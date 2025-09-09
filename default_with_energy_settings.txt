@@ -1,12 +1,12 @@
 #
-# Default settings for the simulation
+# Default settings with Energy Level Report
 #
 
 ## Scenario settings
-Scenario.name = default_scenario
+Scenario.name = default_with_energy_scenario
 Scenario.simulateConnections = true
 Scenario.updateInterval = 0.1
-# 43200s == 12h
+# 3600s == 1h (reduced for faster testing)
 Scenario.endTime = 43200
 
 ## Interface-specific settings:
@@ -52,7 +52,7 @@ Scenario.nrofHostGroups = 6
 
 # Common settings for all groups
 Group.movementModel = ShortestPathMapBasedMovement
-Group.router = ProphetRouter
+Group.router = EpidemicRouter
 Group.bufferSize = 5M
 Group.waitTime = 0, 120
 # All nodes have the bluetooth interface
@@ -64,6 +64,12 @@ Group.speed = 0.5, 1.5
 Group.msgTtl = 300
 
 Group.nrofHosts = 40
+
+## Energy model settings for all groups
+Group.initialEnergy = 1000
+Group.scanEnergy = 0.1
+Group.transmitEnergy = 0.5
+Group.scanResponseEnergy = 0.05
 
 # group1 (pedestrians) specific settings
 Group1.groupID = p
@@ -145,7 +151,7 @@ MapBasedMovement.mapFile4 = data/shops.wkt
 ## Reports - all report names have to be valid report classes
 
 # how many reports to load
-Report.nrofReports = 2
+Report.nrofReports = 3
 # length of the warm up period (simulated seconds)
 Report.warmup = 0
 # default directory of reports (can be overridden per Report with output setting)
@@ -153,6 +159,10 @@ Report.reportDir = reports/
 # Report classes to load
 Report.report1 = MessageStatsReport
 Report.report2 = ContactTimesReport
+Report.report3 = EnergyLevelReport
+
+# Energy Level Report specific settings
+EnergyLevelReport.granularity = 300
 
 ## Default settings for some routers settings
 ProphetRouter.secondsInTimeUnit = 30

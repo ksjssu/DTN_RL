@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(javac:*)",
+      "Bash(if [ ! -d \"target/gui/buttonGraphics\" ])",
+      "Bash(then mkdir -p target/gui/buttonGraphics)",
+      "Bash(fi)",
+      "Bash(./one.sh:*)",
+      "Bash(java:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

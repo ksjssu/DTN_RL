@@ -1,0 +1,240 @@
+#
+# Dynamic traffic density (High/Medium/Low every 3600s) for 12h run
+# Based on default_settings.txt with Events overridden to time-sliced generators
+#
+
+## Scenario settings
+Scenario.name = dynamic_hml_1h
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+# 43200s == 12h
+Scenario.endTime = 43200
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+highspeedInterface.type = SimpleBroadcastInterface
+highspeedInterface.transmitSpeed = 10M
+highspeedInterface.transmitRange = 1000
+
+## Groups
+Scenario.nrofHostGroups = 6
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.router = ProphetRouter
+Group.bufferSize = 5M
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.msgTtl = 300
+
+Group.nrofHosts = 40
+
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.okMaps = 1
+Group2.speed = 2.7, 13.9
+
+Group3.groupID = w
+
+Group4.groupID = t
+Group4.bufferSize = 50M
+Group4.movementModel = MapRouteMovement
+Group4.routeFile = data/tram3.wkt
+Group4.routeType = 1
+Group4.waitTime = 10, 30
+Group4.speed = 7, 10
+Group4.nrofHosts = 2
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = highspeedInterface
+
+Group5.groupID = t
+Group5.bufferSize = 50M
+Group5.movementModel = MapRouteMovement
+Group5.routeFile = data/tram4.wkt
+Group5.routeType = 2
+Group5.waitTime = 10, 30
+Group5.speed = 7, 10
+Group5.nrofHosts = 2
+
+Group6.groupID = t
+Group6.bufferSize = 50M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram10.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 10
+Group6.nrofHosts = 2
+
+## Message creation: High/Medium/Low per 3600-second window
+# Host/address and size consistent with defaults
+# High:   5–10s interval
+# Medium: 25–35s interval
+# Low:    120–180s interval
+
+Events.nrof = 12
+
+# 0–3600 High
+Events1.class = MessageEventGenerator
+Events1.interval = 5,10
+Events1.size = 500k,1M
+Events1.hosts = 0,126
+Events1.time = 0,3600
+Events1.prefix = H1
+
+# 3600–7200 Medium
+Events2.class = MessageEventGenerator
+Events2.interval = 25,35
+Events2.size = 500k,1M
+Events2.hosts = 0,126
+Events2.time = 3600,7200
+Events2.prefix = M1
+
+# 7200–10800 Low
+Events3.class = MessageEventGenerator
+Events3.interval = 120,180
+Events3.size = 500k,1M
+Events3.hosts = 0,126
+Events3.time = 7200,10800
+Events3.prefix = L1
+
+# 10800–14400 High
+Events4.class = MessageEventGenerator
+Events4.interval = 5,10
+Events4.size = 500k,1M
+Events4.hosts = 0,126
+Events4.time = 10800,14400
+Events4.prefix = H2
+
+# 14400–18000 Medium
+Events5.class = MessageEventGenerator
+Events5.interval = 25,35
+Events5.size = 500k,1M
+Events5.hosts = 0,126
+Events5.time = 14400,18000
+Events5.prefix = M2
+
+# 18000–21600 Low
+Events6.class = MessageEventGenerator
+Events6.interval = 120,180
+Events6.size = 500k,1M
+Events6.hosts = 0,126
+Events6.time = 18000,21600
+Events6.prefix = L2
+
+# 21600–25200 High
+Events7.class = MessageEventGenerator
+Events7.interval = 5,10
+Events7.size = 500k,1M
+Events7.hosts = 0,126
+Events7.time = 21600,25200
+Events7.prefix = H3
+
+# 25200–28800 Medium
+Events8.class = MessageEventGenerator
+Events8.interval = 25,35
+Events8.size = 500k,1M
+Events8.hosts = 0,126
+Events8.time = 25200,28800
+Events8.prefix = M3
+
+# 28800–32400 Low
+Events9.class = MessageEventGenerator
+Events9.interval = 120,180
+Events9.size = 500k,1M
+Events9.hosts = 0,126
+Events9.time = 28800,32400
+Events9.prefix = L3
+
+# 32400–36000 High
+Events10.class = MessageEventGenerator
+Events10.interval = 5,10
+Events10.size = 500k,1M
+Events10.hosts = 0,126
+Events10.time = 32400,36000
+Events10.prefix = H4
+
+# 36000–39600 Medium
+Events11.class = MessageEventGenerator
+Events11.interval = 25,35
+Events11.size = 500k,1M
+Events11.hosts = 0,126
+Events11.time = 36000,39600
+Events11.prefix = M4
+
+# 39600–43200 Low
+Events12.class = MessageEventGenerator
+Events12.interval = 120,180
+Events12.size = 500k,1M
+Events12.hosts = 0,126
+Events12.time = 39600,43200
+Events12.prefix = L4
+
+## Movement model settings
+MovementModel.rngSeed = 1
+MovementModel.worldSize = 4500, 3400
+MovementModel.warmup = 1000
+
+## Map based movement
+MapBasedMovement.nrofMapFiles = 4
+MapBasedMovement.mapFile1 = data/roads.wkt
+MapBasedMovement.mapFile2 = data/main_roads.wkt
+MapBasedMovement.mapFile3 = data/pedestrian_paths.wkt
+MapBasedMovement.mapFile4 = data/shops.wkt
+
+## Reports
+Report.nrofReports = 6
+Report.warmup = 0
+Report.reportDir = reports/
+Report.report1 = MessageStatsReport
+Report.report2 = ContactTimesReport
+Report.report3 = DeliveryRatePerIntervalReport
+DeliveryRatePerIntervalReport.binSize = 3600
+Report.report4 = NodeContactBufferWindowReport
+# Align sampling to RL step (30s)
+NodeContactBufferWindowReport.sampleInterval = 30
+NodeContactBufferWindowReport.windowSize = 600
+NodeContactBufferWindowReport.contactsNormMode = cmax
+NodeContactBufferWindowReport.contactsCmax = 10
+#NodeContactBufferWindowReport.contactsNormMode = saturate
+#NodeContactBufferWindowReport.contactsTau = 3
+Report.report5 = RLStateReport
+RLStateReport.sampleInterval = 30
+RLStateReport.windowSize = 600
+RLStateReport.contactsNormMode = cmax
+RLStateReport.contactsCmax = 10
+RLStateReport.maxMessagesPerNode = 20
+RLStateReport.wRelay = 1.0
+RLStateReport.wDrop = 1.0
+RLStateReport.wAbort = 0.5
+Report.report6 = RLBridgeReport
+RLBridgeReport.sampleInterval = 30
+RLBridgeReport.windowSize = 600
+RLBridgeReport.contactsNormMode = cmax
+RLBridgeReport.contactsCmax = 10
+RLBridgeReport.maxMessagesPerNode = 20
+RLBridgeReport.deltaLimit = 0.05
+RLBridgeReport.timeoutMs = 3000
+# Set RLBridgeReport.url to your DRL endpoint to enable action application
+RLBridgeReport.url = http://localhost:5000/infer_and_update
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+SprayAndWaitRouter.nrofCopies = 6
+SprayAndWaitRouter.binaryMode = true
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100

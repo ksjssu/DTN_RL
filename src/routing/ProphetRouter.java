@@ -62,8 +62,10 @@ public class ProphetRouter extends ActiveRouter {
 	/** value of gamma setting */
 	private double gamma;
 
-	/** delivery predictabilities */
-	private Map<DTNHost, Double> preds;
+    /** delivery predictabilities */
+    private Map<DTNHost, Double> preds;
+    /** external offset for predictabilities (e.g., DRL delta per-destination) */
+    private Map<DTNHost, Double> extOffsets = new HashMap<DTNHost, Double>();
 	/** last delivery predictability update (sim)time */
 	private double lastAgeUpdate;
 
@@ -140,15 +142,15 @@ public class ProphetRouter extends ActiveRouter {
 	 * @param host The host to look the P for
 	 * @return the current P value
 	 */
-	public double getPredFor(DTNHost host) {
-		ageDeliveryPreds(); // make sure preds are updated before getting
-		if (preds.containsKey(host)) {
-			return preds.get(host);
-		}
-		else {
-			return 0;
-		}
-	}
+    public double getPredFor(DTNHost host) {
+        ageDeliveryPreds(); // make sure preds are updated before getting
+        double base = preds.containsKey(host) ? preds.get(host) : 0.0;
+        Double off = extOffsets.get(host);
+        double val = base + (off == null ? 0.0 : off.doubleValue());
+        if (val < 0) val = 0;
+        if (val > 1) val = 1;
+        return val;
+    }
 
 	/**
 	 * Updates transitive (A->B->C) delivery predictions.
@@ -297,11 +299,11 @@ public class ProphetRouter extends ActiveRouter {
 	}
 
 	@Override
-	public RoutingInfo getRoutingInfo() {
-		ageDeliveryPreds();
-		RoutingInfo top = super.getRoutingInfo();
-		RoutingInfo ri = new RoutingInfo(preds.size() +
-				" delivery prediction(s)");
+    public RoutingInfo getRoutingInfo() {
+        ageDeliveryPreds();
+        RoutingInfo top = super.getRoutingInfo();
+        RoutingInfo ri = new RoutingInfo(preds.size() +
+                " delivery prediction(s)");
 
 		for (Map.Entry<DTNHost, Double> e : preds.entrySet()) {
 			DTNHost host = e.getKey();
@@ -311,9 +313,20 @@ public class ProphetRouter extends ActiveRouter {
 					host, value)));
 		}
 
-		top.addMoreInfo(ri);
-		return top;
-	}
+        top.addMoreInfo(ri);
+        return top;
+    }
+
+    /** Clears all external offsets (e.g., at the start of a new step). */
+    public void clearExternalOffsets() {
+        this.extOffsets.clear();
+    }
+
+    /** Sets external offset for destination host. Value is added to base pred and clamped to [0,1]. */
+    public void setExternalOffset(DTNHost dest, double offset) {
+        if (dest == null) return;
+        this.extOffsets.put(dest, new Double(offset));
+    }
 
 	@Override
 	public MessageRouter replicate() {

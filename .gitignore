@@ -15,3 +15,16 @@ doc/package-list
 .project
 /target/
 .settings/org.eclipse.*
+
+# Python cache and virtual envs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE/editor configs
+.idea/
+.vscode/
+
+# Logs
+*.log
