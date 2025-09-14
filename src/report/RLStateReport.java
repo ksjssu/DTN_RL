@@ -37,6 +37,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     public static final String W_RELAY_S = "wRelay";
     public static final String W_DROP_S = "wDrop";
     public static final String W_ABORT_S = "wAbort";
+    public static final String REPORT_URL_S = "reportUrl"; // optional: POST episode-end summary to DRL server
 
     // Windowed stats
     private final int windowSizeSeconds;
@@ -60,6 +61,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     private final double wRelay;
     private final double wDrop;
     private final double wAbort;
+    private final String reportUrl;
 
     public RLStateReport() {
         super();
@@ -75,6 +77,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         this.wRelay = s.getDouble(W_RELAY_S, 1.0);
         this.wDrop = s.getDouble(W_DROP_S, 1.0);
         this.wAbort = s.getDouble(W_ABORT_S, 0.5);
+        this.reportUrl = s.getSetting(REPORT_URL_S, "");
 
         write("# time type host msgId dest contacts_norm freebuf_norm pred relayed drops aborted reward");
     }
@@ -192,6 +195,11 @@ public class RLStateReport extends SamplingReport implements MessageListener {
                 emitted++;
             }
         }
+
+        // Step-level cumulative delivery rate logging (no episodes)
+        double rateNow = (createdTotal > 0) ? ((double) deliveredFinalTotal) / createdTotal : Double.NaN;
+        write("# step_cum_rate t=" + now + " rate=" + format(rateNow) +
+                " delivered=" + deliveredFinalTotal + " created=" + createdTotal);
     }
 
     private int getAndReset(Map<Integer, Integer> map, int key) {
@@ -250,6 +258,44 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         // Emit episode-end delivery rate summary line
         double rate = (createdTotal > 0) ? ((double) deliveredFinalTotal) / createdTotal : Double.NaN;
         write("# episode_end average_delivery_rate " + format(rate) + " (delivered=" + deliveredFinalTotal + "/created=" + createdTotal + ")");
+        // Also write a concise episode reward file for external consumers (e.g., DRL server dashboards)
+        try {
+            Settings sAll = new Settings();
+            String dir = sAll.getSetting(Report.REPORTDIR_SETTING);
+            if (dir == null || dir.length() == 0) { dir = "reports"; }
+            java.io.File out = new java.io.File(dir, getScenarioName() + "_EpisodeReward.txt");
+            java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.OutputStreamWriter(new java.io.FileOutputStream(out, false), "UTF-8"));
+            pw.println("average_delivery_rate " + format(rate) + " delivered " + deliveredFinalTotal + " created " + createdTotal);
+            pw.close();
+        } catch (Exception ignore) {}
+        // Optional: notify DRL server
+        if (this.reportUrl != null && this.reportUrl.trim().length() > 0) {
+            try {
+                java.net.URL url = new java.net.URL(this.reportUrl);
+                java.net.HttpURLConnection con = (java.net.HttpURLConnection) url.openConnection();
+                con.setRequestMethod("POST");
+                con.setRequestProperty("Content-Type", "application/json");
+                con.setConnectTimeout(1000);
+                con.setReadTimeout(1000);
+                con.setDoOutput(true);
+                String payload = "{\"sim_id\":\"" + escape(getScenarioName()) + "\",\"average_delivery_rate\":" + format(rate) +
+                        ",\"delivered\":" + deliveredFinalTotal + ",\"created\":" + createdTotal + "}";
+                java.io.DataOutputStream out = new java.io.DataOutputStream(con.getOutputStream());
+                out.write(payload.getBytes("UTF-8")); out.flush(); out.close();
+                int code = con.getResponseCode();
+                if (code != 200) {
+                    write("# RLStateReport WARN: episode_end POST failed: HTTP " + code);
+                }
+                try { con.disconnect(); } catch (Exception ignore) {}
+            } catch (Exception e) {
+                write("# RLStateReport WARN: episode_end POST error: " + e.getMessage());
+            }
+        }
         super.done();
+    }
+
+    private String escape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }

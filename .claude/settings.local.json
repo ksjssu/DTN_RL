@@ -6,7 +6,8 @@
       "Bash(then mkdir -p target/gui/buttonGraphics)",
       "Bash(fi)",
       "Bash(./one.sh:*)",
-      "Bash(java:*)"
+      "Bash(java:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []

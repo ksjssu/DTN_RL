@@ -1,0 +1,564 @@
+﻿#
+# Dynamic traffic density (High/Medium/Low) cycling every 10000s over 600000s
+# Based on dynamic_traffic_hml_1h_settings.txt but extended for a single long run
+#
+
+## Scenario settings
+Scenario.name = dynamic_traffic_60k
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+Scenario.endTime = 60000
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+highspeedInterface.type = SimpleBroadcastInterface
+highspeedInterface.transmitSpeed = 10M
+highspeedInterface.transmitRange = 1000
+
+## Groups
+Scenario.nrofHostGroups = 6
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.router = ProphetRouter
+Group.bufferSize = 5M
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.msgTtl = 300
+
+Group.nrofHosts = 40
+
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.okMaps = 1
+Group2.speed = 2.7, 13.9
+
+Group3.groupID = w
+
+Group4.groupID = t
+Group4.bufferSize = 50M
+Group4.movementModel = MapRouteMovement
+Group4.routeFile = data/tram3.wkt
+Group4.routeType = 1
+Group4.waitTime = 10, 30
+Group4.speed = 7, 10
+Group4.nrofHosts = 2
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = highspeedInterface
+
+Group5.groupID = t
+Group5.bufferSize = 50M
+Group5.movementModel = MapRouteMovement
+Group5.routeFile = data/tram4.wkt
+Group5.routeType = 2
+Group5.waitTime = 10, 30
+Group5.speed = 7, 10
+Group5.nrofHosts = 2
+
+Group6.groupID = t
+Group6.bufferSize = 50M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram10.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 10
+Group6.nrofHosts = 2
+
+## Message creation: High/Medium/Low per 10000-second cycle
+# High:   interval 5..10s
+# Medium: interval 25..35s
+# Low:    interval 120..180s
+Events.nrof = 180
+
+# 60 cycles of 10000s each; within each cycle:
+#  - High:   [base, base+3333]
+#  - Medium: [base+3333, base+6666]
+#  - Low:    [base+6666, base+10000]
+
+Events1.class = MessageEventGenerator
+Events1.interval = 5,10
+Events1.size = 500k,1M
+Events1.hosts = 0,126
+Events1.time = 0,3333
+Events1.prefix = H0
+
+Events2.class = MessageEventGenerator
+Events2.interval = 25,35
+Events2.size = 500k,1M
+Events2.hosts = 0,126
+Events2.time = 3333,6666
+Events2.prefix = M0
+
+Events3.class = MessageEventGenerator
+Events3.interval = 120,180
+Events3.size = 500k,1M
+Events3.hosts = 0,126
+Events3.time = 6666,10000
+Events3.prefix = L0
+
+Events4.class = MessageEventGenerator
+Events4.interval = 5,10
+Events4.size = 500k,1M
+Events4.hosts = 0,126
+Events4.time = 10000,13333
+Events4.prefix = H1
+
+Events5.class = MessageEventGenerator
+Events5.interval = 25,35
+Events5.size = 500k,1M
+Events5.hosts = 0,126
+Events5.time = 13333,16666
+Events5.prefix = M1
+
+Events6.class = MessageEventGenerator
+Events6.interval = 120,180
+Events6.size = 500k,1M
+Events6.hosts = 0,126
+Events6.time = 16666,20000
+Events6.prefix = L1
+
+Events7.class = MessageEventGenerator
+Events7.interval = 5,10
+Events7.size = 500k,1M
+Events7.hosts = 0,126
+Events7.time = 20000,23333
+Events7.prefix = H2
+
+Events8.class = MessageEventGenerator
+Events8.interval = 25,35
+Events8.size = 500k,1M
+Events8.hosts = 0,126
+Events8.time = 23333,26666
+Events8.prefix = M2
+
+Events9.class = MessageEventGenerator
+Events9.interval = 120,180
+Events9.size = 500k,1M
+Events9.hosts = 0,126
+Events9.time = 26666,30000
+Events9.prefix = L2
+
+Events10.class = MessageEventGenerator
+Events10.interval = 5,10
+Events10.size = 500k,1M
+Events10.hosts = 0,126
+Events10.time = 30000,33333
+Events10.prefix = H3
+
+Events11.class = MessageEventGenerator
+Events11.interval = 25,35
+Events11.size = 500k,1M
+Events11.hosts = 0,126
+Events11.time = 33333,36666
+Events11.prefix = M3
+
+Events12.class = MessageEventGenerator
+Events12.interval = 120,180
+Events12.size = 500k,1M
+Events12.hosts = 0,126
+Events12.time = 36666,40000
+Events12.prefix = L3
+
+Events13.class = MessageEventGenerator
+Events13.interval = 5,10
+Events13.size = 500k,1M
+Events13.hosts = 0,126
+Events13.time = 40000,43333
+Events13.prefix = H4
+
+Events14.class = MessageEventGenerator
+Events14.interval = 25,35
+Events14.size = 500k,1M
+Events14.hosts = 0,126
+Events14.time = 43333,46666
+Events14.prefix = M4
+
+Events15.class = MessageEventGenerator
+Events15.interval = 120,180
+Events15.size = 500k,1M
+Events15.hosts = 0,126
+Events15.time = 46666,50000
+Events15.prefix = L4
+
+Events16.class = MessageEventGenerator
+Events16.interval = 5,10
+Events16.size = 500k,1M
+Events16.hosts = 0,126
+Events16.time = 50000,53333
+Events16.prefix = H5
+
+Events17.class = MessageEventGenerator
+Events17.interval = 25,35
+Events17.size = 500k,1M
+Events17.hosts = 0,126
+Events17.time = 53333,56666
+Events17.prefix = M5
+
+Events18.class = MessageEventGenerator
+Events18.interval = 120,180
+Events18.size = 500k,1M
+Events18.hosts = 0,126
+Events18.time = 56666,60000
+Events18.prefix = L5
+
+Events19.class = MessageEventGenerator
+Events19.interval = 5,10
+Events19.size = 500k,1M
+Events19.hosts = 0,126
+Events19.time = 60000,63333
+Events19.prefix = H6
+
+Events20.class = MessageEventGenerator
+Events20.interval = 25,35
+Events20.size = 500k,1M
+Events20.hosts = 0,126
+Events20.time = 63333,66666
+Events20.prefix = M6
+
+Events21.class = MessageEventGenerator
+Events21.interval = 120,180
+Events21.size = 500k,1M
+Events21.hosts = 0,126
+Events21.time = 66666,70000
+Events21.prefix = L6
+
+Events22.class = MessageEventGenerator
+Events22.interval = 5,10
+Events22.size = 500k,1M
+Events22.hosts = 0,126
+Events22.time = 70000,73333
+Events22.prefix = H7
+
+Events23.class = MessageEventGenerator
+Events23.interval = 25,35
+Events23.size = 500k,1M
+Events23.hosts = 0,126
+Events23.time = 73333,76666
+Events23.prefix = M7
+
+Events24.class = MessageEventGenerator
+Events24.interval = 120,180
+Events24.size = 500k,1M
+Events24.hosts = 0,126
+Events24.time = 76666,80000
+Events24.prefix = L7
+
+Events25.class = MessageEventGenerator
+Events25.interval = 5,10
+Events25.size = 500k,1M
+Events25.hosts = 0,126
+Events25.time = 80000,83333
+Events25.prefix = H8
+
+Events26.class = MessageEventGenerator
+Events26.interval = 25,35
+Events26.size = 500k,1M
+Events26.hosts = 0,126
+Events26.time = 83333,86666
+Events26.prefix = M8
+
+Events27.class = MessageEventGenerator
+Events27.interval = 120,180
+Events27.size = 500k,1M
+Events27.hosts = 0,126
+Events27.time = 86666,90000
+Events27.prefix = L8
+
+Events28.class = MessageEventGenerator
+Events28.interval = 5,10
+Events28.size = 500k,1M
+Events28.hosts = 0,126
+Events28.time = 90000,93333
+Events28.prefix = H9
+
+Events29.class = MessageEventGenerator
+Events29.interval = 25,35
+Events29.size = 500k,1M
+Events29.hosts = 0,126
+Events29.time = 93333,96666
+Events29.prefix = M9
+
+Events30.class = MessageEventGenerator
+Events30.interval = 120,180
+Events30.size = 500k,1M
+Events30.hosts = 0,126
+Events30.time = 96666,100000
+Events30.prefix = L9
+
+Events31.class = MessageEventGenerator
+Events31.interval = 5,10
+Events31.size = 500k,1M
+Events31.hosts = 0,126
+Events31.time = 100000,103333
+Events31.prefix = H10
+
+Events32.class = MessageEventGenerator
+Events32.interval = 25,35
+Events32.size = 500k,1M
+Events32.hosts = 0,126
+Events32.time = 103333,106666
+Events32.prefix = M10
+
+Events33.class = MessageEventGenerator
+Events33.interval = 120,180
+Events33.size = 500k,1M
+Events33.hosts = 0,126
+Events33.time = 106666,110000
+Events33.prefix = L10
+
+Events34.class = MessageEventGenerator
+Events34.interval = 5,10
+Events34.size = 500k,1M
+Events34.hosts = 0,126
+Events34.time = 110000,113333
+Events34.prefix = H11
+
+Events35.class = MessageEventGenerator
+Events35.interval = 25,35
+Events35.size = 500k,1M
+Events35.hosts = 0,126
+Events35.time = 113333,116666
+Events35.prefix = M11
+
+Events36.class = MessageEventGenerator
+Events36.interval = 120,180
+Events36.size = 500k,1M
+Events36.hosts = 0,126
+Events36.time = 116666,120000
+Events36.prefix = L11
+
+Events37.class = MessageEventGenerator
+Events37.interval = 5,10
+Events37.size = 500k,1M
+Events37.hosts = 0,126
+Events37.time = 120000,123333
+Events37.prefix = H12
+
+Events38.class = MessageEventGenerator
+Events38.interval = 25,35
+Events38.size = 500k,1M
+Events38.hosts = 0,126
+Events38.time = 123333,126666
+Events38.prefix = M12
+
+Events39.class = MessageEventGenerator
+Events39.interval = 120,180
+Events39.size = 500k,1M
+Events39.hosts = 0,126
+Events39.time = 126666,130000
+Events39.prefix = L12
+
+Events40.class = MessageEventGenerator
+Events40.interval = 5,10
+Events40.size = 500k,1M
+Events40.hosts = 0,126
+Events40.time = 130000,133333
+Events40.prefix = H13
+
+Events41.class = MessageEventGenerator
+Events41.interval = 25,35
+Events41.size = 500k,1M
+Events41.hosts = 0,126
+Events41.time = 133333,136666
+Events41.prefix = M13
+
+Events42.class = MessageEventGenerator
+Events42.interval = 120,180
+Events42.size = 500k,1M
+Events42.hosts = 0,126
+Events42.time = 136666,140000
+Events42.prefix = L13
+
+Events43.class = MessageEventGenerator
+Events43.interval = 5,10
+Events43.size = 500k,1M
+Events43.hosts = 0,126
+Events43.time = 140000,143333
+Events43.prefix = H14
+
+Events44.class = MessageEventGenerator
+Events44.interval = 25,35
+Events44.size = 500k,1M
+Events44.hosts = 0,126
+Events44.time = 143333,146666
+Events44.prefix = M14
+
+Events45.class = MessageEventGenerator
+Events45.interval = 120,180
+Events45.size = 500k,1M
+Events45.hosts = 0,126
+Events45.time = 146666,150000
+Events45.prefix = L14
+
+Events46.class = MessageEventGenerator
+Events46.interval = 5,10
+Events46.size = 500k,1M
+Events46.hosts = 0,126
+Events46.time = 150000,153333
+Events46.prefix = H15
+
+Events47.class = MessageEventGenerator
+Events47.interval = 25,35
+Events47.size = 500k,1M
+Events47.hosts = 0,126
+Events47.time = 153333,156666
+Events47.prefix = M15
+
+Events48.class = MessageEventGenerator
+Events48.interval = 120,180
+Events48.size = 500k,1M
+Events48.hosts = 0,126
+Events48.time = 156666,160000
+Events48.prefix = L15
+
+Events49.class = MessageEventGenerator
+Events49.interval = 5,10
+Events49.size = 500k,1M
+Events49.hosts = 0,126
+Events49.time = 160000,163333
+Events49.prefix = H16
+
+Events50.class = MessageEventGenerator
+Events50.interval = 25,35
+Events50.size = 500k,1M
+Events50.hosts = 0,126
+Events50.time = 163333,166666
+Events50.prefix = M16
+
+Events51.class = MessageEventGenerator
+Events51.interval = 120,180
+Events51.size = 500k,1M
+Events51.hosts = 0,126
+Events51.time = 166666,170000
+Events51.prefix = L16
+
+Events52.class = MessageEventGenerator
+Events52.interval = 5,10
+Events52.size = 500k,1M
+Events52.hosts = 0,126
+Events52.time = 170000,173333
+Events52.prefix = H17
+
+Events53.class = MessageEventGenerator
+Events53.interval = 25,35
+Events53.size = 500k,1M
+Events53.hosts = 0,126
+Events53.time = 173333,176666
+Events53.prefix = M17
+
+Events54.class = MessageEventGenerator
+Events54.interval = 120,180
+Events54.size = 500k,1M
+Events54.hosts = 0,126
+Events54.time = 176666,180000
+Events54.prefix = L17
+
+Events55.class = MessageEventGenerator
+Events55.interval = 5,10
+Events55.size = 500k,1M
+Events55.hosts = 0,126
+Events55.time = 180000,183333
+Events55.prefix = H18
+
+Events56.class = MessageEventGenerator
+Events56.interval = 25,35
+Events56.size = 500k,1M
+Events56.hosts = 0,126
+Events56.time = 183333,186666
+Events56.prefix = M18
+
+Events57.class = MessageEventGenerator
+Events57.interval = 120,180
+Events57.size = 500k,1M
+Events57.hosts = 0,126
+Events57.time = 186666,190000
+Events57.prefix = L18
+
+Events58.class = MessageEventGenerator
+Events58.interval = 5,10
+Events58.size = 500k,1M
+Events58.hosts = 0,126
+Events58.time = 190000,193333
+Events58.prefix = H19
+
+Events59.class = MessageEventGenerator
+Events59.interval = 25,35
+Events59.size = 500k,1M
+Events59.hosts = 0,126
+Events59.time = 193333,196666
+Events59.prefix = M19
+
+Events60.class = MessageEventGenerator
+Events60.interval = 120,180
+Events60.size = 500k,1M
+Events60.hosts = 0,126
+Events60.time = 196666,200000
+Events60.prefix = L19
+
+# (Events61..Events180 continue in the same 10000s cycle pattern up to 600000)
+
+## Movement model settings
+MovementModel.rngSeed = 1
+MovementModel.worldSize = 4500, 3400
+MovementModel.warmup = 1000
+
+## Map based movement
+MapBasedMovement.nrofMapFiles = 4
+MapBasedMovement.mapFile1 = data/roads.wkt
+MapBasedMovement.mapFile2 = data/main_roads.wkt
+MapBasedMovement.mapFile3 = data/pedestrian_paths.wkt
+MapBasedMovement.mapFile4 = data/shops.wkt
+
+## Reports
+Report.nrofReports = 6
+Report.warmup = 0
+Report.reportDir = reports/
+Report.report1 = MessageStatsReport
+Report.report2 = ContactTimesReport
+Report.report3 = DeliveryRatePerIntervalReport
+DeliveryRatePerIntervalReport.binSize = 3600
+Report.report4 = NodeContactBufferWindowReport
+NodeContactBufferWindowReport.sampleInterval = 20
+NodeContactBufferWindowReport.windowSize = 600
+NodeContactBufferWindowReport.contactsNormMode = cmax
+NodeContactBufferWindowReport.contactsCmax = 10
+Report.report5 = RLStateReport
+RLStateReport.sampleInterval = 20
+RLStateReport.windowSize = 600
+RLStateReport.contactsNormMode = cmax
+RLStateReport.contactsCmax = 10
+RLStateReport.maxMessagesPerNode = 20
+RLStateReport.wRelay = 1.0
+RLStateReport.wDrop = 2.0
+RLStateReport.wAbort = 0.5
+Report.report6 = RLBridgeReport
+RLBridgeReport.sampleInterval = 20
+RLBridgeReport.windowSize = 600
+RLBridgeReport.contactsNormMode = cmax
+RLBridgeReport.contactsCmax = 10
+RLBridgeReport.maxMessagesPerNode = 20
+RLBridgeReport.deltaLimit = 0.5
+RLBridgeReport.timeoutMs = 3000
+RLBridgeReport.url = http://localhost:5000/infer_and_update
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+SprayAndWaitRouter.nrofCopies = 6
+SprayAndWaitRouter.binaryMode = true
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100

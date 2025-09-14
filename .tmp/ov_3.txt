@@ -1,0 +1,4 @@
+﻿MovementModel.rngSeed = 3
+Report.reportDir = reports/run_3/
+RLStateReport.reportUrl = http://localhost:5000/episode_end
+Scenario.endTime = 3600

@@ -1,0 +1,3 @@
+﻿MovementModel.rngSeed = 25
+RLStateReport.reportUrl = http://localhost:5000/episode_end
+RLBridgeReport.unboundedDelta = true

@@ -33,6 +33,10 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     public static final String MAX_MSG_PER_NODE_S = "maxMessagesPerNode"; // 0=unlimited
     public static final String DELTA_LIMIT_S = "deltaLimit";
     public static final String TIMEOUT_MS_S = "timeoutMs";
+    public static final String UNBOUNDED_DELTA_S = "unboundedDelta"; // true|false
+    public static final String LOG_ACTIONS_S = "logActions"; // true|false
+    public static final String LOG_ACTIONS_MAX_S = "logActionsMax"; // max lines per step
+    public static final String DELIVERY_RELAY_BONUS_S = "deliveryRelayBonus"; // delivered counted as extra relayed units
 
     private final String endpoint;
     private final int windowSizeSeconds;
@@ -42,22 +46,25 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final int maxMsgsPerNode;
     private final double deltaLimit;
     private final int timeoutMs;
+    private String lastPolicyId = "";
+    private final boolean logActions;
+    private final int logActionsMax;
+    private final boolean unboundedDelta;
+    private final double deliveryRelayBonus;
 
     // Histories for windowed features
     private final Map<Integer, Deque<Double>> contactsHistory = new HashMap<Integer, Deque<Double>>();
     private final Map<Integer, Deque<Double>> freeFracHistory = new HashMap<Integer, Deque<Double>>();
 
-    // Last state/action per message for prev_transition
-    private static class MsgState {
-        double cNorm; double fNorm; double pred; double action;
-        MsgState(double c, double f, double p, double a){cNorm=c;fNorm=f;pred=p;action=a;}
-    }
-    private final Map<String, MsgState> lastMsgState = new HashMap<String, MsgState>(); // key: host#msgId
+    // Host-dest updated keys since last sample: hostStr -> set of destStr
+    private final Map<String, Set<String>> updatedKeysByHost = new HashMap<String, Set<String>>();
 
-    // Reward counters since last sample (node-level)
-    private final Map<Integer, Integer> relayedCnt = new HashMap<Integer, Integer>();
-    private final Map<Integer, Integer> droppedCnt = new HashMap<Integer, Integer>();
-    private final Map<Integer, Integer> abortedCnt = new HashMap<Integer, Integer>();
+    // Reward counters since last sample (host-dest granularity), key: "hostStr#destStr"
+    private final Map<String, Integer> relayedByKey = new HashMap<String, Integer>();
+    private final Map<String, Integer> droppedByKey = new HashMap<String, Integer>();
+    private final Map<String, Integer> abortedByKey = new HashMap<String, Integer>();
+    private final Map<String, Integer> deliveredByKey = new HashMap<String, Integer>();
+    private final Map<String, Double> totalDelayByKey = new HashMap<String, Double>();  // total delay for delivered messages
 
     public RLBridgeReport() {
         super();
@@ -72,6 +79,12 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         this.maxMsgsPerNode = (int)Math.round(s.getDouble(MAX_MSG_PER_NODE_S, 20.0));
         this.deltaLimit = s.getDouble(DELTA_LIMIT_S, 0.05);
         this.timeoutMs = (int)Math.round(s.getDouble(TIMEOUT_MS_S, 1000.0));
+        String logA = s.getSetting(LOG_ACTIONS_S, "false").toLowerCase();
+        this.logActions = ("true".equals(logA) || "1".equals(logA) || "yes".equals(logA));
+        this.logActionsMax = (int)Math.round(s.getDouble(LOG_ACTIONS_MAX_S, 10.0));
+        String ub = s.getSetting(UNBOUNDED_DELTA_S, "false").toLowerCase();
+        this.unboundedDelta = ("true".equals(ub) || "1".equals(ub) || "yes".equals(ub));
+        this.deliveryRelayBonus = s.getDouble(DELIVERY_RELAY_BONUS_S, 3.0);
 
         write("# RLBridge active. endpoint=" + (endpoint.length()>0?endpoint:"(none)") +
                 " sampleInterval=" + format(super.interval) + " windowSize=" + windowSizeSeconds);
@@ -86,7 +99,9 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         StringBuilder req = new StringBuilder();
         req.append("{\"sim_id\":\"").append(escape(getScenarioName())).append("\",");
         req.append("\"time\":").append(now).append(",");
-        req.append("\"delta_limit\":").append(format(this.deltaLimit)).append(",");
+        // If unbounded, signal with negative delta_limit
+        double effDeltaLimit = this.unboundedDelta ? -1.0 : this.deltaLimit;
+        req.append("\"delta_limit\":").append(format(effDeltaLimit)).append(",");
         req.append("\"prev_transition\":[");
         boolean firstPrev = true;
 
@@ -94,6 +109,7 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         StringBuilder stateBatch = new StringBuilder();
         stateBatch.append("\"state_batch\":[");
         boolean firstState = true;
+        int stateCount = 0;
 
         // Clear previous external offsets before applying new ones
         for (DTNHost h : hosts) {
@@ -163,32 +179,50 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                 contactsNorm = avgC / cmax; if (contactsNorm<0) contactsNorm=0; if (contactsNorm>1) contactsNorm=1;
             }
 
-            // Prev transition (node-level reward)
-            int rel = getAndReset(relayedCnt, addr);
-            int dr = getAndReset(droppedCnt, addr);
-            int ab = getAndReset(abortedCnt, addr);
-            if (!firstPrev) req.append(","); firstPrev=false;
-            req.append("{\"host\":\"").append(escape(hostStr)).append("\",")
-               .append("\"relayed\":").append(rel).append(",\"drops\":").append(dr)
-               .append(",\"aborted\":").append(ab).append("}");
+            // Prev transition: drain counters for this host at host-dest granularity
+            Set<String> destsUpdated = updatedKeysByHost.get(hostStr);
+            if (destsUpdated != null && !destsUpdated.isEmpty()) {
+                // copy to avoid concurrent modification
+                java.util.List<String> copy = new java.util.ArrayList<String>(destsUpdated);
+                for (String destStr : copy) {
+                    String k = hostStr + "#" + destStr;
+                    int rel = getAndResetStr(relayedByKey, k);
+                    int dr = getAndResetStr(droppedByKey, k);
+                    int ab = getAndResetStr(abortedByKey, k);
+                    int de = getAndResetStr(deliveredByKey, k);
+                    double totalDelay = getAndResetDouble(totalDelayByKey, k);
+                    double avgDelay = (de > 0) ? (totalDelay / de) : 0.0;
+                    int relAug = rel + (int)Math.round(this.deliveryRelayBonus * de);
+                    if (rel != 0 || dr != 0 || ab != 0 || de != 0) {
+                        if (!firstPrev) req.append(","); firstPrev=false;
+                        req.append("{\"host\":\"").append(escape(hostStr)).append("\",")
+                           .append("\"dest\":\"").append(escape(destStr)).append("\",")
+                           .append("\"relayed\":").append(relAug).append(",\"drops\":").append(dr)
+                           .append(",\"aborted\":").append(ab).append(",\"delivered\":").append(de)
+                           .append(",\"avg_delay\":").append(String.format("%.3f", avgDelay)).append("}");
+                    }
+                    destsUpdated.remove(destStr);
+                }
+                if (destsUpdated.isEmpty()) { updatedKeysByHost.remove(hostStr); }
+            }
 
-            // State batch per message
+            // State batch per destination (unique dests among buffered messages)
             int emitted=0;
-            for (Message m : h.getMessageCollection()) {
+            Set<String> uniqueDests = new HashSet<String>();
+            for (Message m : h.getMessageCollection()) { uniqueDests.add(m.getTo().toString()); }
+            for (String destStr : uniqueDests) {
                 if (this.maxMsgsPerNode>0 && emitted>=this.maxMsgsPerNode) break;
-                double pred = getPredFor(h, m.getTo());
+                // resolve dest host
+                DTNHost destHost = null; for (DTNHost cand : hosts) { if (cand.toString().equals(destStr)) { destHost = cand; break; } }
+                if (destHost == null) { continue; }
+                double pred = getPredFor(h, destHost);
                 if (!firstState) stateBatch.append(","); firstState=false;
                 stateBatch.append("{\"host\":\"").append(escape(hostStr)).append("\",")
-                        .append("\"msg_id\":\"").append(escape(m.getId())).append("\",")
-                        .append("\"dest\":\"").append(escape(m.getTo().toString())).append("\",")
+                        .append("\"dest\":\"").append(escape(destStr)).append("\",")
                         .append("\"contacts_norm\":").append(format(contactsNorm)).append(",")
                         .append("\"freebuf_norm\":").append(format(freebufNorm)).append(",")
                         .append("\"pred\":").append(format(pred)).append("}");
-                // Save last state for this message with action placeholder (filled after response)
-                String key = hostStr + "#" + m.getId();
-                MsgState prev = lastMsgState.get(key);
-                if (prev == null) { lastMsgState.put(key, new MsgState(contactsNorm, freebufNorm, pred, 0.0)); }
-                emitted++;
+                emitted++; stateCount++;
             }
         }
 
@@ -198,32 +232,37 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         // Call DRL module and apply actions
         Map<String, Double> actions = callDrl(endpoint, req.toString());
         if (actions != null) {
-            // actions map key: host#msg_id, value: delta
+            // actions map key: host#dest, value: delta
             int applied = 0;
+            int recvActions = actions.size();
+            int logged = 0;
             for (DTNHost h : hosts) {
                 final String hostStr = h.toString();
-                // apply per message
-                for (Message m : h.getMessageCollection()) {
-                    String key = hostStr + "#" + m.getId();
+                // Aggregate unique destinations
+                Set<String> uniqueDests = new HashSet<String>();
+                Map<String, DTNHost> destMap = new HashMap<String, DTNHost>();
+                for (Message m : h.getMessageCollection()) { String d = m.getTo().toString(); uniqueDests.add(d); if (!destMap.containsKey(d)) destMap.put(d, m.getTo()); }
+                for (String destStr : uniqueDests) {
+                    String key = hostStr + "#" + destStr;
                     if (!actions.containsKey(key)) continue;
                     double delta = actions.get(key).doubleValue();
-                    if (delta > deltaLimit) delta = deltaLimit;
-                    if (delta < -deltaLimit) delta = -deltaLimit;
-                    // Apply as external offset to destination on Prophet routers
+                    if (!this.unboundedDelta) { if (delta > deltaLimit) delta = deltaLimit; if (delta < -deltaLimit) delta = -deltaLimit; }
                     MessageRouter r = h.getRouter();
                     if (r instanceof ProphetRouter) {
-                        // We set offset equal to delta (additive). If multiple messages to same dest, last one wins.
-                        ((ProphetRouter) r).setExternalOffset(m.getTo(), delta);
-                        applied++;
+                        DTNHost destHost = destMap.get(destStr);
+                        if (destHost != null) {
+                            ((ProphetRouter) r).setExternalOffset(destHost, delta);
+                            applied++;
+                            if (this.logActions && logged < this.logActionsMax) { write(now + " A " + hostStr + " - " + destStr + " " + format(delta)); logged++; }
+                        }
                     }
-                    // store last action
-                    lastMsgState.put(key, new MsgState(0,0,0, delta));
                 }
             }
-            write("# RLBridge OK t=" + now + " applied_actions=" + applied);
+            write("# RLBridge OK t=" + now + " policy=" + (lastPolicyId==null?"":lastPolicyId) +
+                    " states=" + stateCount + " recv_actions=" + recvActions + " applied_actions=" + applied);
         }
         else {
-            write("# RLBridge: no endpoint/failed request; applied zero deltas");
+            write("# RLBridge: no endpoint/failed request; policy=(none) states=" + stateCount + " recv_actions=0 applied_actions=0");
         }
     }
 
@@ -234,6 +273,13 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
 
     private int getAndReset(Map<Integer, Integer> map, int key) {
         Integer v = map.get(key); if (v == null) v = 0; map.put(key, 0); return v;
+    }
+    private int getAndResetStr(Map<String, Integer> map, String key) {
+        Integer v = map.get(key); if (v == null) v = 0; map.put(key, 0); return v;
+    }
+
+    private double getAndResetDouble(Map<String, Double> map, String key) {
+        Double v = map.get(key); if (v == null) v = 0.0; map.put(key, 0.0); return v;
     }
 
     private double getPredFor(DTNHost self, DTNHost dest) {
@@ -264,7 +310,19 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             StringBuilder resp = new StringBuilder();
             String line; while ((line = in.readLine()) != null) { resp.append(line); }
             in.close();
-            return parseActions(resp.toString());
+            String body = resp.toString();
+            try { this.lastPolicyId = extractString(body, "policy_id"); } catch (Exception ignore) {}
+            Map<String, Double> parsed = parseActionsKV(body);
+            if (parsed.isEmpty()) {
+                parsed = parseActions(body);
+            }
+            if (parsed.isEmpty()) {
+                // Emit a short debug snippet to help diagnose parsing issues
+                String snippet;
+                if (body.length() > 240) { snippet = body.substring(0, 240) + "..."; } else { snippet = body; }
+                write("# RLBridge WARN: parsed zero actions; body_snippet=" + snippet.replace('\n',' ').replace('\r',' '));
+            }
+            return parsed;
         } catch (Exception e) {
             write("# RLBridge HTTP error: " + e.getMessage());
             return null;
@@ -273,25 +331,56 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         }
     }
 
-    // Minimal JSON parser for {"actions":[{"host":"p1","per_message":[{"msg_id":"H1","delta":0.01}, ...]} ...]}
+    // Simpler parsing for flat map: {"actions_kv": {"p0#H1": 0.01, "p1#H2": -0.003}}
+    private Map<String, Double> parseActionsKV(String json) {
+        Map<String, Double> result = new HashMap<String, Double>();
+        if (json == null) return result;
+        int idx = json.indexOf("\"actions_kv\""); if (idx < 0) return result;
+        int objStart = json.indexOf('{', idx); if (objStart < 0) return result;
+        int objEnd = findMatchingBracket(json, objStart, '{', '}'); if (objEnd < 0) return result;
+        String body = json.substring(objStart + 1, objEnd);
+        int i = 0;
+        while (i < body.length()) {
+            // find key
+            int k1 = body.indexOf('"', i); if (k1 < 0) break;
+            int k2 = body.indexOf('"', k1+1); if (k2 < 0) break;
+            String key = body.substring(k1+1, k2);
+            int colon = body.indexOf(':', k2); if (colon < 0) break;
+            // parse value number
+            int e = colon+1;
+            while (e < body.length() && (Character.isWhitespace(body.charAt(e)) || body.charAt(e)==',')) e++;
+            int j = e;
+            while (j < body.length()) {
+                char ch = body.charAt(j);
+                if ((ch>='0' && ch<='9') || ch=='-' || ch=='.' || ch=='e' || ch=='E' || ch=='+') { j++; }
+                else { break; }
+            }
+            try {
+                Double val = Double.parseDouble(body.substring(e, j));
+                result.put(key, val);
+            } catch (Exception ignore) {}
+            i = j+1;
+        }
+        return result;
+    }
+
+    // Minimal JSON parser for nested structure: {"actions":[{"host":"p1","per_message":[{"msg_id":"H1","delta":0.01}, ...]} ...]}
     private Map<String, Double> parseActions(String json) {
         Map<String, Double> result = new HashMap<String, Double>();
         if (json == null) return result;
-        // naive parsing: find "actions":[ ... ] and then extract host/msg_id/delta triples
         int idx = json.indexOf("\"actions\""); if (idx < 0) return result;
         int arrStart = json.indexOf('[', idx); if (arrStart < 0) return result;
-        int arrEnd = json.indexOf(']', arrStart); if (arrEnd < 0) return result;
-        String arr = json.substring(arrStart+1, arrEnd);
-        String[] hostBlocks = arr.split("\\},\\{");
-        for (String hb : hostBlocks) {
+        int arrEnd = findMatchingBracket(json, arrStart, '[', ']'); if (arrEnd < 0) return result;
+        String arr = json.substring(arrStart + 1, arrEnd);
+        // Extract top-level objects inside actions array
+        java.util.List<String> hostObjs = extractTopLevelObjects(arr);
+        for (String hb : hostObjs) {
             String host = extractString(hb, "host"); if (host == null) continue;
-            // per_message array
             int pmIdx = hb.indexOf("per_message"); if (pmIdx < 0) continue;
             int pmStart = hb.indexOf('[', pmIdx); if (pmStart < 0) continue;
-            int pmEnd = hb.indexOf(']', pmStart); if (pmEnd < 0) continue;
-            String pmArr = hb.substring(pmStart+1, pmEnd);
-            String[] entries = pmArr.split("\\},\\{");
-            for (String ent : entries) {
+            int pmEnd = findMatchingBracket(hb, pmStart, '[', ']'); if (pmEnd < 0) continue;
+            String pmArr = hb.substring(pmStart + 1, pmEnd);
+            for (String ent : extractTopLevelObjects(pmArr)) {
                 String msgId = extractString(ent, "msg_id");
                 Double delta = extractDouble(ent, "delta");
                 if (msgId != null && delta != null) {
@@ -300,6 +389,38 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             }
         }
         return result;
+    }
+
+    private int findMatchingBracket(String s, int start, char open, char close) {
+        int depth = 0;
+        for (int i = start; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == open) depth++;
+            else if (ch == close) {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private java.util.List<String> extractTopLevelObjects(String s) {
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        int i = 0;
+        while (i < s.length()) {
+            // skip whitespace and commas
+            while (i < s.length()) {
+                char ch = s.charAt(i);
+                if (Character.isWhitespace(ch) || ch == ',') i++; else break;
+            }
+            if (i >= s.length()) break;
+            if (s.charAt(i) != '{') { i++; continue; }
+            int end = findMatchingBracket(s, i, '{', '}');
+            if (end < 0) break;
+            out.add(s.substring(i, end + 1));
+            i = end + 1;
+        }
+        return out;
     }
 
     private String extractString(String block, String key) {
@@ -319,22 +440,44 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         try { return Double.parseDouble(block.substring(c+1, e)); } catch (Exception ex) { return null; }
     }
 
-    // MessageListener-like hooks to collect rewards; wire via Settings by adding as Report and Simulation listeners already attach UpdateListener
+    // MessageListener-like hooks to collect rewards at host-dest granularity
     public void newMessage(Message m) {}
     public void messageTransferStarted(Message m, DTNHost from, DTNHost to) {}
     public void messageDeleted(Message m, DTNHost where, boolean dropped) {
         if (dropped) {
-            int k = where.getAddress();
-            Integer v = droppedCnt.get(k); droppedCnt.put(k, (v==null?1:v+1));
+            String hostStr = where.toString();
+            String destStr = m.getTo().toString();
+            String key = hostStr + "#" + destStr;
+            Integer v = droppedByKey.get(key); droppedByKey.put(key, (v==null?1:v+1));
+            markUpdated(hostStr, destStr);
         }
     }
     public void messageTransferAborted(Message m, DTNHost from, DTNHost to) {
-        int k = from.getAddress();
-        Integer v = abortedCnt.get(k); abortedCnt.put(k, (v==null?1:v+1));
+        String hostStr = from.toString();
+        String destStr = m.getTo().toString();
+        String key = hostStr + "#" + destStr;
+        Integer v = abortedByKey.get(key); abortedByKey.put(key, (v==null?1:v+1));
+        markUpdated(hostStr, destStr);
     }
     public void messageTransferred(Message m, DTNHost from, DTNHost to, boolean firstDelivery) {
-        int k = from.getAddress();
-        Integer v = relayedCnt.get(k); relayedCnt.put(k, (v==null?1:v+1));
+        String hostStr = from.toString();
+        String destStr = m.getTo().toString();
+        String key = hostStr + "#" + destStr;
+        Integer vr = relayedByKey.get(key); relayedByKey.put(key, (vr==null?1:vr+1));
+        if (firstDelivery) { 
+            Integer vd = deliveredByKey.get(key); deliveredByKey.put(key, (vd==null?1:vd+1)); 
+            // Calculate delivery delay: current time - message creation time
+            double deliveryDelay = SimClock.getTime() - m.getCreationTime();
+            Double totalDelay = totalDelayByKey.get(key); 
+            totalDelayByKey.put(key, (totalDelay == null ? deliveryDelay : totalDelay + deliveryDelay));
+        }
+        markUpdated(hostStr, destStr);
+    }
+
+    private void markUpdated(String hostStr, String destStr) {
+        Set<String> s = updatedKeysByHost.get(hostStr);
+        if (s == null) { s = new HashSet<String>(); updatedKeysByHost.put(hostStr, s); }
+        s.add(destStr);
     }
 
 }

@@ -1,0 +1,2 @@
+﻿MovementModel.rngSeed = 304
+RLStateReport.reportUrl = http://localhost:5000/episode_end

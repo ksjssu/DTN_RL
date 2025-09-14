@@ -1,0 +1,15 @@
+﻿# 1) Build rewards per host from prev_transition
+        rewards_per_host = {}
+        for item in prev_tr:
+            try:
+                host = str(item.get("host", ""))
+                relayed = float(item.get("relayed", 0) or 0)
+                drops = float(item.get("drops", 0) or 0)
+                aborted = float(item.get("aborted", 0) or 0)
+                # weights aligned with Java: wRelay=+1, wDrop=??, wAbort=??.5
+                r = relayed - drops - 0.5 * aborted
+                rewards_per_host[host] = rewards_per_host.get(host, 0.0) + r
+            except Exception:
+                continue
+
+        # Apply optional additional weighting if 'delivered' is presen

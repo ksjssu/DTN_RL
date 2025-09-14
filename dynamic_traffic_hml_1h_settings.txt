@@ -218,7 +218,7 @@ RLBridgeReport.windowSize = 600
 RLBridgeReport.contactsNormMode = cmax
 RLBridgeReport.contactsCmax = 10
 RLBridgeReport.maxMessagesPerNode = 20
-RLBridgeReport.deltaLimit = 0.05
+RLBridgeReport.deltaLimit = 0.6
 RLBridgeReport.timeoutMs = 3000
 # Set RLBridgeReport.url to your DRL endpoint to enable action application
 RLBridgeReport.url = http://localhost:5000/infer_and_update

@@ -61,3 +61,26 @@ git push -u origin main  # or master, depending on your repo
 
 > Note: ignore files include `/target/`, Python caches, and report logs. Adjust `.gitignore` as needed.
 
+## Model Save/Load & Train-Then-Eval
+
+- Env controls (set before starting the server):
+  - `TRAIN_UNTIL_SECONDS`: train until this sim-time, then auto-save and freeze to eval-only.
+  - `SAVE_AT_SECONDS`: one-shot autosave after crossing this sim-time (training continues).
+  - `MODEL_DIR` / `MODEL_PATH`: checkpoint location (dir or explicit file).
+  - `EVAL_ONLY=true`: start in evaluation mode (no training updates).
+
+- Examples
+  - Train 60 minutes (3600s), save, then evaluate with the frozen policy:
+    ```bash
+    TRAIN_UNTIL_SECONDS=3600 DRL_POLICY=ppo python toolkit/drl_server.py
+    ```
+  - Train for a long run (e.g., 600k s) but save once at 60k s:
+    ```bash
+    SAVE_AT_SECONDS=60000 DRL_POLICY=ppo python toolkit/drl_server.py
+    ```
+  - Manual save/load:
+    ```bash
+    curl -X POST http://127.0.0.1:5000/save  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
+    curl -X POST http://127.0.0.1:5000/load  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
+    ```
+
