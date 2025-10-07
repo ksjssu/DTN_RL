@@ -1,11 +1,11 @@
-# DRL Live Integration (PPO, synchronous per-step)
+﻿# DRL Live Integration (PPO, synchronous per-step)
 
 This repo contains a live DRL (PPO) bridge between The ONE simulator (Java) and a Python server.
 
 ## Components
 
 - Java
-  - `src/report/RLBridgeReport.java`: Sends state to Python and applies per-message predictability deltas (Δ) returned by the DRL server.
+  - `src/report/RLBridgeReport.java`: Sends state to Python and applies per-message predictability deltas (?) returned by the DRL server.
   - `src/report/RLStateReport.java`: Logs per-step rewards and per-message state for inspection.
   - `src/routing/ProphetRouter.java`: Supports external predictability offsets via `setExternalOffset()`.
 - Python
@@ -40,14 +40,20 @@ This repo contains a live DRL (PPO) bridge between The ONE simulator (Java) and 
 - `Report.report6 = RLBridgeReport`
 - `RLBridgeReport.sampleInterval = 30` (step/reward period)
 - `RLBridgeReport.windowSize = 600` (state window average)
-- `RLBridgeReport.deltaLimit = 0.05` (Δ clamp)
+- `RLBridgeReport.deltaLimit = 0.05` (? clamp)
 - `RLBridgeReport.maxMessagesPerNode = 20` (inference cap)
 - `RLBridgeReport.url = http://localhost:5000/infer_and_update`
 
-## Outputs
+### Observation Vector (DRL)
 
-- `reports/*_RLStateReport.txt`: State and per-step reward logs.
-- `reports/*_RLBridgeReport.txt`: Bridge diagnostics (HTTP ok/timeouts, applied action counts).
+The server expects 5-dim observations per host-destination pair:
+
+- `[contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util]`
+  - `contacts_norm`: normalized average contacts over a time window
+  - `pred`: PRoPHET predictability to the destination
+  - `bufocc_mean`: mean buffer occupancy derived from the shared tracker (0-1)
+  - `capacity_norm`: node buffer capacity normalized by the scenario's maximum
+  - `self_buf_util`: current node buffer utilization (used / total)
 
 ## Pushing to GitHub
 
@@ -83,4 +89,6 @@ git push -u origin main  # or master, depending on your repo
     curl -X POST http://127.0.0.1:5000/save  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
     curl -X POST http://127.0.0.1:5000/load  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
     ```
+
+
 

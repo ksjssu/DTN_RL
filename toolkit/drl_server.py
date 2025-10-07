@@ -10,7 +10,8 @@ Request JSON:
   "delta_limit": 0.05,
   "prev_transition": [ {"host":"p1","relayed":3,"drops":1,"aborted":0,"delivered":1}, ... ],
   "state_batch": [ {"host":"p1","msg_id":"H176","dest":"w82",
-                     "contacts_norm":0.12,"freebuf_norm":0.93,"pred":0.5881}, ... ]
+                     "contacts_norm":0.12,"pred":0.5881,"bufocc_mean":0.45,
+                     "capacity_norm":0.5,"self_buf_util":0.35}, ... ]
 }
 
 Response JSON:
@@ -20,7 +21,7 @@ Response JSON:
 }
 
 Notes:
-- Observations are 3-dim: [contacts_norm, freebuf_norm, pred]
+- Observations are 5-dim: [contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util]
 - Action is scalar delta in [-delta_limit, +delta_limit]; modeled via tanh(mean) * delta_limit (Gaussian policy optional)
 - Per-step update uses weighted rewards from prev_transition: r = W_DELIVER*delivered + W_RELAY*relayed - W_DROP*drops - W_ABORT*aborted (env-configurable). Reward is divided equally among messages that received action in the previous step for that host.
 - If torch is unavailable, falls back to a heuristic policy.
@@ -41,26 +42,92 @@ try:
 except Exception:
     TORCH_OK = False
 
-HOST = "127.0.0.1"
-PORT = 5000
+HOST = os.environ.get("DRL_HOST", "127.0.0.1")
+PORT = int(float(os.environ.get("DRL_PORT", "5000")))
 
-# Epsilon-greedy configuration (overridable via environment)
-EPS_POLICY = os.environ.get("DRL_POLICY", "eps_greedy").lower()  # ppo | heuristic | eps_greedy
-EPS_START = float(os.environ.get("EPS_START", "0.30"))
-EPS_END = float(os.environ.get("EPS_END", "0.05"))
-EPISODE_SECONDS = int(float(os.environ.get("EPISODE_SECONDS", "3600")))
-TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "12"))
-SIM_END_SECONDS = int(float(os.environ.get("SIM_END_SECONDS", "1200000")))  # single-run horizon
+# Action logging configuration
+PPO_DEBUG_ACTIONS = os.environ.get("PPO_DEBUG_ACTIONS", "false").lower() == "true"
 
-# Training / checkpoint control (env)
-# TRAIN_UNTIL_SECONDS: 학습을 이 시뮬레이션 시간까지 수행하고 자동 저장 후 평가 모드로 전환
-TRAIN_UNTIL_SECONDS = int(float(os.environ.get("TRAIN_UNTIL_SECONDS", "0")))
-# SAVE_AT_SECONDS: 이 시뮬레이션 시간을 초과하면 1회 저장(학습 지속)
-SAVE_AT_SECONDS = int(float(os.environ.get("SAVE_AT_SECONDS", "0")))
-# MODEL_DIR / MODEL_PATH: 저장 위치 지정(디렉토리 / 파일)
+# Step-by-step reward tracking configuration
+STEP_REWARD_TRACKING = os.environ.get("STEP_REWARD_TRACKING", "true").lower() == "true"
+
+def log_step_rewards(sim_time, rewards_per_host, buffer_size_mb=None):
+    """Log step-by-step rewards for tracking and graphing."""
+    if not STEP_REWARD_TRACKING:
+        return
+
+    try:
+        # Create reward logs directory
+        log_dir = os.path.join("reports", "reward_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Determine log file based on buffer size
+        if buffer_size_mb:
+            log_file = os.path.join(log_dir, f"step_rewards_buf{int(buffer_size_mb)}M.csv")
+        else:
+            log_file = os.path.join(log_dir, "step_rewards.csv")
+
+        # Write header if file doesn't exist
+        write_header = not os.path.exists(log_file)
+
+        with open(log_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("sim_time,total_reward,avg_reward_per_host,num_hosts\n")
+
+            total_reward = sum(rewards_per_host.values()) if rewards_per_host else 0.0
+            num_hosts = len(rewards_per_host) if rewards_per_host else 0
+            avg_reward = total_reward / num_hosts if num_hosts > 0 else 0.0
+
+            f.write(f"{sim_time},{total_reward},{avg_reward},{num_hosts}\n")
+    except Exception:
+        pass  # Silent fail for logging
+
+def log_actions_for_visualization(sim_time, state_batch, actions_raw, flat_map):
+    """Log actions for visualization analysis."""
+    try:
+        # Create action logs directory
+        log_dir = os.path.join("reports", "action_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Log to CSV file for visualization
+        csv_file = os.path.join(log_dir, "actions.csv")
+
+        # Write header if file doesn't exist
+        write_header = not os.path.exists(csv_file)
+
+        with open(csv_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("sim_time,host,dest,contacts_norm,freebuf_norm,pred,action_delta\n")
+
+            for i, item in enumerate(state_batch):
+                try:
+                    host = str(item.get("host", ""))
+                    dest = str(item.get("dest", ""))
+                    c = item.get("contacts_norm", 0.0)
+                    f_buf = item.get("freebuf_norm", 0.0)
+                    p = item.get("pred", 0.0)
+                    delta = float(actions_raw[i] if i < len(actions_raw) else 0.0)
+
+                    f.write(f"{sim_time},{host},{dest},{c},{f_buf},{p},{delta}\n")
+                except Exception:
+                    continue
+    except Exception as e:
+        pass  # Silent fail for logging
+
+# Training configuration - 10만초 에피소드 50번 학습 디폴트
+EPISODE_SECONDS = int(float(os.environ.get("EPISODE_SECONDS", "100000")))  # 10만초 에피소드
+TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "50"))  # 50번 학습
+SIM_END_SECONDS = int(float(os.environ.get("SIM_END_SECONDS", "5000000")))  # 500만초 (50 에피소드 * 10만초)
+
+# Training / checkpoint control - 에피소드 단위 자동 저장
+# TRAIN_UNTIL_SECONDS: 호환성을 위해 유지하되 사용 안함 (에피소드 기반 저장 사용)
+TRAIN_UNTIL_SECONDS = int(float(os.environ.get("TRAIN_UNTIL_SECONDS", "0")))  # 비활성화
+# SAVE_AT_SECONDS: 에피소드 기반 저장으로 대체되어 사용 안함
+SAVE_AT_SECONDS = int(float(os.environ.get("SAVE_AT_SECONDS", "0")))  # 비활성화
+# MODEL_DIR / MODEL_PATH: checkpoint directory / explicit file path
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
-MODEL_PATH = os.environ.get("MODEL_PATH", "")  # 비어있으면 자동 네이밍 사용
-# EVAL_ONLY=true: 시작부터 학습 비활성화(평가 전용)
+MODEL_PATH = os.environ.get("MODEL_PATH", "")  # empty = auto-generate when saving
+# EVAL_ONLY=true: disable training updates (inference only)
 EVAL_ONLY = os.environ.get("EVAL_ONLY", "false").lower() in ("1", "true", "yes")
 
 # Reward weights (overridable via environment)
@@ -69,7 +136,98 @@ W_DELIVER = float(os.environ.get("W_DELIVER", "20.0"))
 W_RELAY   = float(os.environ.get("W_RELAY",   "10.0"))
 W_DROP    = float(os.environ.get("W_DROP",    "2.0"))
 W_ABORT   = float(os.environ.get("W_ABORT",   "0.5"))
-W_DELAY   = float(os.environ.get("W_DELAY",   "0.001"))  # penalty for high delay (direct relationship)
+W_DELAY   = 0.0  # penalty for high delay (direct relationship) - disabled but logic kept
+W_PRESSURE = float(os.environ.get("W_PRESSURE", "3.0"))  # buffer-pressure bonus scaling (8.0→3.0 스케일 다운)
+
+def extract_buffer_size_mb(sim_id):
+    """Extract buffer size from sim_id. Returns buffer size in MB or None if not found."""
+    try:
+        sim_id_lower = sim_id.lower()
+        if "buf" in sim_id_lower:
+            # Look for patterns like "buf05", "buf10", "buf30", etc.
+            import re
+            match = re.search(r'buf(\d+)', sim_id_lower)
+            if match:
+                return float(match.group(1))
+        return None
+    except Exception:
+        return None
+
+def get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty):
+    """
+    Calculate base reward (delivery, drop, abort penalties).
+    Additional relay rewards are calculated separately based on buffer conditions.
+    """
+    buffer_size = extract_buffer_size_mb(sim_id)
+
+    if buffer_size is None:
+        # Fallback to environment variables if buffer size not detected
+        return (W_DELIVER * delivered) + (W_RELAY * relayed) - (W_DROP * drops) - (W_ABORT * aborted) - delay_penalty
+
+    # Buffer-specific base reward strategies
+    if buffer_size == 10.0:
+        # 10M: Delivery-focused with abort penalty only (NO relay in base, added conditionally later)
+        # Drop penalty: 0.0, Abort penalty: 36.0
+        return (delivered * 55.0) - (aborted * 36.0)
+    elif buffer_size == 20.0:
+        # 20M: Delivery reward only, no penalties (NO relay in base)
+        # Drop penalty: 0.0, Abort penalty: 0.0
+        return (delivered * 55.0)
+    elif buffer_size <= 20.0:
+        # 5M, 15M: Follow 10M strategy (abort penalty only)
+        # Drop penalty: 0.0, Abort penalty: 36.0
+        return (delivered * 55.0) - (aborted * 36.0)
+    elif buffer_size <= 25.0:
+        # 25M: Delivery only (NO relay in base, added conditionally later)
+        return delivered * 10.0
+    else:
+        # 30M+: Delivery + relay in base (YES relay included)
+        return (delivered * 10.0) + (relayed * 10.0)
+
+
+def calculate_relay_reward(buffer_size, relayed, self_util, buf_mean):
+    """
+    Calculate relay-specific rewards based on buffer size and conditions.
+    This is added to the base reward.
+
+    Returns:
+        float: Additional reward/penalty for relay behavior
+    """
+    if relayed <= 0:
+        return 0.0
+
+    pressure_diff = self_util - buf_mean
+
+    # 5M-15M: Relay reward DISABLED (turned off)
+    if buffer_size is not None and buffer_size < 20.0:
+        return 0.0
+
+    # 20M: Pressure-based relay reward (enabled)
+    if buffer_size == 20.0:
+        if pressure_diff >= 0.05:  # 내가 여유롭고 네트워크가 막힌 경우
+            bonus = min(pressure_diff * 6.0, 3.0)
+            relay_contribution = bonus * min(relayed, 50.0)
+            return max(-4.0, min(4.0, relay_contribution))
+        elif pressure_diff <= -0.05:  # 내가 부족한데 네트워크가 여유로운 경우
+            penalty = max(pressure_diff * 8.0, -4.0)
+            relay_contribution = penalty * min(relayed, 50.0)
+            return max(-4.0, min(4.0, relay_contribution))
+        else:
+            return 0.0
+
+    # 25M: Threshold-based smart relay
+    elif buffer_size == 25.0:
+        if self_util <= 0.6:  # 여유있음 → 보상
+            return 5.0 * relayed
+        elif self_util >= 0.8:  # 부족함 → 패널티
+            return -3.0 * relayed
+
+    # 30M+: Smart relay bonus when buffer below 70%
+    elif buffer_size > 25.0:
+        if self_util <= 0.7:
+            return 5.0 * relayed
+
+    return 0.0
 
 
 class HeuristicPolicy:
@@ -77,11 +235,17 @@ class HeuristicPolicy:
         pass
 
     def act_batch(self, obs_batch, delta_limit):
-        # obs: list of (contacts_norm, freebuf_norm, pred)
+        # obs: list of (contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util)
         out = []
-        for c, f, p in obs_batch:
-            c = float(c or 0.0); f = float(f or 0.0); p = float(p or 0.0)
-            base = c * max(0.0, 1.0 - f) * max(0.0, 1.0 - p)
+        for obs in obs_batch:
+            c = float(obs[0] or 0.0)  # contacts_norm
+            p = float(obs[1] or 0.0)  # pred
+            buf_mean = float(obs[2] or 0.0)  # bufocc_mean
+            cap_norm = float(obs[3] or 0.0)  # capacity_norm
+            self_util = float(obs[4] or 0.0)  # self_buf_util
+
+            # Simple heuristic: use self_util instead of freebuf
+            base = c * max(0.0, 1.0 - self_util) * max(0.0, 1.0 - p)
             if delta_limit is not None and delta_limit > 0:
                 delta = delta_limit * base
                 delta = max(-delta_limit, min(delta_limit, delta))
@@ -96,12 +260,12 @@ class HeuristicPolicy:
 
 
 class PPOPolicy:
-    def __init__(self, obs_dim=3, hidden=64):
+    def __init__(self, obs_dim=5, hidden1=128, hidden2=128):
         # Hyperparameters (env-overridable)
         self.clip_eps = float(os.environ.get("PPO_CLIP", "0.2"))
         self.value_coef = float(os.environ.get("PPO_VALUE_COEF", "0.5"))
-        self.entropy_coef = float(os.environ.get("PPO_ENTROPY", "0.0"))
-        self.lr = float(os.environ.get("PPO_LR", "3e-4"))
+        self.entropy_coef = float(os.environ.get("PPO_ENTROPY", "0.005"))  # 탐험 보수적: 0.015 → 0.005
+        self.lr = float(os.environ.get("PPO_LR", "3e-4"))  # 학습률 복원: 2e-4 → 3e-4
         self.batch_size = int(os.environ.get("PPO_BATCH_SIZE", "1024"))
         self.minibatch = int(os.environ.get("PPO_MINIBATCH", "128"))
         self.epochs = int(os.environ.get("PPO_EPOCHS", "6"))
@@ -109,17 +273,20 @@ class PPOPolicy:
         self.device = torch.device("cpu")
 
         # Actor: outputs mean; log_std is a learnable parameter
+        # Architecture: 5-128-128-1
         self.actor = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1)
+            nn.Linear(obs_dim, hidden1), nn.Tanh(),
+            nn.Linear(hidden1, hidden2), nn.Tanh(),
+            nn.Linear(hidden2, 1)
         ).to(self.device)
         self.log_std = nn.Parameter(torch.zeros(1, device=self.device))
+        self.log_std_min = -3.0  # 최소 log_std 완화: -2.0 → -3.0
         # Critic
+        # Architecture: 5-128-128-1
         self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1)
+            nn.Linear(obs_dim, hidden1), nn.Tanh(),
+            nn.Linear(hidden1, hidden2), nn.Tanh(),
+            nn.Linear(hidden2, 1)
         ).to(self.device)
         self.opt = optim.Adam(list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()), lr=self.lr)
 
@@ -138,7 +305,8 @@ class PPOPolicy:
         return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
     def _tanh_gaussian_sample(self, mean):
-        std = self.log_std.exp().expand_as(mean)
+        log_std_clamped = torch.clamp(self.log_std, min=self.log_std_min)
+        std = log_std_clamped.exp().expand_as(mean)
         normal = torch.distributions.Normal(mean, std)
         u = normal.rsample()  # reparameterized
         a = torch.tanh(u)
@@ -147,7 +315,8 @@ class PPOPolicy:
         return u, a, logp.squeeze(-1)
 
     def _tanh_gaussian_logprob(self, mean, u):
-        std = self.log_std.exp().expand_as(mean)
+        log_std_clamped = torch.clamp(self.log_std, min=self.log_std_min)
+        std = log_std_clamped.exp().expand_as(mean)
         normal = torch.distributions.Normal(mean, std)
         a = torch.tanh(u)
         logp = normal.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)
@@ -247,8 +416,9 @@ class PPOPolicy:
                 value_loss = (value_pred - b_ret).pow(2).mean()
 
                 # approximate entropy of underlying normal (ignoring tanh)
-                std = self.log_std.exp()
-                entropy = (0.5 + 0.5 * math.log(2 * math.pi)) + self.log_std
+                log_std_clamped = torch.clamp(self.log_std, min=self.log_std_min)
+                std = log_std_clamped.exp()
+                entropy = (0.5 + 0.5 * math.log(2 * math.pi)) + log_std_clamped
                 entropy = entropy.sum()
 
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
@@ -257,9 +427,25 @@ class PPOPolicy:
                 nn.utils.clip_grad_norm_(list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()), 1.0)
                 self.opt.step()
 
+        # Diagnostic logging
+        std_mean = std.mean().item()
+        entropy_mean = entropy.item() / std.numel()  # per dimension
+        adv_mean = adv.mean().item()
+        adv_var = adv.var().item()
+
+        # Log diagnostics to file
+        try:
+            import os
+            os.makedirs("reports", exist_ok=True)
+            with open(os.path.join("reports", "drl_policy_diagnostics.txt"), "a", encoding="utf-8") as f:
+                f.write(f"UPDATE: std_mean={std_mean:.6f} entropy_mean={entropy_mean:.6f} "
+                       f"adv_mean={adv_mean:.6f} adv_var={adv_var:.6f} batch_size={n}\n")
+        except Exception:
+            pass
+
         # Clear buffer after update
         self.buf_obs.clear(); self.buf_act_pre.clear(); self.buf_logp.clear(); self.buf_val.clear(); self.buf_rew.clear()
-        return {"updated": True, "trained_on": n}
+        return {"updated": True, "trained_on": n, "std_mean": std_mean, "entropy": entropy_mean, "adv_var": adv_var}
 
     # --- Checkpoint I/O ---
     def save(self, path):
@@ -270,7 +456,7 @@ class PPOPolicy:
             "opt": self.opt.state_dict(),
             "meta": {
                 "policy_id": self.policy_id,
-                "obs_dim": 3,
+                "obs_dim": 5,
             },
         }
         p = pathlib.Path(path)
@@ -315,15 +501,36 @@ class Handler(BaseHTTPRequestHandler):
     else:
         AGENT = HeuristicPolicy()
         BASE_POLICY_ID = "heuristic_v1"
-    POLICY_ID = BASE_POLICY_ID if EPS_POLICY != "eps_greedy" else f"eps_greedy({BASE_POLICY_ID})"
+    POLICY_ID = BASE_POLICY_ID
+    if MODEL_PATH:
+        try:
+            if TORCH_OK:
+                res = AGENT.load(MODEL_PATH)
+                if res.get("ok", False):
+                    print(f"[BOOT] Loaded model from {MODEL_PATH}")
+                else:
+                    print(f"[BOOT] Failed to load model from {MODEL_PATH}: {res.get('error', 'unknown')}")
+            else:
+                print(f"[BOOT] MODEL_PATH set but torch unavailable: {MODEL_PATH}")
+        except Exception as e:
+            print(f"[BOOT] Exception while loading MODEL_PATH {MODEL_PATH}: {e}")
     # Episode tracking for reward reporting
     EP_CUR = None
     EP_REWARD_ACC = 0.0
+    STATE_CACHE = {}  # host#dest -> feature snapshot from previous step
     EP_COUNT = 0  # increments when simulator notifies episode end
+    # Detailed reward component tracking
+    EP_DELIVERED_SUM = 0.0
+    EP_PRESSURE_SUM = 0.0
+    EP_RELAYED_SUM = 0.0
+    EP_OVERHEAD_PENALTY = 0.0
+    # Observation variance tracking
+    OBS_CONTACTS = []
+    OBS_FREEBUF = []
+    OBS_PRED = []
     # Training control
     TRAINING_ENABLED = not EVAL_ONLY
     MODEL_SAVED_AT = None  # first save time
-    ONESHOT_SAVED = False
 
     def do_POST(self):
         # Episode end notification: record average delivery rate per run
@@ -345,11 +552,71 @@ class Handler(BaseHTTPRequestHandler):
             reward = delivered if delivered is not None else int((avg if avg==avg else 0.0) * float(created))
             Handler.EP_COUNT += 1
             try:
-                os.makedirs("reports", exist_ok=True)
-                with open(os.path.join("reports", "drl_episode_rewards.txt"), "a", encoding="utf-8") as f:
+                # Create directory structure based on sim_id buffer size
+                buffer_size = extract_buffer_size_mb(sim_id)
+                if buffer_size is not None:
+                    report_dir = f"reports_drl_train/buf{int(buffer_size):02d}"
+                else:
+                    report_dir = "reports_drl_train/unknown"
+                os.makedirs(report_dir, exist_ok=True)
+                with open(os.path.join(report_dir, "drl_episode_rewards.txt"), "a", encoding="utf-8") as f:
                     f.write(f"episode {Handler.EP_COUNT} reward {reward} avg_delivery_rate {avg:.6f} delivered {delivered} created {created} sim_id {sim_id}\n")
+
+                # Write detailed diagnostic log
+                with open(os.path.join(report_dir, "drl_diagnostic_log.txt"), "a", encoding="utf-8") as f:
+                    # Calculate observation variances
+                    import numpy as np
+                    contacts_var = np.var(Handler.OBS_CONTACTS) if Handler.OBS_CONTACTS else 0.0
+                    freebuf_var = np.var(Handler.OBS_FREEBUF) if Handler.OBS_FREEBUF else 0.0
+                    pred_var = np.var(Handler.OBS_PRED) if Handler.OBS_PRED else 0.0
+
+                    f.write(f"EP{Handler.EP_COUNT}: delivered_sum={Handler.EP_DELIVERED_SUM:.1f} "
+                           f"pressure_sum={Handler.EP_PRESSURE_SUM:.1f} relayed_sum={Handler.EP_RELAYED_SUM:.1f} "
+                           f"overhead_penalty={Handler.EP_OVERHEAD_PENALTY:.1f} "
+                           f"contacts_var={contacts_var:.6f} freebuf_var={freebuf_var:.6f} pred_var={pred_var:.6f}\n")
             except Exception:
                 pass
+
+            # Save model at episode completion
+            if TORCH_OK and Handler.EP_COUNT > 0:
+                try:
+                    os.makedirs(MODEL_DIR, exist_ok=True)
+
+                    # Extract buffer size for cleaner filenames
+                    buffer_size = extract_buffer_size_mb(sim_id)
+                    if buffer_size:
+                        model_name = f"buf{int(buffer_size)}_ep{Handler.EP_COUNT}_ppo.pt"
+                    else:
+                        model_name = f"{sim_id or 'sim'}_ep{Handler.EP_COUNT}_ppo.pt"
+
+                    path = MODEL_PATH or os.path.join(MODEL_DIR, model_name)
+                    res = Handler.AGENT.save(path)
+                    print(f"[EPISODE_END] Saved model for episode {Handler.EP_COUNT} to {res.get('path', path)} (ok={res.get('ok')})")
+
+                    # Check if training is complete
+                    if Handler.EP_COUNT >= TOTAL_EPISODES:
+                        Handler.TRAINING_ENABLED = False
+
+                        if buffer_size:
+                            final_name = f"buf{int(buffer_size)}_final_ep{TOTAL_EPISODES}_ppo.pt"
+                        else:
+                            final_name = f"{sim_id or 'sim'}_final_ep{TOTAL_EPISODES}_ppo.pt"
+
+                        final_path = MODEL_PATH or os.path.join(MODEL_DIR, final_name)
+                        final_res = Handler.AGENT.save(final_path)
+                        print(f"[TRAINING_COMPLETE] Saved final model to {final_res.get('path', final_path)} after {TOTAL_EPISODES} episodes")
+                except Exception as e:
+                    print(f"[ERROR] Failed to save model at episode {Handler.EP_COUNT}: {e}")
+
+            # Reset episode tracking variables for next episode
+            Handler.EP_DELIVERED_SUM = 0.0
+            Handler.EP_PRESSURE_SUM = 0.0
+            Handler.EP_RELAYED_SUM = 0.0
+            Handler.EP_OVERHEAD_PENALTY = 0.0
+            Handler.OBS_CONTACTS = []
+            Handler.OBS_FREEBUF = []
+            Handler.OBS_PRED = []
+
             body = json.dumps({"ok": True, "episode": Handler.EP_COUNT}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -423,6 +690,17 @@ class Handler(BaseHTTPRequestHandler):
         state_batch = req.get("state_batch", []) or []
         sim_time = int(float(req.get("time", 0)))
         sim_id = str(req.get("sim_id", ""))
+        prev_features = Handler.STATE_CACHE or {}
+        next_features = {}
+
+        def _to_float(val, default=0.0):
+            try:
+                f = float(val)
+            except Exception:
+                return default
+            if math.isnan(f) or math.isinf(f):
+                return default
+            return f
 
         # 1) Build rewards per host from prev_transition
         rewards_per_host = {}
@@ -432,7 +710,6 @@ class Handler(BaseHTTPRequestHandler):
                 relayed = float(item.get("relayed", 0) or 0)
                 drops = float(item.get("drops", 0) or 0)
                 aborted = float(item.get("aborted", 0) or 0)
-                # weights aligned with Java: wRelay=+1, wDrop=−1, wAbort=−0.5
                 r = relayed - drops - 0.5 * aborted
                 rewards_per_host[host] = rewards_per_host.get(host, 0.0) + r
             except Exception:
@@ -440,7 +717,6 @@ class Handler(BaseHTTPRequestHandler):
 
         # Apply optional additional weighting if 'delivered' is present
         try:
-            # Adjust rewards with configurable weights while preserving legacy base r
             has_delivered = any((isinstance(it, dict) and ('delivered' in it)) for it in prev_tr)
             if has_delivered:
                 for item in prev_tr:
@@ -452,13 +728,18 @@ class Handler(BaseHTTPRequestHandler):
                         aborted = float(item.get("aborted", 0) or 0)
                         avg_delay = float(item.get("avg_delay", 0) or 0)  # average delivery delay in seconds
                         
-                        # Delay penalty: direct relationship - higher delay = higher penalty
                         delay_penalty = 0
                         if delivered > 0 and avg_delay > 0:
                             delay_penalty = W_DELAY * delivered * avg_delay
                         
-                        r_adj = (W_DELIVER * delivered) + (W_RELAY - 1.0) * relayed - (W_DROP - 1.0) * drops - (W_ABORT - 0.5) * aborted - delay_penalty
+                        r_adj = get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty)
                         rewards_per_host[host] = rewards_per_host.get(host, 0.0) + r_adj
+
+                        # Track reward components for episode analysis
+                        Handler.EP_DELIVERED_SUM += delivered
+                        Handler.EP_RELAYED_SUM += relayed
+
+                        # No additional penalties for 5M-25M buffers (delivery reward only)
                     except Exception:
                         continue
         except Exception:
@@ -472,6 +753,7 @@ class Handler(BaseHTTPRequestHandler):
                 dest = str(item.get("dest", "")) if isinstance(item, dict) else ""
                 if not dest:
                     continue
+                key = f"{host}#{dest}"
                 relayed = float(item.get("relayed", 0) or 0)
                 drops = float(item.get("drops", 0) or 0)
                 aborted = float(item.get("aborted", 0) or 0)
@@ -479,13 +761,32 @@ class Handler(BaseHTTPRequestHandler):
                 avg_delay = float(item.get("avg_delay", 0) or 0)
                 base = relayed - drops - 0.5 * aborted
                 
-                # Include delay penalty in per-key calculation
                 delay_penalty = 0
                 if delivered > 0 and avg_delay > 0:
                     delay_penalty = W_DELAY * delivered * avg_delay
                 
-                r = (W_DELIVER * delivered) + (W_RELAY * relayed) - (W_DROP * drops) - (W_ABORT * aborted) - delay_penalty if ('delivered' in item) else base
-                key = f"{host}#{dest}"
+                # Calculate base reward
+                r = get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty) if ('delivered' in item) else base
+
+                # Calculate additional relay reward based on buffer conditions
+                feature = prev_features.get(key)
+                relay_reward = 0.0
+                buffer_size = extract_buffer_size_mb(sim_id)
+
+                if feature and buffer_size is not None:
+                    self_util_prev = _to_float(feature.get("self_buf_util"), 0.0)
+                    buf_mean_prev = _to_float(feature.get("bufocc_mean"), 0.0)
+
+                    # Calculate relay reward using unified function
+                    relay_reward = calculate_relay_reward(buffer_size, relayed, self_util_prev, buf_mean_prev)
+
+                # Add relay reward to total reward
+                if relay_reward != 0.0:
+                    rewards_per_host[host] = rewards_per_host.get(host, 0.0) + relay_reward
+                    r += relay_reward
+                    # Track relay reward component
+                    Handler.EP_PRESSURE_SUM += abs(relay_reward)
+
                 rewards_per_key[key] = rewards_per_key.get(key, 0.0) + r
         except Exception:
             pass
@@ -498,22 +799,50 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 host = str(item.get("host", ""))
                 dest = str(item.get("dest", ""))
-                c = float(item.get("contacts_norm", 0.0) or 0.0)
-                f = float(item.get("freebuf_norm", 0.0) or 0.0)
-                p = float(item.get("pred", 0.0) or 0.0)
-                obs_batch.append([c, f, p])
+                c = _to_float(item.get("contacts_norm", 0.0), 0.0)
+                self_util_cur = _to_float(item.get("self_buf_util"), 0.0)
+                buf_mean_cur = _to_float(item.get("bufocc_mean"), 0.0)
+                cap_norm_cur = _to_float(item.get("capacity_norm"), 0.0)
+                freebuf_raw = item.get("freebuf_norm", None)
+                if freebuf_raw is None:
+                    freebuf_raw = 1.0 - self_util_cur
+                f = _to_float(freebuf_raw, 0.0)
+                if f < 0.0:
+                    f = 0.0
+                if f > 1.0:
+                    f = 1.0
+                p = _to_float(item.get("pred", 0.0), 0.0)
+                # 5-dimensional observation: [contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util]
+                obs_batch.append([c, p, buf_mean_cur, cap_norm_cur, self_util_cur])
                 k = f"{host}#{dest}"
                 keys.append(k)
                 map_host_to_keys[host].append(k)
+
+                # Collect observations for variance analysis
+                Handler.OBS_CONTACTS.append(c)
+                Handler.OBS_FREEBUF.append(f)
+                Handler.OBS_PRED.append(p)
+                next_features[k] = {
+                    "self_buf_util": self_util_cur,
+                    "bufocc_mean": buf_mean_cur,
+                    "capacity_norm": cap_norm_cur,
+                    "freebuf_norm": f,
+                }
             except Exception:
                 continue
 
+        Handler.STATE_CACHE = next_features
         # 2b) Episode reward accumulation and report
         try:
             ep_idx = (sim_time // EPISODE_SECONDS) if EPISODE_SECONDS > 0 else 0
         except Exception:
             ep_idx = 0
         sum_r = sum(rewards_per_host.values()) if rewards_per_host else 0.0
+
+        # Log step-by-step rewards
+        if STEP_REWARD_TRACKING and rewards_per_host:
+            buffer_size = extract_buffer_size_mb(sim_id)
+            log_step_rewards(sim_time, rewards_per_host, buffer_size)
         if Handler.EP_CUR is None:
             Handler.EP_CUR = ep_idx
             Handler.EP_REWARD_ACC = 0.0
@@ -521,8 +850,10 @@ class Handler(BaseHTTPRequestHandler):
             Handler.EP_REWARD_ACC += sum_r
         else:
             try:
+                # This section logs step-by-step reward accumulation (less important)
+                # Will write to general reports directory for now
                 os.makedirs("reports", exist_ok=True)
-                with open(os.path.join("reports", "drl_episode_rewards.txt"), "a", encoding="utf-8") as f:
+                with open(os.path.join("reports", "drl_step_rewards.txt"), "a", encoding="utf-8") as f:
                     f.write(f"episode {Handler.EP_CUR} reward_sum {Handler.EP_REWARD_ACC:.4f}\n")
             except Exception:
                 pass
@@ -530,29 +861,7 @@ class Handler(BaseHTTPRequestHandler):
             Handler.EP_REWARD_ACC = sum_r
 
         # 3) Training / checkpoint logic
-        # Autosave at SAVE_AT_SECONDS (one-shot)
-        if TORCH_OK and (not Handler.ONESHOT_SAVED) and SAVE_AT_SECONDS > 0 and sim_time >= SAVE_AT_SECONDS:
-            # Prefer user-defined path; else auto name by sim_id and time
-            path = MODEL_PATH or os.path.join(MODEL_DIR, f"{sim_id or 'sim'}_t{sim_time}_ppo.pt")
-            res = Handler.AGENT.save(path)
-            Handler.ONESHOT_SAVED = True
-            Handler.MODEL_SAVED_AT = sim_time
-            try:
-                print(f"[CHKPT] Saved model at t={sim_time} to {res.get('path', path)} (ok={res.get('ok')})")
-            except Exception:
-                pass
-
-        # Train-until mode: after threshold, save and switch to eval-only
-        if TORCH_OK and TRAIN_UNTIL_SECONDS > 0 and sim_time >= TRAIN_UNTIL_SECONDS and Handler.TRAINING_ENABLED:
-            # Save once at the cutoff
-            path = MODEL_PATH or os.path.join(MODEL_DIR, f"{sim_id or 'sim'}_t{TRAIN_UNTIL_SECONDS}_ppo.pt")
-            res = Handler.AGENT.save(path)
-            Handler.MODEL_SAVED_AT = TRAIN_UNTIL_SECONDS
-            Handler.TRAINING_ENABLED = False
-            try:
-                print(f"[TRAIN->EVAL] Saved model at cutoff t={TRAIN_UNTIL_SECONDS} to {res.get('path', path)}; switch to eval-only")
-            except Exception:
-                pass
+        # Note: Model saving is now handled in /episode_end endpoint for accuracy
 
         # Update policy only if training enabled
         if TORCH_OK:
@@ -561,31 +870,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             Handler.AGENT.update()
 
-        # 4) Infer actions for current batch (optionally epsilon-greedy)
-        if EPS_POLICY == "eps_greedy":
-            # Compute epsilon schedule
-            if TOTAL_EPISODES <= 1:
-                # Single-episode: decay over wall-clock sim progress
-                progress = 0.0
-                if SIM_END_SECONDS > 0:
-                    progress = max(0.0, min(1.0, float(sim_time) / float(SIM_END_SECONDS)))
-                eps_now = EPS_START - (EPS_START - EPS_END) * progress
-                eps_now = max(EPS_END, min(EPS_START, eps_now))
-            else:
-                # Multi-episode: decay per episode index
-                idx_clamped = max(0, min(ep_idx, TOTAL_EPISODES - 1))
-                eps_now = EPS_START - (EPS_START - EPS_END) * (idx_clamped / (TOTAL_EPISODES - 1))
-                eps_now = max(EPS_END, min(EPS_START, eps_now))
-            # Exploitation via base policy
-            base_actions = Handler.AGENT.act_batch(obs_batch, delta_limit) if not TORCH_OK else Handler.AGENT.act_batch(obs_batch, delta_limit, keys)
-            actions_raw = []
-            for a in base_actions:
-                if random.random() < eps_now:
-                    actions_raw.append(random.uniform(-delta_limit, delta_limit))
-                else:
-                    actions_raw.append(a)
-        else:
-            actions_raw = Handler.AGENT.act_batch(obs_batch, delta_limit) if not TORCH_OK else Handler.AGENT.act_batch(obs_batch, delta_limit, keys)
+        # 4) Infer actions for current batch
+        actions_raw = Handler.AGENT.act_batch(obs_batch, delta_limit) if not TORCH_OK else Handler.AGENT.act_batch(obs_batch, delta_limit, keys)
 
         # 5) Group actions by host and also provide a flat map for robustness
         per_host = defaultdict(list)
@@ -608,17 +894,15 @@ class Handler(BaseHTTPRequestHandler):
         actions = [{"host": h, "per_message": v} for h, v in per_host.items()]
         resp = {"policy_id": Handler.POLICY_ID, "actions": actions, "actions_kv": flat_map}
 
+        # Log actions for visualization if enabled
+        if PPO_DEBUG_ACTIONS:
+            log_actions_for_visualization(req.get('time', 0), state_batch, actions_raw, flat_map)
+
         body = json.dumps(resp).encode("utf-8")
         try:
-            # Concise per-request trace to ease debugging
+            # Concise per-request trace
             total_actions = sum(len(v) for v in per_host.values())
-            extra = ""
-            if EPS_POLICY == "eps_greedy":
-                if TOTAL_EPISODES <= 1:
-                    extra = f" eps=[{EPS_START}->{EPS_END}] progress={sim_time}/{SIM_END_SECONDS}"
-                else:
-                    extra = f" eps=[{EPS_START}->{EPS_END}] ep={Handler.EP_COUNT}/{TOTAL_EPISODES}"
-            print(f"t={req.get('time')} states={len(state_batch)} actions={total_actions} policy={Handler.POLICY_ID}{extra}")
+            print(f"t={req.get('time')} states={len(state_batch)} actions={total_actions} policy={Handler.POLICY_ID}")
         except Exception:
             pass
         self.send_response(200)

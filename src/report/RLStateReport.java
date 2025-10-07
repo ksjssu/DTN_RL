@@ -1,7 +1,7 @@
 /*
  * RL State and Reward sampling report.
  * Emits, at fixed sampling intervals, per-node reward summary and per-message state tuples.
- * State per message m: [contacts_norm, freebuf_norm, pred(self->dest(m))].
+ * State per message m: [contacts_norm, pred(self->dest(m)), bufocc_mean, capacity_norm, self_buf_util].
  * Reward per node over the last interval: r = wDeliver*delivered - wDrop*dropped - wAbort*aborted.
  */
 package report;
@@ -47,7 +47,6 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     private final int maxMsgsPerNode;
 
     private final Map<Integer, Deque<Double>> contactsHistory = new HashMap<Integer, Deque<Double>>();
-    private final Map<Integer, Deque<Double>> freeFracHistory = new HashMap<Integer, Deque<Double>>();
 
     // Reward counters since last sample
     private final Map<Integer, Integer> relayedCnt = new HashMap<Integer, Integer>();
@@ -62,6 +61,9 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     private final double wDrop;
     private final double wAbort;
     private final String reportUrl;
+
+    // Buffer occupancy knowledge (contact-based exchange)
+    private final BufferOccupancyTracker bufOccTracker = new BufferOccupancyTracker();
 
     public RLStateReport() {
         super();
@@ -79,13 +81,33 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         this.wAbort = s.getDouble(W_ABORT_S, 0.5);
         this.reportUrl = s.getSetting(REPORT_URL_S, "");
 
-        write("# time type host msgId dest contacts_norm freebuf_norm pred relayed drops aborted reward");
+        write("# time type host msgId dest contacts_norm pred bufocc_mean capacity_norm self_buf_util relayed drops aborted reward");
     }
 
     @Override
     protected void sample(final List<DTNHost> hosts) {
         final int windowSamples = Math.max(1, (int)Math.round(this.windowSizeSeconds / super.interval));
         final int now = (int) SimClock.getTime();
+
+        double maxBufferSize = 0.0;
+        if (hosts != null) {
+            for (DTNHost h : hosts) {
+                if (h == null) { continue; }
+                MessageRouter router = h.getRouter();
+                if (router != null) {
+                    long bufSize = router.getBufferSize();
+                    if (bufSize > maxBufferSize) {
+                        maxBufferSize = bufSize;
+                    }
+                }
+            }
+        }
+        if (maxBufferSize <= 0) {
+            maxBufferSize = 1.0;
+        }
+
+        // Update buffer occupancy tables (knowledge exchange) before sampling
+        try { this.bufOccTracker.update(hosts, now, this.windowSizeSeconds); } catch (Exception ignore) {}
 
         for (DTNHost h : hosts) {
             final String hostStr = h.toString();
@@ -100,68 +122,37 @@ public class RLStateReport extends SamplingReport implements MessageListener {
             // contacts_now
             final double contactsNow = peers.size();
 
-            // free fraction now across {self+peers}
-            double sumFrac = 0.0;
-            int fracCount = 0;
-
-            // self
             final MessageRouter selfRouter = h.getRouter();
+            double capacityNorm = 0.0;
+            double selfBufUtil = Double.NaN;
             if (selfRouter != null) {
+                if (maxBufferSize > 0) {
+                    capacityNorm = ((double) selfRouter.getBufferSize()) / maxBufferSize;
+                    if (capacityNorm < 0.0) { capacityNorm = 0.0; }
+                    if (capacityNorm > 1.0) { capacityNorm = 1.0; }
+                }
                 long size = selfRouter.getBufferSize();
                 long free = selfRouter.getFreeBufferSize();
                 if (size > 0 && size < Integer.MAX_VALUE) {
-                    double frac = (free * 1.0) / size;
-                    if (frac < 0.0) frac = 0.0;
-                    if (frac > 1.0) frac = 1.0;
-                    sumFrac += frac;
-                    fracCount += 1;
+                    double util = 1.0 - ((double) free / size);
+                    if (util < 0.0) { util = 0.0; }
+                    if (util > 1.0) { util = 1.0; }
+                    selfBufUtil = util;
                 }
             }
 
-            // peers
-            for (Integer pid : peers) {
-                DTNHost ph = null;
-                for (DTNHost cand : hosts) {
-                    if (cand.getAddress() == pid) { ph = cand; break; }
-                }
-                if (ph != null && ph.getRouter() != null) {
-                    MessageRouter r = ph.getRouter();
-                    long size = r.getBufferSize();
-                    long free = r.getFreeBufferSize();
-                    if (size > 0 && size < Integer.MAX_VALUE) {
-                        double frac = (free * 1.0) / size;
-                        if (frac < 0.0) frac = 0.0;
-                        if (frac > 1.0) frac = 1.0;
-                        sumFrac += frac;
-                        fracCount += 1;
-                    }
-                }
-            }
-
-            final double freeFracNow = (fracCount > 0) ? (sumFrac / fracCount) : Double.NaN;
-
-            // Update histories
             Deque<Double> ch = contactsHistory.get(addr);
             if (ch == null) { ch = new ArrayDeque<Double>(windowSamples); contactsHistory.put(addr, ch); }
-            Deque<Double> fh = freeFracHistory.get(addr);
-            if (fh == null) { fh = new ArrayDeque<Double>(windowSamples); freeFracHistory.put(addr, fh); }
-
-            if (ch.size() == windowSamples) ch.removeFirst();
-            if (fh.size() == windowSamples) fh.removeFirst();
+            if (ch.size() == windowSamples) { ch.removeFirst(); }
             ch.addLast(contactsNow);
-            fh.addLast(freeFracNow);
 
-            // Need full window for normalized outputs
-            if (ch.size() < windowSamples || fh.size() < windowSamples) {
+            if (ch.size() < windowSamples) {
                 continue;
             }
 
             double sumC = 0.0;
-            double sumFfrac = 0.0;
-            for (double v : ch) sumC += v;
-            for (double v : fh) sumFfrac += v;
+            for (double v : ch) { sumC += v; }
             final double avgC = sumC / windowSamples;
-            final double freebufNorm = sumFfrac / windowSamples; // [0,1]
 
             // contacts normalization
             double contactsNorm;
@@ -180,7 +171,8 @@ public class RLStateReport extends SamplingReport implements MessageListener {
             int dr = getAndReset(droppedCnt, addr);
             int ab = getAndReset(abortedCnt, addr);
             double reward = this.wRelay * rel - this.wDrop * dr - this.wAbort * ab;
-            write(now + " R " + hostStr + " - - " + format(contactsNorm) + " " + format(freebufNorm) + " NaN " + rel + " " + dr + " " + ab + " " + format(reward));
+            double bufOccMean = this.bufOccTracker.getMeanOccupancy(addr);
+            write(now + " R " + hostStr + " - - " + format(contactsNorm) + " NaN " + format(bufOccMean) + " " + format(capacityNorm) + " " + format(selfBufUtil) + " " + rel + " " + dr + " " + ab + " " + format(reward));
 
             // Per-message state lines (type S)
             int emitted = 0;
@@ -190,8 +182,9 @@ public class RLStateReport extends SamplingReport implements MessageListener {
                 }
                 // predictability
                 double pred = getPredFor(h, m.getTo());
+                double bufOccMean2 = this.bufOccTracker.getMeanOccupancy(addr);
                 String destStr = m.getTo().toString();
-                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(contactsNorm) + " " + format(freebufNorm) + " " + format(pred) + " 0 0 0 0.0000");
+                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(contactsNorm) + " " + format(pred) + " " + format(bufOccMean2) + " " + format(capacityNorm) + " " + format(selfBufUtil) + " 0 0 0 0.0000");
                 emitted++;
             }
         }

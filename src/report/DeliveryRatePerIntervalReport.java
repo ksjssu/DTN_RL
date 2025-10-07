@@ -20,11 +20,14 @@ public class DeliveryRatePerIntervalReport extends Report implements MessageList
 
     /** Interval (seconds) for time bins (default 3600 = 1 hour). */
     public static final String BIN_SIZE_S = "binSize";
+    /** Enables cumulative aggregation across time bins. */
+    public static final String CUMULATIVE_MODE_S = "cumulativeMode";
 
     private int binSize;
     private Map<String, Integer> msgBinById;
     private Map<Integer, Integer> createdByBin;
     private Map<Integer, Integer> deliveredByBin;
+    private boolean cumulativeMode;
 
     public DeliveryRatePerIntervalReport() {
         init();
@@ -41,11 +44,18 @@ public class DeliveryRatePerIntervalReport extends Report implements MessageList
         this.msgBinById = new HashMap<String, Integer>();
         this.createdByBin = new HashMap<Integer, Integer>();
         this.deliveredByBin = new HashMap<Integer, Integer>();
+        this.cumulativeMode = parseBooleanSetting(s.getSetting(CUMULATIVE_MODE_S, "false"));
         write("# start end created delivered success_rate");
+        write("# cumulative_mode=" + this.cumulativeMode);
     }
 
     private int timeToBin(double t) {
         return (int) Math.floor(t / this.binSize);
+    }
+
+    private boolean parseBooleanSetting(String value) {
+        String v = (value == null ? "" : value.trim().toLowerCase());
+        return ("true".equals(v) || "1".equals(v) || "yes".equals(v));
     }
 
     private void inc(Map<Integer, Integer> map, int key) {
@@ -91,13 +101,23 @@ public class DeliveryRatePerIntervalReport extends Report implements MessageList
         Set<Integer> bins = new TreeSet<Integer>();
         bins.addAll(createdByBin.keySet());
         bins.addAll(deliveredByBin.keySet());
+        int cumulativeCreated = 0;
+        int cumulativeDelivered = 0;
         for (Integer b : bins) {
             int created = createdByBin.containsKey(b) ? createdByBin.get(b) : 0;
             int delivered = deliveredByBin.containsKey(b) ? deliveredByBin.get(b) : 0;
-            double rate = (created > 0) ? ((double) delivered) / created : Double.NaN;
+            int outputCreated = created;
+            int outputDelivered = delivered;
+            if (this.cumulativeMode) {
+                cumulativeCreated += created;
+                cumulativeDelivered += delivered;
+                outputCreated = cumulativeCreated;
+                outputDelivered = cumulativeDelivered;
+            }
+            double rate = (outputCreated > 0) ? ((double) outputDelivered) / outputCreated : Double.NaN;
             int start = b * binSize;
             int end = start + binSize;
-            write(start + " " + end + " " + created + " " + delivered + " " + format(rate));
+            write(start + " " + end + " " + outputCreated + " " + outputDelivered + " " + format(rate));
         }
         super.done();
     }

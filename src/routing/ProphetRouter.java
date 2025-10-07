@@ -55,6 +55,9 @@ public class ProphetRouter extends ActiveRouter {
 	 */
 	public static final String GAMMA_S = "gamma";
 
+	/** Setting key for heuristic delta adjustments. */
+	public static final String HEURISTIC_DELTA_S = "heuristicDelta";
+
 	/** the value of nrof seconds in time unit -setting */
 	private int secondsInTimeUnit;
 	/** value of beta setting */
@@ -335,3 +338,4 @@ public class ProphetRouter extends ActiveRouter {
 	}
 
 }
+

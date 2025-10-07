@@ -1,45 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` — Java sources by package: `core/`, `routing/`, `movement/`, `input/`, `report/`, `gui/`, `applications/`, `interfaces/`, `ui/`, `util/`. Tests live in `src/test/`.
-- `target/` — Compiled classes (safe to delete to clean builds).
-- `lib/` — Third‑party jars for compile/runtime (e.g., `ECLA.jar`, `DTNConsoleConnection.jar`).
-- `data/` — Example maps/POIs (WKT) referenced by settings.
-- `wdm_settings/` and `*.txt` — Ready‑to‑run configuration files (see `README.txt` for override order).
-- `toolkit/` — Utility scripts for analysis/conversion.
+Keep production code under `src/`. Place shared models in `src/core`, routing logic in `src/routing`, and mobility behaviors in `src/movement`. Mirror packages under `src/test/...` for test sources so they compile alongside the code being exercised. Keep scenario data in `data/` (maps, POIs, WKT shapes) and rely on staged jars in `lib/`. Build artifacts live in `target/`; do not add generated outputs to version control.
 
 ## Build, Test, and Development Commands
-- Build (Windows): `./compile.bat` — compiles `src/` into `target/` using jars from `lib/` (JDK 8+).
-- Build (Linux/macOS): `./compile.sh` — same as above.
-- Run (GUI or batch):
-  - Windows: `./one.bat default_settings.txt`
-  - Linux/macOS: `./one.sh -b 3 default_settings.txt` (batch with 3 runs)
-- Clean: delete the `target/` directory.
+Run `./compile.sh` (or `compile.bat` on Windows) to produce fresh Java 8 classes in `target/`. Use `./one.sh -b 3 default_settings.txt` for a three-run headless regression; drop `-b` to launch the GUI. After compiling tests, execute `java -cp "target;lib/*;target/test" test.AllTests` to run the aggregate JUnit suite.
 
 ## Coding Style & Naming Conventions
-- Java, 4‑space indentation, UTF‑8, ~100‑char line length.
-- Packages: lowercase; Classes: UpperCamelCase; methods/fields: lowerCamelCase; constants: UPPER_SNAKE_CASE.
-- One public class per file; keep classes in matching package folders.
-- Settings keys: `Namespace.Key = Value` (CamelCase), e.g., `MovementModel.maxSpeed`.
-- Public APIs include Javadoc; prefer immutable collections when reasonable.
+Indent Java code with four spaces and keep lines near 100 characters. Packages stay lowercase, classes UpperCamelCase, and members lowerCamelCase; reserve `UPPER_SNAKE_CASE` for constants. Limit features to Java 8 and supply Javadoc for public APIs. Add concise inline comments only where logic is subtle.
 
 ## Testing Guidelines
-- Frameworks: JUnit 3/4 supported.
-- Location: `src/test/`; name tests `*Test.java`; keep deterministic and GUI‑independent.
-- Run: add JUnit to the classpath, compile `src/test`, then run `test.AllTests` (via IDE or CLI).
+Write deterministic JUnit 3/4 cases named `*Test.java` under the mirrored package in `src/test`. Seed randomness explicitly so regressions remain reproducible. Re-run `./compile.sh` before invoking `test.AllTests`, and expand coverage when adjusting routing or movement behavior.
 
 ## Commit & Pull Request Guidelines
-- Commits: imperative, concise; add scope when helpful (e.g., `routing: fix relay policy`).
-- Reference issues (e.g., `Fixes #123`); explain rationale, risks, and config impacts.
-- PRs: include description, run instructions (commands/config files), screenshots for GUI changes, and updated docs/settings as needed.
-- Do not commit `target/`, large generated outputs, or local data.
+Author commits with imperative, scoped messages such as `routing: tighten relay policy`. Pull requests should summarize intent, list affected modules, and include verification evidence (for example `./compile.sh`, regression runs). Provide GUI screenshots when visuals change and flag configuration or data updates. Never commit jars or `target/` outputs.
 
-## Configuration Tips
-- Keep shared values in `default_settings.txt`; override in scenario files.
-- Use forward slashes in settings paths (portable across OSes).
-- WKT assets reside under `data/`; ensure referenced files exist when sharing configs.
-
-## Agent Notes
-- Scope applies to the entire repository tree.
-- Keep changes minimal and focused; avoid unrelated refactors or renames.
-- Fix root causes; match existing style and module layout.
+## Configuration & Debugging Tips
+Tune defaults in `default_settings.txt`, override scenarios via matching keys in `wdm_settings/`, and delete `target/` followed by `./compile.sh` if builds drift. Prefer dependencies staged in `lib/` to avoid drift and keep iterative changes small so they are easy to review.
