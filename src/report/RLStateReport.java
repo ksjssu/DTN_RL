@@ -2,7 +2,10 @@
  * RL State and Reward sampling report.
  * Emits, at fixed sampling intervals, per-node reward summary and per-message state tuples.
  * State per message m: [contacts_norm, pred(self->dest(m)), bufocc_mean, capacity_norm, self_buf_util].
- * Reward per node over the last interval: r = wDeliver*delivered - wDrop*dropped - wAbort*aborted.
+ * Reward per node over the last interval (matching Python DRL server calculation):
+ *   r = w_del(B)*delivered + [w_relay(B) + pressure_coeff(B,Δp)]*relayed + w_abort(B)*aborted
+ * where B = buffer size (MB), Δp = self_buf_util - network_avg_buf (pressure difference).
+ * Buffer-specific weights use sigmoid functions to adapt relay/abort penalties based on buffer capacity.
  */
 package report;
 
@@ -52,10 +55,29 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     private final Map<Integer, Integer> relayedCnt = new HashMap<Integer, Integer>();
     private final Map<Integer, Integer> droppedCnt = new HashMap<Integer, Integer>();
     private final Map<Integer, Integer> abortedCnt = new HashMap<Integer, Integer>();
+    private final Map<Integer, Integer> deliveredCnt = new HashMap<Integer, Integer>(); // Track delivered per node
 
     // For episode-end delivery rate bonus summary
     private int createdTotal = 0;
     private int deliveredFinalTotal = 0;
+
+    // Python DRL server reward constants (matching toolkit/drl_server.py)
+    private static final double W_DELIVER_FALLBACK = 1.0;
+    private static final double RELAY_MIN = -0.4;
+    private static final double RELAY_MAX = 3.0;
+    private static final double RELAY_SLOPE = 0.12;
+    private static final double RELAY_MID = 40.0;
+    private static final double ABORT_GAIN = 0.6;
+    private static final double ABORT_SLOPE = 0.18;
+    private static final double ABORT_MID = 25.0;
+    private static final double NETWORK_AVG_LOW_THRESHOLD = 0.35;
+    private static final double NETWORK_AVG_HIGH_THRESHOLD = 0.75;
+    private static final double RELAY_CRIT_STATIC_PENALTY = 1.0;
+    private static final double RELAY_CRIT_MULT = 2.0;
+    private static final double H_WARNING_GAIN = 0.4;
+    private static final double FLUSH_UTIL_THRESHOLD = 0.30;
+    private static final double FLUSH_GAIN = 0.8;
+    private static final double RATE_DELTA_GAIN = 10.0;
 
     private final double wRelay;
     private final double wDrop;
@@ -64,6 +86,17 @@ public class RLStateReport extends SamplingReport implements MessageListener {
 
     // Buffer occupancy knowledge (contact-based exchange)
     private final BufferOccupancyTracker bufOccTracker = new BufferOccupancyTracker();
+
+    // CTDE: Track previous values for change rate calculation
+    private double prevTotalMessages = 0.0;
+    private double prevAvgBufferUtil = 0.0;
+    private double prevTotalAborted = 0.0;
+    private double prevTimestamp = 0.0;
+    private double prevMsgChangeRate = 0.0;
+    private double prevBufUtilChangeRate = 0.0;
+
+    private double prevStepRate = Double.NaN;
+    private double lastRateDelta = 0.0;
 
     public RLStateReport() {
         super();
@@ -81,7 +114,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         this.wAbort = s.getDouble(W_ABORT_S, 0.5);
         this.reportUrl = s.getSetting(REPORT_URL_S, "");
 
-        write("# time type host msgId dest contacts_norm pred bufocc_mean capacity_norm self_buf_util relayed drops aborted reward");
+        write("# time type host msgId dest contacts_norm pred bufocc_mean capacity_norm self_buf_util relayed drops aborted reward legacy_reward global_active_conns global_total_msgs global_avg_buf global_avg_contacts global_msg_change_rate global_msg_change_momentum global_buf_util_change_rate global_buf_util_momentum global_avg_free_buf global_high_util_frac");
     }
 
     @Override
@@ -105,6 +138,9 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         if (maxBufferSize <= 0) {
             maxBufferSize = 1.0;
         }
+
+        // CTDE: Collect global network features (10D)
+        double[] globalFeatures = collectGlobalFeatures(hosts, maxBufferSize);
 
         // Update buffer occupancy tables (knowledge exchange) before sampling
         try { this.bufOccTracker.update(hosts, now, this.windowSizeSeconds); } catch (Exception ignore) {}
@@ -170,9 +206,79 @@ public class RLStateReport extends SamplingReport implements MessageListener {
             int rel = getAndReset(relayedCnt, addr);
             int dr = getAndReset(droppedCnt, addr);
             int ab = getAndReset(abortedCnt, addr);
-            double reward = this.wRelay * rel - this.wDrop * dr - this.wAbort * ab;
+            int del = getAndReset(deliveredCnt, addr); // Get delivered count for this node
+
+            // Calculate reward using same formula as Python DRL server (toolkit/drl_server.py)
+            double reward = 0.0;
+
+            // Get buffer size for this host (in MB)
+            double bufferSizeMB = 60.0; // Default to 60M, will extract from router
+            if (selfRouter != null) {
+                long bufferSizeBytes = selfRouter.getBufferSize();
+                bufferSizeMB = bufferSizeBytes / (1024.0 * 1024.0);
+            }
+
+            // Get buffer-specific weights
+            double[] weights = bufferWeightProfile(bufferSizeMB);
+            double wDel = weights[0];
+            double wRelayWeight = weights[1];
+            double wAbortWeight = weights[2];
+
+            // 1. Delivered reward
+            if (del > 0) {
+                reward += wDel * del;
+            }
+
+            // 2. Aborted penalty
+            if (ab > 0) {
+                double abortPenalty = wAbortWeight * ab;
+                reward += abortPenalty;
+            }
+
+            // 3. Relay reward with buffer-utilization-based threshold
             double bufOccMean = this.bufOccTracker.getMeanOccupancy(addr);
-            write(now + " R " + hostStr + " - - " + format(contactsNorm) + " NaN " + format(bufOccMean) + " " + format(capacityNorm) + " " + format(selfBufUtil) + " " + rel + " " + dr + " " + ab + " " + format(reward));
+
+            if (rel > 0) {
+                double relayReward = 0.0;
+                double meanOcc = Double.isNaN(bufOccMean) ? 0.5 : bufOccMean;
+                if (meanOcc <= NETWORK_AVG_LOW_THRESHOLD) {
+                    relayReward = wRelayWeight * rel;
+                } else if (meanOcc >= NETWORK_AVG_HIGH_THRESHOLD) {
+                    relayReward = -RELAY_CRIT_MULT * wRelayWeight * rel;
+                } else {
+                    relayReward = 0.0;
+                }
+
+                double msgChangeRate = globalFeatures[4];
+                if (msgChangeRate > 0.3) {
+                    double warningScale = Math.min(1.0, Math.max(0.0, msgChangeRate));
+                    relayReward -= H_WARNING_GAIN * warningScale * rel;
+                }
+
+                reward += relayReward;
+            }
+
+            if (!Double.isNaN(bufOccMean) && bufOccMean >= NETWORK_AVG_HIGH_THRESHOLD) {
+                reward -= RELAY_CRIT_STATIC_PENALTY;
+            }
+
+            reward += RATE_DELTA_GAIN * this.lastRateDelta;
+
+            double legacyReward = reward;
+            double drlReward = RLBridgeReport.getLatestHostReward(hostStr, now);
+            double finalReward = Double.isNaN(drlReward) ? legacyReward : drlReward;
+
+            double g0 = safe(globalFeatures[0]);
+            double g1 = safe(globalFeatures[1]);
+            double g2 = safe(globalFeatures[2]);
+            double g3 = safe(globalFeatures[3]);
+            double g4 = safe(globalFeatures[4]);
+            double g5 = safe(globalFeatures[5]);
+            double g6 = safe(globalFeatures[6]);
+            double g7 = safe(globalFeatures[7]);
+            double g8 = safe(globalFeatures[8]);
+            double g9 = safe(globalFeatures[9]);
+            write(now + " R " + hostStr + " - - " + format(safe(contactsNorm)) + " NaN " + format(safe(bufOccMean)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " " + rel + " " + dr + " " + ab + " " + format(finalReward) + " " + format(legacyReward) + " " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
 
             // Per-message state lines (type S)
             int emitted = 0;
@@ -184,15 +290,21 @@ public class RLStateReport extends SamplingReport implements MessageListener {
                 double pred = getPredFor(h, m.getTo());
                 double bufOccMean2 = this.bufOccTracker.getMeanOccupancy(addr);
                 String destStr = m.getTo().toString();
-                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(contactsNorm) + " " + format(pred) + " " + format(bufOccMean2) + " " + format(capacityNorm) + " " + format(selfBufUtil) + " 0 0 0 0.0000");
+                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(safe(contactsNorm)) + " " + format(safe(pred)) + " " + format(safe(bufOccMean2)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " 0 0 0 0.0000 0.0000 " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
                 emitted++;
             }
         }
 
-        // Step-level cumulative delivery rate logging (no episodes)
         double rateNow = (createdTotal > 0) ? ((double) deliveredFinalTotal) / createdTotal : Double.NaN;
+        double rateDelta = 0.0;
+        if (!Double.isNaN(rateNow) && !Double.isNaN(this.prevStepRate)) {
+            rateDelta = rateNow - this.prevStepRate;
+        }
+        this.prevStepRate = rateNow;
+        this.lastRateDelta = rateDelta;
         write("# step_cum_rate t=" + now + " rate=" + format(rateNow) +
-                " delivered=" + deliveredFinalTotal + " created=" + createdTotal);
+                " delivered=" + deliveredFinalTotal + " created=" + createdTotal +
+                " delta=" + format(rateDelta));
     }
 
     private int getAndReset(Map<Integer, Integer> map, int key) {
@@ -243,6 +355,9 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         // Track final deliveries for episode-end bonus summary
         if (firstDelivery) {
             deliveredFinalTotal++;
+            // Track delivered per node (assign to sender of final hop)
+            Integer vd = deliveredCnt.get(kFrom);
+            deliveredCnt.put(kFrom, (vd == null ? 1 : vd + 1));
         }
     }
 
@@ -290,5 +405,143 @@ public class RLStateReport extends SamplingReport implements MessageListener {
     private String escape(String s) {
         if (s == null) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /**
+     * Calculate buffer-specific weight profile (matching Python buffer_weight_profile).
+     * Returns [delivery_weight, relay_weight, abort_weight].
+     */
+    private double[] bufferWeightProfile(double bufferSizeMB) {
+        // Sigmoid function for relay weight: RELAY_MIN + (RELAY_MAX - RELAY_MIN) * sigmoid(buffer_mb)
+        double sigmoid = 1.0 / (1.0 + Math.exp(-RELAY_SLOPE * (bufferSizeMB - RELAY_MID)));
+        double relayWeight = RELAY_MIN + (RELAY_MAX - RELAY_MIN) * sigmoid;
+        relayWeight *= 2.0;
+        if (relayWeight < 0.0) {
+            relayWeight = Math.min(0.15, Math.abs(relayWeight)); // small positive reward for tiny buffers
+        }
+
+        // Abort weight calculation
+        double abortWeight = -ABORT_GAIN / (1.0 + Math.exp(ABORT_SLOPE * (bufferSizeMB - ABORT_MID)));
+
+        return new double[] { W_DELIVER_FALLBACK, relayWeight, abortWeight };
+    }
+
+    /**
+     * CTDE: Collect global network state features (10 dimensions).
+     * Same method as in RLBridgeReport for consistency.
+     */
+    private double[] collectGlobalFeatures(List<DTNHost> hosts, double maxBufferSize) {
+        if (hosts == null || hosts.isEmpty()) {
+            return new double[10]; // Return zeros if no hosts
+        }
+
+        double now = SimClock.getTime();
+        // Statistics accumulators
+        int totalNodes = hosts.size();
+        int activeConnections = 0;
+        int totalMessages = 0;
+        double sumBufferUtil = 0.0;
+        int validBufferCount = 0;
+        double sumContacts = 0.0;
+        int totalAborted = 0;
+        int highUtilNodes = 0;
+
+        // Collect statistics from all hosts
+        for (DTNHost h : hosts) {
+            // Count active connections
+            if (h.getConnections() != null) {
+                activeConnections += h.getConnections().size();
+                sumContacts += h.getConnections().size();
+            }
+
+            // Count messages and buffer utilization
+            MessageRouter router = h.getRouter();
+            if (router != null) {
+                java.util.Collection<Message> messages = router.getMessageCollection();
+                if (messages != null) {
+                    totalMessages += messages.size();
+                }
+
+                // Buffer utilization
+                long size = router.getBufferSize();
+                long free = router.getFreeBufferSize();
+                if (size > 0 && size < Integer.MAX_VALUE) {
+                    double util = 1.0 - ((double) free / size);
+                    if (util < 0) util = 0;
+                    if (util > 1) util = 1;
+                    sumBufferUtil += util;
+                    validBufferCount++;
+                    if (util >= NETWORK_AVG_HIGH_THRESHOLD) {
+                        highUtilNodes++;
+                    }
+                }
+            }
+        }
+
+        // Sum aborted messages across all hosts
+        for (Integer count : this.abortedCnt.values()) {
+            totalAborted += count;
+        }
+
+        // Calculate statistics
+        double avgBufferUtil = validBufferCount > 0 ? sumBufferUtil / validBufferCount : 0.0;
+
+        double avgContacts = totalNodes > 0 ? sumContacts / totalNodes : 0.0;
+        double highUtilFraction = totalNodes > 0 ? (double) highUtilNodes / totalNodes : 0.0;
+
+        // Calculate change rates (trends)
+        double timeDelta = (prevTimestamp > 0) ? (now - prevTimestamp) : 1.0;
+        if (timeDelta <= 0) timeDelta = 1.0;
+
+        double msgChangeRate = (totalMessages - prevTotalMessages) / timeDelta;
+        double bufUtilChangeRate = (avgBufferUtil - prevAvgBufferUtil) / timeDelta;
+        if (!Double.isFinite(msgChangeRate)) { msgChangeRate = 0.0; }
+        if (!Double.isFinite(bufUtilChangeRate)) { bufUtilChangeRate = 0.0; }
+
+        double msgChangeRateNorm = Math.max(-1.0, Math.min(1.0, msgChangeRate / 100.0));
+        double bufUtilChangeRateNorm = Math.max(-1.0, Math.min(1.0, bufUtilChangeRate / 0.1));
+
+        double msgChangeMomentum = 0.0;
+        double denom = Math.abs(prevMsgChangeRate) > 1e-6 ? Math.abs(prevMsgChangeRate) : 1.0;
+        msgChangeMomentum = Math.max(-1.0, Math.min(1.0, (msgChangeRate - prevMsgChangeRate) / denom));
+        if (!Double.isFinite(msgChangeMomentum)) { msgChangeMomentum = 0.0; }
+
+        double bufUtilMomentum = 0.0;
+        double bufDenom = Math.abs(prevBufUtilChangeRate) > 1e-6 ? Math.abs(prevBufUtilChangeRate) : 1.0;
+        bufUtilMomentum = Math.max(-1.0, Math.min(1.0, (bufUtilChangeRate - prevBufUtilChangeRate) / bufDenom));
+        if (!Double.isFinite(bufUtilMomentum)) { bufUtilMomentum = 0.0; }
+
+        prevTotalMessages = totalMessages;
+        prevAvgBufferUtil = avgBufferUtil;
+        prevTotalAborted = totalAborted;
+        prevTimestamp = now;
+        prevMsgChangeRate = msgChangeRate;
+        prevBufUtilChangeRate = bufUtilChangeRate;
+
+        double maxNodes = 1000.0;
+        double maxConnections = 10000.0;
+        double maxMessages = 10000.0;
+        double maxContacts = 50.0;
+
+        double[] globalFeatures = new double[10];
+        globalFeatures[0] = activeConnections / maxConnections;             // active_connections_norm
+        globalFeatures[1] = totalMessages / maxMessages;                    // total_messages_norm
+        globalFeatures[2] = avgBufferUtil;                                  // avg_buffer_util
+        globalFeatures[3] = avgContacts / maxContacts;                      // avg_contacts_norm
+        globalFeatures[4] = msgChangeRateNorm;                              // msg_change_rate
+        globalFeatures[5] = msgChangeMomentum;                              // msg_change_momentum
+        globalFeatures[6] = bufUtilChangeRateNorm;                          // buf_util_change_rate
+        globalFeatures[7] = bufUtilMomentum;                                // buf_util_momentum
+        globalFeatures[8] = Math.max(0.0, 1.0 - avgBufferUtil);             // avg_free_buffer
+        globalFeatures[9] = highUtilFraction;                               // high_util_fraction
+
+        return globalFeatures;
+    }
+
+    private double safe(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return 0.0;
+        }
+        return value;
     }
 }

@@ -23,6 +23,8 @@ import java.net.URL;
 import java.util.*;
 
 public class RLBridgeReport extends SamplingReport implements UpdateListener, core.MessageListener {
+    private static final double RELAY_CRIT_UTIL = 0.85;
+    private static final double HIGH_UTIL_FLAG_THRESHOLD = 0.6;
 
     // Settings
     public static final String URL_S = "url";
@@ -34,11 +36,13 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     public static final String MAX_MSG_PER_NODE_S = "maxMessagesPerNode"; // 0=unlimited
     public static final String DELTA_LIMIT_S = "deltaLimit";
     public static final String TIMEOUT_MS_S = "timeoutMs";
+    public static final String HEURISTIC_MODE_S = "heuristicMode";
+    public static final String HEURISTIC_DELTA_S = "heuristicDelta";
     public static final String UNBOUNDED_DELTA_S = "unboundedDelta"; // true|false
     public static final String LOG_ACTIONS_S = "logActions"; // true|false
     public static final String LOG_ACTIONS_MAX_S = "logActionsMax"; // max lines per step
-    public static final String DELIVERY_RELAY_BONUS_S = "deliveryRelayBonus"; // delivered counted as extra relayed units
     public static final String BUF_OCC_MAX_AGE_S = "bufOccMaxAge"; // seconds to keep shared occupancy samples
+    public static final String ACTIVATION_TIME_S = "activationTime"; // seconds before controller activates
 
     private final String endpoint;
     private final String localPolicyPath;
@@ -49,12 +53,16 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final int maxMsgsPerNode;
     private final double deltaLimit;
     private final int timeoutMs;
+    private final boolean heuristicMode;
+    private final double heuristicDelta;
     private String lastPolicyId = "";
     private final boolean logActions;
     private final int logActionsMax;
     private final boolean unboundedDelta;
-    private final double deliveryRelayBonus;
-    private LocalPpoPolicy localPolicy = null; // when non-null, perform local inference (CTDE execution)
+    private final double activationTime;
+    private boolean activationNotified = false;
+    private LocalPpoPolicy localPolicy = null; // feed-forward local policy
+    private LocalRmappoPolicy localRmappoPolicy = null; // recurrent local policy
     private final BufferOccupancyTracker bufOccTracker = new BufferOccupancyTracker();
     private final int bufOccMaxAge;
 
@@ -70,6 +78,59 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final Map<String, Integer> abortedByKey = new HashMap<String, Integer>();
     private final Map<String, Integer> deliveredByKey = new HashMap<String, Integer>();
     private final Map<String, Double> totalDelayByKey = new HashMap<String, Double>();  // total delay for delivered messages
+    private static final Map<String, RewardRecord> LAST_DRL_REWARD_BY_HOST = new HashMap<String, RewardRecord>();
+    private static int LAST_REWARD_TIMESTAMP = -1;
+    private static class RewardRecord {
+        final double reward;
+        final int timestamp;
+        RewardRecord(double reward, int timestamp) {
+            this.reward = reward;
+            this.timestamp = timestamp;
+        }
+    }
+
+    public static synchronized void recordHostRewards(Map<String, Double> hostRewards, int timestamp) {
+        if (hostRewards == null) {
+            return;
+        }
+        LAST_REWARD_TIMESTAMP = timestamp;
+        for (Map.Entry<String, Double> e : hostRewards.entrySet()) {
+            if (e.getKey() == null) {
+                continue;
+            }
+            double val = (e.getValue() != null ? e.getValue() : 0.0);
+            LAST_DRL_REWARD_BY_HOST.put(e.getKey(), new RewardRecord(val, timestamp));
+        }
+    }
+
+    public static synchronized double getLatestHostReward(String host, int timestamp) {
+        if (LAST_REWARD_TIMESTAMP != timestamp) {
+            return Double.NaN;
+        }
+        RewardRecord rec = LAST_DRL_REWARD_BY_HOST.get(host);
+        if (rec == null || rec.timestamp != timestamp) {
+            return 0.0;
+        }
+        return rec.reward;
+    }
+
+    // Track last applied action (delta) for each host-dest pair for Gradient Alignment Reward
+    private final Map<String, Double> lastActionByKey = new HashMap<String, Double>();
+    // Track buffer utilization at the time of action
+    private final Map<String, Double> lastBufferUtilByKey = new HashMap<String, Double>();
+    // Track neighbor's p_base at the time of action (contact time)
+    private final Map<String, Double> lastNeighborPBaseByKey = new HashMap<String, Double>();
+
+    // CTDE: Track previous values for change rate calculation
+    private double prevTotalMessages = 0.0;
+    private double prevAvgBufferUtil = 0.0;
+    private double prevTotalAborted = 0.0;
+    private double prevTimestamp = 0.0;
+    private double prevMsgChangeRate = 0.0;
+    private double prevBufUtilChangeRate = 0.0;
+    private double prevGlobalFreeBuf = Double.NaN;
+    private double currentRateDelta = 0.0;
+    private double currentAvgBufDelta = 0.0;
 
     public RLBridgeReport() {
         super();
@@ -84,16 +145,21 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         this.contactsTau = s.getDouble(CONTACTS_TAU_S, 3.0);
         this.maxMsgsPerNode = (int)Math.round(s.getDouble(MAX_MSG_PER_NODE_S, 20.0));
         this.deltaLimit = s.getDouble(DELTA_LIMIT_S, 1.0);
-        this.timeoutMs = (int)Math.round(s.getDouble(TIMEOUT_MS_S, 1000.0));
+        this.timeoutMs = (int)Math.round(s.getDouble(TIMEOUT_MS_S, 30000.0));
+        this.heuristicMode = s.getBoolean(HEURISTIC_MODE_S, false);
+        this.heuristicDelta = s.getDouble(HEURISTIC_DELTA_S, 0.05);
         String logA = s.getSetting(LOG_ACTIONS_S, "false").toLowerCase();
         this.logActions = ("true".equals(logA) || "1".equals(logA) || "yes".equals(logA));
         this.logActionsMax = (int)Math.round(s.getDouble(LOG_ACTIONS_MAX_S, 10.0));
         String ub = s.getSetting(UNBOUNDED_DELTA_S, "false").toLowerCase();
         this.unboundedDelta = ("true".equals(ub) || "1".equals(ub) || "yes".equals(ub));
-        this.deliveryRelayBonus = s.getDouble(DELIVERY_RELAY_BONUS_S, 3.0);
         int age = (int)Math.round(s.getDouble(BUF_OCC_MAX_AGE_S, this.windowSizeSeconds));
         if (age < 0) { age = this.windowSizeSeconds; }
         this.bufOccMaxAge = age;
+        this.activationTime = Math.max(0.0, s.getDouble(ACTIVATION_TIME_S, 0.0));
+        if (this.activationTime > 0.0) {
+            write("# RLBridge inactive until t >= " + format(this.activationTime));
+        }
 
         write("# RLBridge active. endpoint=" + (endpoint.length()>0?endpoint:"(none)") +
                 " sampleInterval=" + format(super.interval) + " windowSize=" + windowSizeSeconds);
@@ -101,10 +167,16 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         // Try load local policy for CTDE execution
         if (this.localPolicyPath.length() > 0) {
             try {
-                this.localPolicy = new LocalPpoPolicy(this.localPolicyPath);
-                write("# RLBridge local policy loaded from " + this.localPolicyPath);
+                if (LocalRmappoPolicy.isRmappoFormat(this.localPolicyPath)) {
+                    this.localRmappoPolicy = new LocalRmappoPolicy(this.localPolicyPath);
+                    write("# RLBridge local policy (rmappo_gru) loaded from " + this.localPolicyPath);
+                } else {
+                    this.localPolicy = new LocalPpoPolicy(this.localPolicyPath);
+                    write("# RLBridge local policy loaded from " + this.localPolicyPath);
+                }
             } catch (Exception e) {
                 this.localPolicy = null;
+                this.localRmappoPolicy = null;
                 write("# RLBridge WARN: failed to load local policy '" + this.localPolicyPath + "': " + e.getMessage());
             }
         }
@@ -115,7 +187,16 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         final int windowSamples = Math.max(1, (int)Math.round(this.windowSizeSeconds / super.interval));
         final int now = (int) SimClock.getTime();
 
-        final boolean localMode = (this.localPolicy != null);
+        final boolean localGruMode = (this.localRmappoPolicy != null);
+        final boolean localMlpMode = (this.localPolicy != null);
+        final boolean baseLocalMode = localGruMode || localMlpMode || this.heuristicMode;
+        final boolean controllerActive = (this.activationTime <= 0.0) || (now >= this.activationTime);
+        if (controllerActive && !this.activationNotified && this.activationTime > 0.0) {
+            write("# RLBridge activation at t=" + now);
+            this.activationNotified = true;
+        }
+        final boolean localMode = controllerActive && baseLocalMode;
+        final boolean remoteMode = controllerActive && !baseLocalMode;
 
         // Initialize variables for state and transition building
         StringBuilder req = new StringBuilder();
@@ -145,8 +226,11 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             bufOccTracker.update(hosts, now, this.bufOccMaxAge);
         } catch (Exception ignore) { /* best effort */ }
 
+        // CTDE: Collect global network features once per step
+        double[] globalFeatures = collectGlobalFeatures(hosts, maxBufferSize);
+
         // Start building request JSON
-        if (!localMode) {
+        if (remoteMode) {
             String simId = escape(getScenarioName());
             req.append("{\"sim_id\":\"").append(simId).append("\",\"time\":").append(now)
                .append(",\"delta_limit\":").append(effDeltaLimit).append(",\"prev_transition\":[");
@@ -199,6 +283,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     selfBufUtil = util;
                 }
             }
+            if (!Double.isFinite(capacityNorm)) { capacityNorm = 0.0; }
+            if (!Double.isFinite(selfBufUtil)) { selfBufUtil = 0.0; }
 
             Deque<Double> ch = contactsHistory.get(addr);
 
@@ -229,6 +315,7 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                 contactsNorm = avgC / cmax; if (contactsNorm<0) contactsNorm=0; if (contactsNorm>1) contactsNorm=1;
 
             }
+            if (!Double.isFinite(contactsNorm)) { contactsNorm = 0.0; }
 
             // Prev transition: drain counters for this host at host-dest granularity
             Set<String> destsUpdated = updatedKeysByHost.get(hostStr);
@@ -243,18 +330,44 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     int de = getAndResetStr(deliveredByKey, k);
                     double totalDelay = getAndResetDouble(totalDelayByKey, k);
                     double avgDelay = (de > 0) ? (totalDelay / de) : 0.0;
-                    int relAug = rel + (int)Math.round(this.deliveryRelayBonus * de);
-                    if (!localMode) {
+
+                    // Get Gradient Alignment Reward fields
+                    double lastAction = getAndResetDouble(lastActionByKey, k);
+                    double lastBufUtil = getAndResetDouble(lastBufferUtilByKey, k);
+                    double neighborPBase = getAndResetDouble(lastNeighborPBaseByKey, k);  // Retrieved from stored value at action time
+
+                    // Get p_base (pure PROPHET predictability without delta)
+                    double pBase = 0.0;
+                    DTNHost destHost = null;
+                    for (DTNHost cand : hosts) {
+                        if (cand.toString().equals(destStr)) {
+                            destHost = cand;
+                            break;
+                        }
+                    }
+                    if (destHost != null) {
+                        MessageRouter router = h.getRouter();
+                        if (router instanceof ProphetRouter) {
+                            pBase = ((ProphetRouter) router).getBasePredFor(destHost);
+                        }
+                    }
+
+                    if (remoteMode) {
                         if (rel != 0 || dr != 0 || ab != 0 || de != 0) {
                             if (!firstPrev) req.append(","); firstPrev=false;
                             req.append("{\"host\":\"").append(escape(hostStr)).append("\",")
                                .append("\"dest\":\"").append(escape(destStr)).append("\",")
-                               .append("\"relayed\":").append(relAug).append(",\"drops\":").append(dr)
+                               .append("\"relayed\":").append(rel).append(",\"drops\":").append(dr)
                                .append(",\"aborted\":").append(ab).append(",\"delivered\":").append(de)
                                 .append(",\"avg_delay\":").append(String.format("%.3f", avgDelay))
-                                .append(",\"buffer_size\":").append(bufferCapacity).append("}");
+                                .append(",\"buffer_size\":").append(bufferCapacity).append(",")
+                                // Gradient Alignment Reward fields
+                                .append("\"p_base\":").append(format(pBase)).append(",")
+                                .append("\"neighbor_p_base\":").append(format(neighborPBase)).append(",")
+                                .append("\"my_buffer_norm\":").append(format(lastBufUtil)).append(",")
+                                .append("\"action\":").append(format(lastAction)).append("}");
                         }
-                    } // if localMode, just drain counters without building JSON
+                    } // if localMode or controller inactive, just drain counters without building JSON
                     destsUpdated.remove(destStr);
                 }
                 if (destsUpdated.isEmpty()) { updatedKeysByHost.remove(hostStr); }
@@ -273,37 +386,115 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                 double bufOccMean = this.bufOccTracker.getMeanOccupancy(addr);
 
                 // Skip this host-dest pair if information is incomplete (NaN values)
-                if (Double.isNaN(pred) || Double.isNaN(bufOccMean)) {
+                if (!Double.isFinite(pred) || !Double.isFinite(bufOccMean)) {
                     continue; // Only send complete state tuples to DRL
                 }
 
-                if (localMode) {
-                    // Local inference (CTDE execution)
-                    double[] obs = new double[] { contactsNorm, pred, bufOccMean, capacityNorm, selfBufUtil };
-                    double delta = 0.0;
-                    try {
-                        delta = this.localPolicy.infer(obs, effDeltaLimit);
-                    } catch (Exception e) {
-                        delta = 0.0; // safe fallback
+                boolean appliedLocally = false;
+                double delta = 0.0;
+                if (controllerActive) {
+                    if (localGruMode) {
+                        double[] fullObs = new double[] {
+                                contactsNorm, pred, bufOccMean, capacityNorm, selfBufUtil, selfBufUtil - bufOccMean, currentRateDelta
+                        };
+                        try {
+                            delta = this.localRmappoPolicy.infer(hostStr + "#" + destStr, fullObs, effDeltaLimit);
+                            appliedLocally = true;
+                        } catch (Exception e) {
+                            delta = 0.0;
+                        }
+                    } else if (localMlpMode) {
+                        double[] obs = new double[] { contactsNorm, pred, bufOccMean, capacityNorm, selfBufUtil };
+                        try {
+                            delta = this.localPolicy.infer(obs, effDeltaLimit);
+                            appliedLocally = true;
+                        } catch (Exception e) {
+                            delta = 0.0;
+                        }
+                    } else if (this.heuristicMode) {
+                        double sign = (selfBufUtil - bufOccMean) <= 0 ? 1.0 : -1.0;
+                        double base = (this.heuristicDelta > 0 ? this.heuristicDelta : effDeltaLimit);
+                        delta = sign * Math.abs(base);
+                        appliedLocally = true;
                     }
+                }
+                if (appliedLocally) {
                     if (!this.unboundedDelta) {
                         if (delta > deltaLimit) delta = deltaLimit; if (delta < -deltaLimit) delta = -deltaLimit;
                     }
                     MessageRouter r = h.getRouter();
                     if (r instanceof ProphetRouter) {
                         ((ProphetRouter) r).setExternalOffset(destHost, delta);
-                        if (this.logActions && loggedLocal < this.logActionsMax) { write(now + " A " + hostStr + " - " + destStr + " " + format(delta)); loggedLocal++; }
+
+                        // Get neighbor's p_base from ALL other nodes' Prophet tables
+                        double neighborPBase = 0.0;
+                        if (destHost != null) {
+                            for (DTNHost otherNode : hosts) {
+                                if (otherNode == h) continue; // Skip self
+                                MessageRouter otherRouter = otherNode.getRouter();
+                                if (otherRouter instanceof ProphetRouter) {
+                                    double otherPred = ((ProphetRouter) otherRouter).getBasePredFor(destHost);
+                                    if (otherPred > neighborPBase) {
+                                        neighborPBase = otherPred;  // Use maximum across all nodes
+                                    }
+                                }
+                            }
+                        }
+
+                        // Store action, buffer util, and neighbor_p_base for Gradient Alignment Reward
+                        String k = hostStr + "#" + destStr;
+                        lastActionByKey.put(k, delta);
+                        lastBufferUtilByKey.put(k, selfBufUtil);
+                        lastNeighborPBaseByKey.put(k, neighborPBase);
+
+                        if (this.logActions && loggedLocal < this.logActionsMax) {
+                            write(now + " A " + hostStr + " - " + destStr + " " + format(delta));
+                            loggedLocal++;
+                        }
                     }
-                    emitted++; stateCount++;
-                } else {
+                }
+                if (remoteMode) {
                     if (!firstState) stateBatch.append(","); firstState=false;
+                    double bufferSizeMB = bufferCapacity / (1024.0 * 1024.0);
+                    if (!Double.isFinite(bufferSizeMB)) { bufferSizeMB = 0.0; }
+                    double g0 = Double.isFinite(globalFeatures[0]) ? globalFeatures[0] : 0.0;
+                    double g1 = Double.isFinite(globalFeatures[1]) ? globalFeatures[1] : 0.0;
+                    double g2 = Double.isFinite(globalFeatures[2]) ? globalFeatures[2] : 0.0;
+                    double g3 = Double.isFinite(globalFeatures[3]) ? globalFeatures[3] : 0.0;
+                    double g4 = Double.isFinite(globalFeatures[4]) ? globalFeatures[4] : 0.0;
+                    double g5 = Double.isFinite(globalFeatures[5]) ? globalFeatures[5] : 0.0;
+                    double g6 = Double.isFinite(globalFeatures[6]) ? globalFeatures[6] : 0.0;
+                    double g7 = Double.isFinite(globalFeatures[7]) ? globalFeatures[7] : 0.0;
+                    double g8 = Double.isFinite(globalFeatures[8]) ? globalFeatures[8] : 0.0;
+                    double g9 = Double.isFinite(globalFeatures[9]) ? globalFeatures[9] : 0.0;
+                    double g10 = Double.isFinite(globalFeatures[10]) ? globalFeatures[10] : 0.0;
+                    double g11 = Double.isFinite(globalFeatures[11]) ? globalFeatures[11] : 0.0;
                     stateBatch.append("{\"host\":\"").append(escape(hostStr)).append("\",")
                             .append("\"dest\":\"").append(escape(destStr)).append("\",")
+                            .append("\"buffer_size_mb\":").append(String.format("%.2f", bufferSizeMB)).append(",")
+                            // Local features (5D)
                             .append("\"contacts_norm\":").append(format(contactsNorm)).append(",")
-                                                        .append("\"pred\":").append(format(pred)).append(",")
+                            .append("\"pred\":").append(format(pred)).append(",")
                             .append("\"bufocc_mean\":").append(format(bufOccMean)).append(",")
                             .append("\"capacity_norm\":").append(format(capacityNorm)).append(",")
-                            .append("\"self_buf_util\":").append(format(selfBufUtil)).append("}");
+                            .append("\"self_buf_util\":").append(format(selfBufUtil)).append(",")
+                            .append("\"pressure_diff\":").append(format(selfBufUtil - bufOccMean)).append(",")
+                            .append("\"rate_delta\":").append(format(currentRateDelta)).append(",")
+                            // CTDE: Global features (10D)
+                            .append("\"global_active_conns\":").append(format(g0)).append(",")
+                            .append("\"global_total_msgs\":").append(format(g1)).append(",")
+                            .append("\"global_avg_buf\":").append(format(g2)).append(",")
+                            .append("\"global_avg_contacts\":").append(format(g3)).append(",")
+                            .append("\"global_msg_change_rate\":").append(format(g4)).append(",")
+                            .append("\"global_msg_change_momentum\":").append(format(g5)).append(",")
+                            .append("\"global_buf_util_change_rate\":").append(format(g6)).append(",")
+                            .append("\"global_buf_util_momentum\":").append(format(g7)).append(",")
+                            .append("\"global_avg_free_buf\":").append(format(g8)).append(",")
+                            .append("\"global_high_util_frac\":").append(format(g9)).append(",")
+                            .append("\"global_high_util_flag\":").append(format(g10)).append(",")
+                            .append("\"global_avg_buf_delta\":").append(format(g11)).append("}");
+                    emitted++; stateCount++;
+                } else if (appliedLocally) {
                     emitted++; stateCount++;
                 }
             }
@@ -312,17 +503,32 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         if (localMode) {
             // Local mode already applied actions inside the loop
             write("# RLBridge LOCAL t=" + now + " policy=(local) states=" + stateCount + " recv_actions=" + stateCount + " applied_actions=" + stateCount);
-        } else {
+        } else if (remoteMode) {
             req.append("],");
             req.append(stateBatch.toString()).append("]}");
 
             // Call DRL module and apply actions
-            Map<String, Double> actions = callDrl(endpoint, req.toString());
-            if (actions != null) {
+            ActionResponse response = callDrl(endpoint, req.toString());
+            if (response != null && response.actions != null) {
+                Map<String, Double> actions = response.actions;
                 // actions map key: host#dest, value: delta
                 int applied = 0;
                 int recvActions = actions.size();
                 int logged = 0;
+                Map<String, Double> hostRewards = new HashMap<String, Double>();
+                if (response.rewards != null) {
+                    for (Map.Entry<String, Double> e : response.rewards.entrySet()) {
+                        String key = e.getKey();
+                        if (key == null) { continue; }
+                        int hash = key.indexOf('#');
+                        if (hash <= 0) { continue; }
+                        String hostKey = key.substring(0, hash);
+                        Double prev = hostRewards.get(hostKey);
+                        double val = (e.getValue() != null ? e.getValue() : 0.0);
+                        hostRewards.put(hostKey, (prev == null ? val : prev + val));
+                    }
+                }
+                recordHostRewards(hostRewards, now);
                 for (DTNHost h : hosts) {
                     final String hostStr = h.toString();
                     // Aggregate unique destinations
@@ -340,6 +546,41 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                             if (destHost != null) {
                                 ((ProphetRouter) r).setExternalOffset(destHost, delta);
                                 applied++;
+
+                                // Calculate buffer utilization for Gradient Alignment Reward
+                                double bufUtil = 0.0;
+                                if (r != null) {
+                                    long size = r.getBufferSize();
+                                    long free = r.getFreeBufferSize();
+                                    if (size > 0 && size < Integer.MAX_VALUE) {
+                                        double util = 1.0 - ((double) free / size);
+                                        if (util < 0) { util = 0; }
+                                        if (util > 1) { util = 1; }
+                                        bufUtil = util;
+                                    }
+                                }
+                                if (!Double.isFinite(bufUtil)) { bufUtil = 0.0; }
+
+                                // Get neighbor's p_base from ALL other nodes' Prophet tables
+                                double neighborPBase = 0.0;
+                                if (destHost != null) {
+                                    for (DTNHost otherNode : hosts) {
+                                        if (otherNode == h) continue; // Skip self
+                                        MessageRouter otherRouter = otherNode.getRouter();
+                                        if (otherRouter instanceof ProphetRouter) {
+                                            double otherPred = ((ProphetRouter) otherRouter).getBasePredFor(destHost);
+                                            if (otherPred > neighborPBase) {
+                                                neighborPBase = otherPred;  // Use maximum across all nodes
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Store action, buffer util, and neighbor_p_base for Gradient Alignment Reward
+                                lastActionByKey.put(key, delta);
+                                lastBufferUtilByKey.put(key, bufUtil);
+                                lastNeighborPBaseByKey.put(key, neighborPBase);
+
                                 if (this.logActions && logged < this.logActionsMax) { write(now + " A " + hostStr + " - " + destStr + " " + format(delta)); logged++; }
                             }
                         }
@@ -378,7 +619,16 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         return Double.NaN;
     }
 
-    private Map<String, Double> callDrl(String urlStr, String payload) {
+    private static class ActionResponse {
+        final Map<String, Double> actions;
+        final Map<String, Double> rewards;
+        ActionResponse(Map<String, Double> actions, Map<String, Double> rewards) {
+            this.actions = actions;
+            this.rewards = rewards;
+        }
+    }
+
+    private ActionResponse callDrl(String urlStr, String payload) {
         if (urlStr == null || urlStr.trim().length() == 0) { return null; }
         HttpURLConnection con = null;
         try {
@@ -400,17 +650,18 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             in.close();
             String body = resp.toString();
             try { this.lastPolicyId = extractString(body, "policy_id"); } catch (Exception ignore) {}
-            Map<String, Double> parsed = parseActionsKV(body);
-            if (parsed.isEmpty()) {
-                parsed = parseActions(body);
+            Map<String, Double> parsedActions = parseDoubleMap(body, "actions_kv");
+            if (parsedActions.isEmpty()) {
+                parsedActions = parseActions(body);
             }
-            if (parsed.isEmpty()) {
+            if (parsedActions.isEmpty()) {
                 // Emit a short debug snippet to help diagnose parsing issues
                 String snippet;
                 if (body.length() > 240) { snippet = body.substring(0, 240) + "..."; } else { snippet = body; }
                 write("# RLBridge WARN: parsed zero actions; body_snippet=" + snippet.replace('\n',' ').replace('\r',' '));
             }
-            return parsed;
+            Map<String, Double> parsedRewards = parseDoubleMap(body, "rewards_kv");
+            return new ActionResponse(parsedActions, parsedRewards);
         } catch (Exception e) {
             write("# RLBridge HTTP error: " + e.getMessage());
             return null;
@@ -420,10 +671,11 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     }
 
     // Simpler parsing for flat map: {"actions_kv": {"p0#H1": 0.01, "p1#H2": -0.003}}
-    private Map<String, Double> parseActionsKV(String json) {
+    private Map<String, Double> parseDoubleMap(String json, String fieldName) {
         Map<String, Double> result = new HashMap<String, Double>();
         if (json == null) return result;
-        int idx = json.indexOf("\"actions_kv\""); if (idx < 0) return result;
+        String needle = "\"" + fieldName + "\"";
+        int idx = json.indexOf(needle); if (idx < 0) return result;
         int objStart = json.indexOf('{', idx); if (objStart < 0) return result;
         int objEnd = findMatchingBracket(json, objStart, '{', '}'); if (objEnd < 0) return result;
         String body = json.substring(objStart + 1, objEnd);
@@ -574,6 +826,148 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         Set<String> s = updatedKeysByHost.get(hostStr);
         if (s == null) { s = new HashSet<String>(); updatedKeysByHost.put(hostStr, s); }
         s.add(destStr);
+    }
+
+    /**
+     * CTDE: Collect global network state features (10 dimensions).
+     * These features provide network-wide context for the centralized critic.
+     *
+     * @param hosts List of all hosts in the network
+     * @param maxBufferSize Maximum buffer size for normalization
+     * @return Array of 10 global features
+     */
+    private double[] collectGlobalFeatures(List<DTNHost> hosts, double maxBufferSize) {
+        if (hosts == null || hosts.isEmpty()) {
+            return new double[10]; // Return zeros if no hosts
+        }
+
+        double now = SimClock.getTime();
+        double simEndTime = 100000.0; // Default, will try to get from settings
+
+        // Statistics accumulators
+        int totalNodes = hosts.size();
+        int activeConnections = 0;
+        int totalMessages = 0;
+        double sumBufferUtil = 0.0;
+        int validBufferCount = 0;
+        double sumContacts = 0.0;
+        int totalRelayed = 0;
+        int totalDelivered = 0;
+        int totalAborted = 0;
+        int highUtilNodes = 0;
+
+        // Collect statistics from all hosts
+        for (DTNHost h : hosts) {
+            // Count active connections
+            if (h.getConnections() != null) {
+                activeConnections += h.getConnections().size();
+                sumContacts += h.getConnections().size();
+            }
+
+            // Count messages and buffer utilization
+            MessageRouter router = h.getRouter();
+            if (router != null) {
+                Collection<Message> messages = router.getMessageCollection();
+                if (messages != null) {
+                    totalMessages += messages.size();
+                }
+
+                // Buffer utilization
+                long size = router.getBufferSize();
+                long free = router.getFreeBufferSize();
+                if (size > 0 && size < Integer.MAX_VALUE) {
+                    double util = 1.0 - ((double) free / size);
+                    if (util < 0) util = 0;
+                    if (util > 1) util = 1;
+                    sumBufferUtil += util;
+                    validBufferCount++;
+                    if (util >= RELAY_CRIT_UTIL) {
+                        highUtilNodes++;
+                    }
+                }
+            }
+        }
+
+        // Count total relayed, delivered, and aborted from reward counters
+        for (Integer count : relayedByKey.values()) {
+            totalRelayed += count;
+        }
+        for (Integer count : deliveredByKey.values()) {
+            totalDelivered += count;
+        }
+        for (Integer count : abortedByKey.values()) {
+            totalAborted += count;
+        }
+
+        // Calculate statistics
+        double avgBufferUtil = validBufferCount > 0 ? sumBufferUtil / validBufferCount : 0.0;
+        double avgContacts = totalNodes > 0 ? sumContacts / totalNodes : 0.0;
+        double highUtilFraction = totalNodes > 0 ? (double) highUtilNodes / totalNodes : 0.0;
+
+        // Calculate change rates (trends)
+        double timeDelta = (prevTimestamp > 0) ? (now - prevTimestamp) : 1.0; // Avoid division by zero
+        if (timeDelta <= 0) timeDelta = 1.0;
+
+        double msgChangeRate = (totalMessages - prevTotalMessages) / timeDelta;
+        double bufUtilChangeRate = (avgBufferUtil - prevAvgBufferUtil) / timeDelta;
+        if (!Double.isFinite(msgChangeRate)) { msgChangeRate = 0.0; }
+        if (!Double.isFinite(bufUtilChangeRate)) { bufUtilChangeRate = 0.0; }
+
+        double msgChangeRateNorm = Math.max(-1.0, Math.min(1.0, msgChangeRate / 100.0));
+        double bufUtilChangeRateNorm = Math.max(-1.0, Math.min(1.0, bufUtilChangeRate / 0.1));
+
+        double msgChangeMomentum = 0.0;
+        double denom = Math.abs(prevMsgChangeRate) > 1e-6 ? Math.abs(prevMsgChangeRate) : 1.0;
+        msgChangeMomentum = Math.max(-1.0, Math.min(1.0, (msgChangeRate - prevMsgChangeRate) / denom));
+        if (!Double.isFinite(msgChangeMomentum)) { msgChangeMomentum = 0.0; }
+
+        double bufUtilMomentum = 0.0;
+        double bufDenom = Math.abs(prevBufUtilChangeRate) > 1e-6 ? Math.abs(prevBufUtilChangeRate) : 1.0;
+        bufUtilMomentum = Math.max(-1.0, Math.min(1.0, (bufUtilChangeRate - prevBufUtilChangeRate) / bufDenom));
+        if (!Double.isFinite(bufUtilMomentum)) { bufUtilMomentum = 0.0; }
+
+        prevTotalMessages = totalMessages;
+        prevAvgBufferUtil = avgBufferUtil;
+        prevTotalAborted = totalAborted;
+        prevTimestamp = now;
+        prevMsgChangeRate = msgChangeRate;
+        prevBufUtilChangeRate = bufUtilChangeRate;
+
+        // Normalization constants
+        double maxNodes = 1000.0;
+        double maxConnections = 10000.0;
+        double maxMessages = 10000.0;
+        double maxContacts = 50.0;
+
+        // Construct 10-dimensional global feature vector
+        double avgFreeBuf = Math.max(0.0, 1.0 - avgBufferUtil);
+        double rateDelta = 0.0;
+        if (!Double.isNaN(avgFreeBuf) && !Double.isNaN(prevGlobalFreeBuf)) {
+            rateDelta = avgFreeBuf - prevGlobalFreeBuf;
+        }
+        prevGlobalFreeBuf = avgFreeBuf;
+        currentRateDelta = rateDelta;
+
+        double avgBufDelta = (this.prevTimestamp > 0) ? (avgBufferUtil - this.prevAvgBufferUtil) : 0.0;
+        if (!Double.isFinite(avgBufDelta)) { avgBufDelta = 0.0; }
+        this.currentAvgBufDelta = avgBufDelta;
+        double highUtilFlag = (highUtilFraction >= HIGH_UTIL_FLAG_THRESHOLD) ? 1.0 : 0.0;
+
+        double[] globalFeatures = new double[12];
+        globalFeatures[0] = activeConnections / maxConnections;       // active_connections_norm
+        globalFeatures[1] = totalMessages / maxMessages;              // total_messages_norm
+        globalFeatures[2] = avgBufferUtil;                            // avg_buffer_util
+        globalFeatures[3] = avgContacts / maxContacts;                // avg_contacts_norm
+        globalFeatures[4] = msgChangeRateNorm;                        // msg_change_rate
+        globalFeatures[5] = msgChangeMomentum;                        // msg_change_momentum
+        globalFeatures[6] = bufUtilChangeRateNorm;                    // buf_util_change_rate
+        globalFeatures[7] = bufUtilMomentum;                          // buf_util_momentum
+        globalFeatures[8] = avgFreeBuf;                               // avg_free_buffer
+        globalFeatures[9] = highUtilFraction;                         // high_util_fraction
+        globalFeatures[10] = highUtilFlag;                            // high_util_flag
+        globalFeatures[11] = avgBufDelta;                             // avg_buf_delta
+
+        return globalFeatures;
     }
 
 }
