@@ -1,0 +1,121 @@
+# DupC-aware Prophet Router with reports
+
+## Scenario settings
+Scenario.name = dupca_prophet_with_reports
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+Scenario.endTime = 3600
+
+## Interface-specific settings
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+highspeedInterface.type = SimpleBroadcastInterface
+highspeedInterface.transmitSpeed = 10M
+highspeedInterface.transmitRange = 1000
+
+## Groups
+Scenario.nrofHostGroups = 6
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.router = DupCAwareProphetRouter
+Group.bufferSize = 5M
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.msgTtl = 300
+
+Group.nrofHosts = 40
+
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.okMaps = 1
+Group2.speed = 2.7, 13.9
+
+Group3.groupID = w
+
+Group4.groupID = t
+Group4.bufferSize = 50M
+Group4.movementModel = MapRouteMovement
+Group4.routeFile = data/tram3.wkt
+Group4.routeType = 1
+Group4.waitTime = 10, 30
+Group4.speed = 7, 10
+Group4.nrofHosts = 2
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = highspeedInterface
+
+Group5.groupID = t
+Group5.bufferSize = 50M
+Group5.movementModel = MapRouteMovement
+Group5.routeFile = data/tram4.wkt
+Group5.routeType = 2
+Group5.waitTime = 10, 30
+Group5.speed = 7, 10
+Group5.nrofHosts = 2
+
+Group6.groupID = t
+Group6.bufferSize = 50M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram10.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 10
+Group6.nrofHosts = 2
+
+## Message creation parameters
+Events.nrof = 1
+Events1.class = MessageEventGenerator
+Events1.interval = 25,35
+Events1.size = 500k,1M
+Events1.hosts = 0,126
+Events1.prefix = M
+
+## Movement model settings
+MovementModel.rngSeed = 1
+MovementModel.worldSize = 4500, 3400
+MovementModel.warmup = 1000
+
+## Map based movement settings
+MapBasedMovement.nrofMapFiles = 4
+MapBasedMovement.mapFile1 = data/roads.wkt
+MapBasedMovement.mapFile2 = data/main_roads.wkt
+MapBasedMovement.mapFile3 = data/pedestrian_paths.wkt
+MapBasedMovement.mapFile4 = data/shops.wkt
+
+## Reports
+Report.nrofReports = 6
+Report.warmup = 0
+Report.reportDir = reports/
+Report.report1 = MessageStatsReport
+Report.report2 = ContactTimesReport
+Report.report3 = EnergyLevelReport
+Report.report4 = BufferOccupancyReport
+Report.report5 = MessageDeliveryReport
+Report.report6 = DeliveredMessagesReport
+EnergyLevelReport.granularity = 300
+BufferOccupancyReport.occupancyInterval = 300
+
+## Prophet base settings
+ProphetRouter.secondsInTimeUnit = 30
+ProphetRouter.beta = 0.25
+ProphetRouter.gamma = 0.98
+
+## DupC-aware Prophet settings
+DupCAwareProphetRouter.tDup = 16
+DupCAwareProphetRouter.delta = 0.2
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI (optional)
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100

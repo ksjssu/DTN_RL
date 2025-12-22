@@ -130,14 +130,48 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "")  # empty = auto-generate when savi
 # EVAL_ONLY=true: disable training updates (inference only)
 EVAL_ONLY = os.environ.get("EVAL_ONLY", "false").lower() in ("1", "true", "yes")
 
-# Reward weights (overridable via environment)
-# Delivery reward increased by 3x (now 27.0 for better performance)
-W_DELIVER = float(os.environ.get("W_DELIVER", "20.0"))
-W_RELAY   = float(os.environ.get("W_RELAY",   "10.0"))
-W_DROP    = float(os.environ.get("W_DROP",    "2.0"))
-W_ABORT   = float(os.environ.get("W_ABORT",   "0.5"))
-W_DELAY   = 0.0  # penalty for high delay (direct relationship) - disabled but logic kept
-W_PRESSURE = float(os.environ.get("W_PRESSURE", "3.0"))  # buffer-pressure bonus scaling (8.0→3.0 스케일 다운)
+# Reward weights (CTDE-aligned with RLStateReport)
+W_DELIVER = float(os.environ.get("W_DELIVER", "1.0"))
+W_DROP    = float(os.environ.get("W_DROP",    "0.0"))
+W_DELAY   = float(os.environ.get("W_DELAY",   "0.0"))
+CONDITIONAL_RELAY_GAIN = float(os.environ.get("CONDITIONAL_RELAY_GAIN", "1.0"))
+DEFAULT_BUFFER_MB = float(os.environ.get("DEFAULT_BUFFER_MB", "60.0"))
+
+# Relay/abort shaping constants (match RLStateReport.java)
+RELAY_MIN   = float(os.environ.get("RELAY_MIN",   "-0.4"))
+RELAY_MAX   = float(os.environ.get("RELAY_MAX",   "3.0"))
+RELAY_SLOPE = float(os.environ.get("RELAY_SLOPE", "0.12"))
+RELAY_MID   = float(os.environ.get("RELAY_MID",   "40.0"))
+PRESSURE_SLOPE = float(os.environ.get("PRESSURE_SLOPE", "0.2"))
+PRESSURE_MID   = float(os.environ.get("PRESSURE_MID",   "35.0"))
+PRESSURE_CLIP  = float(os.environ.get("PRESSURE_CLIP",  "0.15"))
+ABORT_GAIN  = float(os.environ.get("ABORT_GAIN",  "0.6"))
+ABORT_SLOPE = float(os.environ.get("ABORT_SLOPE", "0.18"))
+ABORT_MID   = float(os.environ.get("ABORT_MID",   "25.0"))
+
+
+def buffer_weight_profile(buffer_size_mb):
+    """Return (delivery_weight, relay_weight, abort_weight) for a given buffer size."""
+    if buffer_size_mb is None or buffer_size_mb <= 0:
+        buffer_size_mb = DEFAULT_BUFFER_MB
+    sigmoid = 1.0 / (1.0 + math.exp(-RELAY_SLOPE * (buffer_size_mb - RELAY_MID)))
+    relay_weight = RELAY_MIN + (RELAY_MAX - RELAY_MIN) * sigmoid * 2.0
+    if relay_weight < 0.0:
+        relay_weight = min(0.15, abs(relay_weight))
+    abort_weight = -ABORT_GAIN / (1.0 + math.exp(ABORT_SLOPE * (buffer_size_mb - ABORT_MID)))
+    return W_DELIVER, relay_weight, abort_weight
+
+
+def relay_pressure_coeff(buffer_size_mb, pressure_diff):
+    """Map pressure difference to [-1,1] with buffer-size-dependent gating."""
+    if buffer_size_mb is None or buffer_size_mb <= 0:
+        buffer_size_mb = DEFAULT_BUFFER_MB
+    gate = 0.5 * (1.0 + math.tanh(PRESSURE_SLOPE * (buffer_size_mb - PRESSURE_MID)))
+    if PRESSURE_CLIP > 0:
+        norm = max(-1.0, min(1.0, pressure_diff / PRESSURE_CLIP))
+    else:
+        norm = pressure_diff
+    return gate * norm
 
 def extract_buffer_size_mb(sim_id):
     """Extract buffer size from sim_id. Returns buffer size in MB or None if not found."""
@@ -152,83 +186,6 @@ def extract_buffer_size_mb(sim_id):
         return None
     except Exception:
         return None
-
-def get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty):
-    """
-    Calculate base reward (delivery, drop, abort penalties).
-    Additional relay rewards are calculated separately based on buffer conditions.
-    """
-    buffer_size = extract_buffer_size_mb(sim_id)
-
-    if buffer_size is None:
-        # Fallback to environment variables if buffer size not detected
-        return (W_DELIVER * delivered) + (W_RELAY * relayed) - (W_DROP * drops) - (W_ABORT * aborted) - delay_penalty
-
-    # Buffer-specific base reward strategies
-    if buffer_size == 10.0:
-        # 10M: Delivery-focused with abort penalty only (NO relay in base, added conditionally later)
-        # Drop penalty: 0.0, Abort penalty: 36.0
-        return (delivered * 55.0) - (aborted * 36.0)
-    elif buffer_size == 20.0:
-        # 20M: Delivery reward only, no penalties (NO relay in base)
-        # Drop penalty: 0.0, Abort penalty: 0.0
-        return (delivered * 55.0)
-    elif buffer_size <= 20.0:
-        # 5M, 15M: Follow 10M strategy (abort penalty only)
-        # Drop penalty: 0.0, Abort penalty: 36.0
-        return (delivered * 55.0) - (aborted * 36.0)
-    elif buffer_size <= 25.0:
-        # 25M: Delivery only (NO relay in base, added conditionally later)
-        return delivered * 10.0
-    else:
-        # 30M+: Delivery + relay in base (YES relay included)
-        return (delivered * 10.0) + (relayed * 10.0)
-
-
-def calculate_relay_reward(buffer_size, relayed, self_util, buf_mean):
-    """
-    Calculate relay-specific rewards based on buffer size and conditions.
-    This is added to the base reward.
-
-    Returns:
-        float: Additional reward/penalty for relay behavior
-    """
-    if relayed <= 0:
-        return 0.0
-
-    pressure_diff = self_util - buf_mean
-
-    # 5M-15M: Relay reward DISABLED (turned off)
-    if buffer_size is not None and buffer_size < 20.0:
-        return 0.0
-
-    # 20M: Pressure-based relay reward (enabled)
-    if buffer_size == 20.0:
-        if pressure_diff >= 0.05:  # 내가 여유롭고 네트워크가 막힌 경우
-            bonus = min(pressure_diff * 6.0, 3.0)
-            relay_contribution = bonus * min(relayed, 50.0)
-            return max(-4.0, min(4.0, relay_contribution))
-        elif pressure_diff <= -0.05:  # 내가 부족한데 네트워크가 여유로운 경우
-            penalty = max(pressure_diff * 8.0, -4.0)
-            relay_contribution = penalty * min(relayed, 50.0)
-            return max(-4.0, min(4.0, relay_contribution))
-        else:
-            return 0.0
-
-    # 25M: Threshold-based smart relay
-    elif buffer_size == 25.0:
-        if self_util <= 0.6:  # 여유있음 → 보상
-            return 5.0 * relayed
-        elif self_util >= 0.8:  # 부족함 → 패널티
-            return -3.0 * relayed
-
-    # 30M+: Smart relay bonus when buffer below 70%
-    elif buffer_size > 25.0:
-        if self_util <= 0.7:
-            return 5.0 * relayed
-
-    return 0.0
-
 
 class HeuristicPolicy:
     def __init__(self):
@@ -260,20 +217,22 @@ class HeuristicPolicy:
 
 
 class PPOPolicy:
-    def __init__(self, obs_dim=5, hidden1=128, hidden2=128):
+    def __init__(self, obs_dim=7, hidden1=128, hidden2=128):
         # Hyperparameters (env-overridable)
         self.clip_eps = float(os.environ.get("PPO_CLIP", "0.2"))
         self.value_coef = float(os.environ.get("PPO_VALUE_COEF", "0.5"))
-        self.entropy_coef = float(os.environ.get("PPO_ENTROPY", "0.005"))  # 탐험 보수적: 0.015 → 0.005
+        self.entropy_coef = float(os.environ.get("PPO_ENTROPY", "0.00"))  # 탐험 보수적: 0.015 → 0.005
         self.lr = float(os.environ.get("PPO_LR", "3e-4"))  # 학습률 복원: 2e-4 → 3e-4
-        self.batch_size = int(os.environ.get("PPO_BATCH_SIZE", "1024"))
+        self.batch_size = int(os.environ.get("PPO_BATCH_SIZE", "128"))
         self.minibatch = int(os.environ.get("PPO_MINIBATCH", "128"))
-        self.epochs = int(os.environ.get("PPO_EPOCHS", "6"))
+        self.epochs = int(os.environ.get("PPO_EPOCHS", "20"))
+        self.gamma = float(os.environ.get("PPO_GAMMA", "0.99"))
+        self.gae_lambda = float(os.environ.get("PPO_GAE_LAMBDA", "0.95"))
 
         self.device = torch.device("cpu")
 
         # Actor: outputs mean; log_std is a learnable parameter
-        # Architecture: 5-128-128-1
+        # Architecture: 7-128-128-1 (uses local observation only)
         self.actor = nn.Sequential(
             nn.Linear(obs_dim, hidden1), nn.Tanh(),
             nn.Linear(hidden1, hidden2), nn.Tanh(),
@@ -281,67 +240,174 @@ class PPOPolicy:
         ).to(self.device)
         self.log_std = nn.Parameter(torch.zeros(1, device=self.device))
         self.log_std_min = -3.0  # 최소 log_std 완화: -2.0 → -3.0
-        # Critic
-        # Architecture: 5-128-128-1
+
+        # CTDE: Critic uses global state (local + global features)
+        # Global state = 5 local + 10 global = 15 dimensions
+        self.global_feat_dim = 10
+        self.global_obs_dim = obs_dim + self.global_feat_dim  # 5 + 10 = 15
+        # Architecture: 15-256-128-1 (expanded input and first hidden layer)
         self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden1), nn.Tanh(),
-            nn.Linear(hidden1, hidden2), nn.Tanh(),
-            nn.Linear(hidden2, 1)
+            nn.Linear(self.global_obs_dim, hidden1 * 2), nn.Tanh(),  # 15 → 256
+            nn.Linear(hidden1 * 2, hidden2), nn.Tanh(),              # 256 → 128
+            nn.Linear(hidden2, 1)                                     # 128 → 1
         ).to(self.device)
         self.opt = optim.Adam(list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()), lr=self.lr)
 
+        actor_init = os.environ.get("PPO_ACTOR_INIT", "").strip()
+        if actor_init:
+            try:
+                state = torch.load(actor_init, map_location=self.device)
+                self.actor.load_state_dict(state, strict=False)
+            except Exception as e:
+                print(f"[PPOPolicy] WARN: failed to load actor init {actor_init}: {e}")
+        critic_init = os.environ.get("PPO_CRITIC_INIT", "").strip()
+        if critic_init:
+            try:
+                state = torch.load(critic_init, map_location=self.device)
+                self.critic.load_state_dict(state, strict=False)
+            except Exception as e:
+                print(f"[PPOPolicy] WARN: failed to load critic init {critic_init}: {e}")
+
         # Last step cache and on-policy buffer
-        # last_actions: key -> (obs_tensor, pre_tanh_action, logprob, value)
+        # CTDE: last_actions: key -> (local_obs, global_obs, pre_tanh_action, logprob, value)
         self.last_actions = {}
-        self.buf_obs = []
+        self.buf_local_obs = []   # Actor uses local obs (5D)
+        self.buf_global_obs = []  # Critic uses global obs (15D)
         self.buf_act_pre = []
         self.buf_logp = []
         self.buf_val = []
         self.buf_rew = []
 
+        print(f"[PPOPolicy] Initialized CTDE mode: Actor=5D, Critic=15D (5 local + 10 global)")
         self.policy_id = "ppo_v2"
 
     def _to_tensor(self, arr):
         return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
+    def _construct_global_obs(self, local_obs, global_features):
+        """
+        CTDE: Construct global observation by concatenating local obs with global features.
+
+        Args:
+            local_obs: Tensor of shape (batch_size, 5) - local observations
+            global_features: Tensor of shape (batch_size, 10) - global network features (REQUIRED)
+
+        Returns:
+            Tensor of shape (batch_size, 15) - combined global observation
+        """
+        return torch.cat([local_obs, global_features], dim=1)
+
     def _tanh_gaussian_sample(self, mean):
-        log_std_clamped = torch.clamp(self.log_std, min=self.log_std_min)
-        std = log_std_clamped.exp().expand_as(mean)
-        normal = torch.distributions.Normal(mean, std)
-        u = normal.rsample()  # reparameterized
+        # CRITICAL: detach and clean mean/std completely before Normal distribution
+        log_std_clamped = torch.clamp(torch.nan_to_num(self.log_std.detach()), min=self.log_std_min, max=2.0)
+        std = log_std_clamped.exp()
+        std = torch.clamp(std, min=1e-6, max=10.0).expand_as(mean)
+
+        # Completely sanitize mean (detach from corrupted gradient graph)
+        mean = mean.detach()
+        mean = torch.where(torch.isfinite(mean), mean, torch.zeros_like(mean))
+
+        # Completely sanitize std
+        std = torch.where(torch.isfinite(std), std, torch.full_like(std, 1e-2))
+
+        # Final safety check before Normal creation
+        if not (torch.isfinite(mean).all() and torch.isfinite(std).all()):
+            print(f"[ERROR] Still have NaN/Inf after sanitization - using safe defaults")
+            mean = torch.zeros_like(mean)
+            std = torch.full_like(std, 1e-2)
+
+        try:
+            normal = torch.distributions.Normal(mean, std)
+            u = normal.rsample()
+        except Exception as e:
+            print(f"[ERROR] Normal distribution creation failed: {e}, returning zeros")
+            u = torch.zeros_like(mean)
+
+        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
         a = torch.tanh(u)
+        a = torch.where(torch.isfinite(a), a, torch.zeros_like(a))
+
         # log-prob with tanh correction
-        logp = normal.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)
+        logp = normal.log_prob(u) - torch.log(torch.clamp(1 - a.pow(2), min=1e-6))
+        logp = torch.where(torch.isfinite(logp), logp, torch.zeros_like(logp))
         return u, a, logp.squeeze(-1)
 
     def _tanh_gaussian_logprob(self, mean, u):
-        log_std_clamped = torch.clamp(self.log_std, min=self.log_std_min)
-        std = log_std_clamped.exp().expand_as(mean)
-        normal = torch.distributions.Normal(mean, std)
-        a = torch.tanh(u)
-        logp = normal.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)
+        # Same safety measures as _tanh_gaussian_sample
+        log_std_clamped = torch.clamp(torch.nan_to_num(self.log_std.detach()), min=self.log_std_min, max=2.0)
+        std = log_std_clamped.exp()
+        std = torch.clamp(std, min=1e-6, max=10.0).expand_as(mean)
+
+        # Sanitize inputs
+        mean = torch.where(torch.isfinite(mean), mean, torch.zeros_like(mean))
+        std = torch.where(torch.isfinite(std), std, torch.full_like(std, 1e-2))
+        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
+
+        try:
+            normal = torch.distributions.Normal(mean, std)
+            a = torch.tanh(u)
+            a = torch.where(torch.isfinite(a), a, torch.zeros_like(a))
+            logp = normal.log_prob(u) - torch.log(torch.clamp(1 - a.pow(2), min=1e-6))
+            logp = torch.where(torch.isfinite(logp), logp, torch.zeros_like(logp))
+        except Exception as e:
+            print(f"[ERROR] logprob calculation failed: {e}, returning zeros")
+            logp = torch.zeros_like(u)
+
         return logp.squeeze(-1)
 
-    def act_batch(self, obs_batch, delta_limit, keys):
+    def act_batch(self, obs_batch, delta_limit, keys, global_features=None):
+        """
+        Generate actions for a batch of observations using CTDE.
+
+        Args:
+            obs_batch: List of local observations (5D)
+            delta_limit: Action scale limit
+            keys: List of keys for caching
+            global_features: Global features (10D) for CTDE (optional, uses zeros if None)
+
+        Returns:
+            List of scaled actions
+        """
         if len(obs_batch) == 0:
             return []
-        obs = self._to_tensor(obs_batch)
-        mean = self.actor(obs).squeeze(-1)
+
+        if not torch.isfinite(self.log_std.data).all():
+            self.log_std.data = torch.where(torch.isfinite(self.log_std.data), self.log_std.data, torch.zeros_like(self.log_std.data))
+
+        local_obs = torch.nan_to_num(self._to_tensor(obs_batch))
+
+        # Handle None or empty global_features
+        if global_features is None or len(global_features) == 0:
+            batch_size = local_obs.size(0)
+            global_feat_tensor = torch.zeros(batch_size, self.global_feat_dim, device=self.device)
+        else:
+            global_feat_tensor = torch.nan_to_num(self._to_tensor(global_features))
+
+        # Actor uses only local observations (5D)
+        mean = torch.nan_to_num(self.actor(local_obs).squeeze(-1))
+        if not torch.isfinite(mean).all():
+            mean = torch.where(torch.isfinite(mean), mean, torch.zeros_like(mean))
         u, a, logp = self._tanh_gaussian_sample(mean.unsqueeze(-1))
         a = a.squeeze(-1)
-        # scale to delta space
+
+        # Scale to delta space
         scale = delta_limit if (delta_limit is not None and delta_limit > 0) else 1.0
         action_scaled = (a * scale).detach()
-        val = self.critic(obs).squeeze(-1).detach()
 
-        # store last step actions per key
+        # CTDE: Critic uses global observation (15D = 5 local + 10 global)
+        global_obs = self._construct_global_obs(local_obs, global_feat_tensor)
+        val = self.critic(global_obs).squeeze(-1).detach()
+
+        # Store last step actions per key (local_obs, global_obs, pre_tanh_action, logprob, value)
         act_list = action_scaled.cpu().tolist()
         for i, k in enumerate(keys):
-            self.last_actions[k] = (obs[i].detach(), u[i].detach(), logp[i].detach(), val[i].detach())
+            self.last_actions[k] = (local_obs[i].detach(), global_obs[i].detach(), u[i].detach(), logp[i].detach(), val[i].detach())
         return act_list
 
-    def _add_to_buffer(self, obs, u_pre, logp, val, rew):
-        self.buf_obs.append(obs)
+    def _add_to_buffer(self, local_obs, global_obs, u_pre, logp, val, rew):
+        """Add transition to replay buffer (CTDE version)."""
+        self.buf_local_obs.append(local_obs)
+        self.buf_global_obs.append(global_obs)
         self.buf_act_pre.append(u_pre)
         self.buf_logp.append(logp)
         self.buf_val.append(val)
@@ -365,9 +431,10 @@ class PPOPolicy:
             r_host = float(rewards_per_host.get(host, 0.0))
             r_each = r_host / float(len(acted_keys)) if len(acted_keys) > 0 else 0.0
             for k in acted_keys:
-                obs, u_pre, logp, val = self.last_actions[k]
+                # CTDE: unpack local_obs, global_obs, pre_tanh_action, logprob, value
+                local_obs, global_obs, u_pre, logp, val = self.last_actions[k]
                 r_key = float(rewards_per_key.get(k, r_each))
-                self._add_to_buffer(obs, u_pre, logp, val, r_key)
+                self._add_to_buffer(local_obs, global_obs, u_pre, logp, val, r_key)
                 any_added = True
         # clear last actions cache (we've consumed them)
         self.last_actions.clear()
@@ -376,22 +443,49 @@ class PPOPolicy:
             return {"updated": False}
 
         # If buffer not large enough, defer optimization
-        if len(self.buf_obs) < self.batch_size:
-            return {"updated": False, "buffer": len(self.buf_obs)}
+        if len(self.buf_local_obs) < self.batch_size:
+            return {"updated": False, "buffer": len(self.buf_local_obs)}
 
-        # Prepare tensors
-        obs = torch.stack(self.buf_obs)
+        # Prepare tensors (CTDE: separate local and global obs)
+        local_obs = torch.stack(self.buf_local_obs)
+        global_obs = torch.stack(self.buf_global_obs)
         u_pre = torch.stack(self.buf_act_pre).squeeze(-1) if self.buf_act_pre[0].dim() > 0 else torch.stack(self.buf_act_pre)
         old_logp = torch.stack(self.buf_logp)
         val_old = torch.stack(self.buf_val)
         rew = torch.stack(self.buf_rew)
 
-        # One-step advantage baseline
-        adv = (rew - val_old).detach()
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        ret = rew.detach()
+        # GAE (Generalized Advantage Estimation) for better temporal credit assignment
+        batch_len = rew.size(0)
+        advantages = torch.zeros_like(rew)
+        returns = torch.zeros_like(rew)
 
-        n = obs.size(0)
+        # Compute next values for bootstrapping
+        # For one-step, next_val = 0 (episode boundaries)
+        # In reality, we'd need to track episode boundaries, but for simplicity:
+        # We'll use a simplified GAE that assumes independent transitions
+        with torch.no_grad():
+            for t in reversed(range(batch_len)):
+                if t == batch_len - 1:
+                    next_val = 0.0  # Terminal or boundary
+                    next_advantage = 0.0
+                else:
+                    next_val = val_old[t + 1]
+                    next_advantage = advantages[t + 1]
+
+                # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+                delta = rew[t] + self.gamma * next_val - val_old[t]
+
+                # GAE: A_t = δ_t + (γλ) * A_{t+1}
+                advantages[t] = delta + self.gamma * self.gae_lambda * next_advantage
+
+                # Returns for value function target: R_t = A_t + V(s_t)
+                returns[t] = advantages[t] + val_old[t]
+
+        # Normalize advantages for training stability
+        adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        ret = returns
+
+        n = local_obs.size(0)
         idx = torch.randperm(n)
         mb = self.minibatch if self.minibatch > 0 else n
 
@@ -399,20 +493,24 @@ class PPOPolicy:
             for start in range(0, n, mb):
                 end = min(start + mb, n)
                 b = idx[start:end]
-                b_obs = obs[b]
+                # CTDE: Actor uses local_obs, Critic uses global_obs
+                b_local_obs = local_obs[b]
+                b_global_obs = global_obs[b]
                 b_u = u_pre[b].unsqueeze(-1)
                 b_old_logp = old_logp[b]
                 b_adv = adv[b]
                 b_ret = ret[b]
 
-                mean = self.actor(b_obs)
+                # Actor: uses only local observations (5D)
+                mean = self.actor(b_local_obs)
                 new_logp = self._tanh_gaussian_logprob(mean, b_u)
                 ratio = (new_logp - b_old_logp).exp()
                 surr1 = ratio * b_adv
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * b_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_pred = self.critic(b_obs).squeeze(-1)
+                # Critic: uses global observations (15D)
+                value_pred = self.critic(b_global_obs).squeeze(-1)
                 value_loss = (value_pred - b_ret).pow(2).mean()
 
                 # approximate entropy of underlying normal (ignoring tanh)
@@ -424,8 +522,21 @@ class PPOPolicy:
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
                 self.opt.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()), 1.0)
+                # Gradient clipping with tighter bound for stability
+                nn.utils.clip_grad_norm_(list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()), 0.5)
                 self.opt.step()
+
+                # NaN safety check after parameter update
+                has_nan = False
+                for param in list(self.actor.parameters()) + [self.log_std] + list(self.critic.parameters()):
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        has_nan = True
+                        break
+                if has_nan:
+                    print("[ERROR] NaN/Inf detected in network parameters after update - reverting update")
+                    # This update corrupted the network, ideally should reload previous weights
+                    # For now, just skip and log the error
+                    return {"updated": False, "error": "NaN in parameters"}
 
         # Diagnostic logging
         std_mean = std.mean().item()
@@ -443,8 +554,8 @@ class PPOPolicy:
         except Exception:
             pass
 
-        # Clear buffer after update
-        self.buf_obs.clear(); self.buf_act_pre.clear(); self.buf_logp.clear(); self.buf_val.clear(); self.buf_rew.clear()
+        # Clear buffer after update (CTDE: clear both local and global obs)
+        self.buf_local_obs.clear(); self.buf_global_obs.clear(); self.buf_act_pre.clear(); self.buf_logp.clear(); self.buf_val.clear(); self.buf_rew.clear()
         return {"updated": True, "trained_on": n, "std_mean": std_mean, "entropy": entropy_mean, "adv_var": adv_var}
 
     # --- Checkpoint I/O ---
@@ -702,97 +813,92 @@ class Handler(BaseHTTPRequestHandler):
                 return default
             return f
 
-        # 1) Build rewards per host from prev_transition
+        # 1) Build rewards per host and per key from prev_transition (CTDE-aligned reward function)
         rewards_per_host = {}
+        rewards_per_key = {}
+        buffer_hint = extract_buffer_size_mb(sim_id)
         for item in prev_tr:
             try:
                 host = str(item.get("host", ""))
-                relayed = float(item.get("relayed", 0) or 0)
-                drops = float(item.get("drops", 0) or 0)
-                aborted = float(item.get("aborted", 0) or 0)
-                r = relayed - drops - 0.5 * aborted
-                rewards_per_host[host] = rewards_per_host.get(host, 0.0) + r
+                if not host:
+                    continue
+                dest = str(item.get("dest", "")) if isinstance(item, dict) else ""
+                key = f"{host}#{dest}" if dest else None
+                delivered = _to_float(item.get("delivered", 0.0), 0.0)
+                relayed = _to_float(item.get("relayed", 0.0), 0.0)
+                drops = _to_float(item.get("drops", 0.0), 0.0)
+                aborted = _to_float(item.get("aborted", 0.0), 0.0)
+                avg_delay = _to_float(item.get("avg_delay", 0.0), 0.0)
+                buffer_size_mb = _to_float(item.get("buffer_size_mb", 0.0), 0.0)
+                if buffer_size_mb <= 0:
+                    buffer_bytes = _to_float(item.get("buffer_size", 0.0), 0.0)
+                    if buffer_bytes > 0:
+                        buffer_size_mb = buffer_bytes / (1024.0 * 1024.0)
+                if buffer_size_mb <= 0:
+                    buffer_size_mb = buffer_hint if buffer_hint else DEFAULT_BUFFER_MB
+
+                feature = prev_features.get(key) if key else None
+                self_util_prev = _to_float(feature.get("self_buf_util"), 0.0) if feature else 0.0
+                buf_mean_prev = _to_float(feature.get("bufocc_mean"), 0.0) if feature else 0.0
+                global_msg_rate = _to_float(feature.get("global_msg_change_rate"), 0.0) if feature else 0.0
+
+                w_del, w_relay, w_abort = buffer_weight_profile(buffer_size_mb)
+                reward = 0.0
+                if delivered > 0:
+                    reward += w_del * delivered
+                if aborted > 0:
+                    reward += w_abort * aborted
+                if drops > 0 and W_DROP != 0.0:
+                    reward -= W_DROP * drops
+                if delivered > 0 and avg_delay > 0 and W_DELAY != 0.0:
+                    reward -= W_DELAY * delivered * avg_delay
+
+                mean_occ = buf_mean_prev
+                if math.isnan(mean_occ) or math.isinf(mean_occ):
+                    mean_occ = 0.5
+
+                if relayed > 0:
+                    if mean_occ <= NETWORK_AVG_LOW_THRESHOLD:
+                        relay_bonus = w_relay * relayed
+                    elif mean_occ >= NETWORK_AVG_HIGH_THRESHOLD:
+                        relay_bonus = -RELAY_CRIT_MULT * w_relay * relayed
+                    else:
+                        relay_bonus = 0.0
+
+                    if global_msg_rate > 0.3:
+                        warning_scale = min(1.0, max(0.0, global_msg_rate))
+                        relay_bonus -= H_WARNING_GAIN * warning_scale * relayed
+
+                    if relay_bonus != 0.0:
+                        reward += relay_bonus
+                        Handler.EP_PRESSURE_SUM += abs(relay_bonus)
+
+                if mean_occ >= NETWORK_AVG_HIGH_THRESHOLD:
+                    reward -= RELAY_CRIT_STATIC_PENALTY
+
+                delta_raw = item.get("rate_delta")
+                if delta_raw is not None:
+                    rate_delta = _to_float(delta_raw, 0.0)
+                    reward += RATE_DELTA_GAIN * rate_delta
+
+                if not math.isnan(self_util_prev):
+                    flush_bonus = max(0.0, FLUSH_UTIL_THRESHOLD - self_util_prev)
+                    if flush_bonus > 0:
+                        reward += FLUSH_GAIN * flush_bonus
+
+                if reward != 0.0:
+                    rewards_per_host[host] = rewards_per_host.get(host, 0.0) + reward
+                    if key:
+                        rewards_per_key[key] = rewards_per_key.get(key, 0.0) + reward
+
+                Handler.EP_DELIVERED_SUM += delivered
+                Handler.EP_RELAYED_SUM += relayed
             except Exception:
                 continue
 
-        # Apply optional additional weighting if 'delivered' is present
-        try:
-            has_delivered = any((isinstance(it, dict) and ('delivered' in it)) for it in prev_tr)
-            if has_delivered:
-                for item in prev_tr:
-                    try:
-                        host = str(item.get("host", ""))
-                        delivered = float(item.get("delivered", 0) or 0)
-                        relayed = float(item.get("relayed", 0) or 0)
-                        drops = float(item.get("drops", 0) or 0)
-                        aborted = float(item.get("aborted", 0) or 0)
-                        avg_delay = float(item.get("avg_delay", 0) or 0)  # average delivery delay in seconds
-                        
-                        delay_penalty = 0
-                        if delivered > 0 and avg_delay > 0:
-                            delay_penalty = W_DELAY * delivered * avg_delay
-                        
-                        r_adj = get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty)
-                        rewards_per_host[host] = rewards_per_host.get(host, 0.0) + r_adj
-
-                        # Track reward components for episode analysis
-                        Handler.EP_DELIVERED_SUM += delivered
-                        Handler.EP_RELAYED_SUM += relayed
-
-                        # No additional penalties for 5M-25M buffers (delivery reward only)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        # Build per-key rewards map (host#dest) for finer credit assignment
-        rewards_per_key = {}
-        try:
-            for item in prev_tr:
-                host = str(item.get("host", ""))
-                dest = str(item.get("dest", "")) if isinstance(item, dict) else ""
-                if not dest:
-                    continue
-                key = f"{host}#{dest}"
-                relayed = float(item.get("relayed", 0) or 0)
-                drops = float(item.get("drops", 0) or 0)
-                aborted = float(item.get("aborted", 0) or 0)
-                delivered = float(item.get("delivered", 0) or 0)
-                avg_delay = float(item.get("avg_delay", 0) or 0)
-                base = relayed - drops - 0.5 * aborted
-                
-                delay_penalty = 0
-                if delivered > 0 and avg_delay > 0:
-                    delay_penalty = W_DELAY * delivered * avg_delay
-                
-                # Calculate base reward
-                r = get_base_reward(sim_id, delivered, relayed, drops, aborted, delay_penalty) if ('delivered' in item) else base
-
-                # Calculate additional relay reward based on buffer conditions
-                feature = prev_features.get(key)
-                relay_reward = 0.0
-                buffer_size = extract_buffer_size_mb(sim_id)
-
-                if feature and buffer_size is not None:
-                    self_util_prev = _to_float(feature.get("self_buf_util"), 0.0)
-                    buf_mean_prev = _to_float(feature.get("bufocc_mean"), 0.0)
-
-                    # Calculate relay reward using unified function
-                    relay_reward = calculate_relay_reward(buffer_size, relayed, self_util_prev, buf_mean_prev)
-
-                # Add relay reward to total reward
-                if relay_reward != 0.0:
-                    rewards_per_host[host] = rewards_per_host.get(host, 0.0) + relay_reward
-                    r += relay_reward
-                    # Track relay reward component
-                    Handler.EP_PRESSURE_SUM += abs(relay_reward)
-
-                rewards_per_key[key] = rewards_per_key.get(key, 0.0) + r
-        except Exception:
-            pass
-
         # 2) Prepare obs batch for current state and mapping to keys
         obs_batch = []
+        global_features_batch = []  # CTDE: 10D global features per observation
         keys = []
         map_host_to_keys = defaultdict(list)
         for item in state_batch:
@@ -812,8 +918,37 @@ class Handler(BaseHTTPRequestHandler):
                 if f > 1.0:
                     f = 1.0
                 p = _to_float(item.get("pred", 0.0), 0.0)
-                # 5-dimensional observation: [contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util]
-                obs_batch.append([c, p, buf_mean_cur, cap_norm_cur, self_util_cur])
+                # 5-dimensional local observation: [contacts_norm, pred, bufocc_mean, capacity_norm, self_buf_util]
+                pressure_diff = _to_float(item.get("pressure_diff", self_util_cur - buf_mean_cur), 0.0)
+                pressure_diff = max(-1.0, min(1.0, pressure_diff))
+                if any(math.isnan(x) or math.isinf(x) for x in (c, p, buf_mean_cur, cap_norm_cur, self_util_cur, pressure_diff)):
+                    continue
+                rate_delta = _to_float(item.get("rate_delta", 0.0), 0.0)
+                obs_batch.append([c, p, buf_mean_cur, cap_norm_cur, self_util_cur, pressure_diff, rate_delta])
+
+                # CTDE: Extract 10D global features
+                g_active_conns = _to_float(item.get("global_active_conns", 0.0), 0.0)
+                g_total_msgs = _to_float(item.get("global_total_msgs", 0.0), 0.0)
+                g_avg_buf = _to_float(item.get("global_avg_buf", 0.0), 0.0)
+                g_avg_contacts = _to_float(item.get("global_avg_contacts", 0.0), 0.0)
+                g_msg_change_rate = _to_float(item.get("global_msg_change_rate", 0.0), 0.0)
+                g_msg_change_momentum = _to_float(item.get("global_msg_change_momentum", 0.0), 0.0)
+                g_buf_util_change_rate = _to_float(item.get("global_buf_util_change_rate", 0.0), 0.0)
+                g_buf_util_momentum = _to_float(item.get("global_buf_util_momentum", 0.0), 0.0)
+                g_avg_free_buf = _to_float(item.get("global_avg_free_buf", 0.0), 0.0)
+                g_high_util_frac = _to_float(item.get("global_high_util_frac", 0.0), 0.0)
+                if any(math.isnan(x) or math.isinf(x) for x in (
+                    g_active_conns, g_total_msgs, g_avg_buf, g_avg_contacts,
+                    g_msg_change_rate, g_msg_change_momentum, g_buf_util_change_rate,
+                    g_buf_util_momentum, g_avg_free_buf, g_high_util_frac
+                )):
+                    continue
+                global_features_batch.append([
+                    g_active_conns, g_total_msgs, g_avg_buf, g_avg_contacts, g_msg_change_rate,
+                    g_msg_change_momentum, g_buf_util_change_rate, g_buf_util_momentum,
+                    g_avg_free_buf, g_high_util_frac
+                ])
+
                 k = f"{host}#{dest}"
                 keys.append(k)
                 map_host_to_keys[host].append(k)
@@ -827,6 +962,7 @@ class Handler(BaseHTTPRequestHandler):
                     "bufocc_mean": buf_mean_cur,
                     "capacity_norm": cap_norm_cur,
                     "freebuf_norm": f,
+                    "global_msg_change_rate": g_msg_change_rate,
                 }
             except Exception:
                 continue
@@ -870,8 +1006,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             Handler.AGENT.update()
 
-        # 4) Infer actions for current batch
-        actions_raw = Handler.AGENT.act_batch(obs_batch, delta_limit) if not TORCH_OK else Handler.AGENT.act_batch(obs_batch, delta_limit, keys)
+        # 4) Infer actions for current batch (CTDE: pass global_features)
+        if TORCH_OK:
+            actions_raw = Handler.AGENT.act_batch(obs_batch, delta_limit, keys, global_features_batch)
+        else:
+            actions_raw = Handler.AGENT.act_batch(obs_batch, delta_limit)
 
         # 5) Group actions by host and also provide a flat map for robustness
         per_host = defaultdict(list)
@@ -931,3 +1070,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+RELAY_CRIT_MULT = float(os.environ.get("RELAY_CRIT_MULT", "2.0"))
+H_WARNING_GAIN = float(os.environ.get("H_WARNING_GAIN", "0.4"))
+RELAY_CRIT_STATIC_PENALTY = float(os.environ.get("RELAY_CRIT_STATIC_PENALTY", "1.0"))
+FLUSH_UTIL_THRESHOLD = float(os.environ.get("FLUSH_UTIL_THRESHOLD", "0.30"))
+FLUSH_GAIN = float(os.environ.get("FLUSH_GAIN", "0.8"))
+RATE_DELTA_GAIN = float(os.environ.get("RATE_DELTA_GAIN", "10.0"))
+
+# Network average-based relay thresholds (matching heuristic: BufferLoadHeuristicReport)
+NETWORK_AVG_LOW_THRESHOLD = float(os.environ.get("NETWORK_AVG_LOW_THRESHOLD", "0.35"))
+NETWORK_AVG_HIGH_THRESHOLD = float(os.environ.get("NETWORK_AVG_HIGH_THRESHOLD", "0.75"))

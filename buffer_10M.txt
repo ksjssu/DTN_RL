@@ -1,0 +1,3 @@
+# Override for buffer size 10M
+Group.bufferSize = 10M
+

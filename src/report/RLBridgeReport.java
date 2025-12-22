@@ -118,8 +118,10 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final Map<String, Double> lastActionByKey = new HashMap<String, Double>();
     // Track buffer utilization at the time of action
     private final Map<String, Double> lastBufferUtilByKey = new HashMap<String, Double>();
-    // Track neighbor's p_base at the time of action (contact time)
-    private final Map<String, Double> lastNeighborPBaseByKey = new HashMap<String, Double>();
+    // Track actual peer's p_base (on relay event) for neighbor-based reward
+    private final Map<String, Double> lastPeerPBaseByKey = new HashMap<String, Double>();
+    // Track max neighbor p_base across all nodes (at action application time) for optional max-based reward
+    private final Map<String, Double> lastMaxNeighborPBaseByKey = new HashMap<String, Double>();
 
     // CTDE: Track previous values for change rate calculation
     private double prevTotalMessages = 0.0;
@@ -334,7 +336,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     // Get Gradient Alignment Reward fields
                     double lastAction = getAndResetDouble(lastActionByKey, k);
                     double lastBufUtil = getAndResetDouble(lastBufferUtilByKey, k);
-                    double neighborPBase = getAndResetDouble(lastNeighborPBaseByKey, k);  // Retrieved from stored value at action time
+                    double peerNeighborPBase = getAndResetDouble(lastPeerPBaseByKey, k);
+                    double maxNeighborPBase = getAndResetDouble(lastMaxNeighborPBaseByKey, k);
 
                     // Get p_base (pure PROPHET predictability without delta)
                     double pBase = 0.0;
@@ -363,7 +366,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                                 .append(",\"buffer_size\":").append(bufferCapacity).append(",")
                                 // Gradient Alignment Reward fields
                                 .append("\"p_base\":").append(format(pBase)).append(",")
-                                .append("\"neighbor_p_base\":").append(format(neighborPBase)).append(",")
+                                .append("\"neighbor_p_base\":").append(format(peerNeighborPBase)).append(",")
+                                .append("\"max_neighbor_p_base\":").append(format(maxNeighborPBase)).append(",")
                                 .append("\"my_buffer_norm\":").append(format(lastBufUtil)).append(",")
                                 .append("\"action\":").append(format(lastAction)).append("}");
                         }
@@ -426,26 +430,26 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     if (r instanceof ProphetRouter) {
                         ((ProphetRouter) r).setExternalOffset(destHost, delta);
 
-                        // Get neighbor's p_base from ALL other nodes' Prophet tables
-                        double neighborPBase = 0.0;
+                        // Get max neighbor's p_base from ALL other nodes' Prophet tables (diagnostic/optional reward)
+                        double maxNeighborPBase = 0.0;
                         if (destHost != null) {
                             for (DTNHost otherNode : hosts) {
                                 if (otherNode == h) continue; // Skip self
                                 MessageRouter otherRouter = otherNode.getRouter();
                                 if (otherRouter instanceof ProphetRouter) {
                                     double otherPred = ((ProphetRouter) otherRouter).getBasePredFor(destHost);
-                                    if (otherPred > neighborPBase) {
-                                        neighborPBase = otherPred;  // Use maximum across all nodes
+                                    if (otherPred > maxNeighborPBase) {
+                                        maxNeighborPBase = otherPred;  // Use maximum across all nodes
                                     }
                                 }
                             }
                         }
 
-                        // Store action, buffer util, and neighbor_p_base for Gradient Alignment Reward
+                        // Store action, buffer util, and max_neighbor_p_base for reward logic
                         String k = hostStr + "#" + destStr;
                         lastActionByKey.put(k, delta);
                         lastBufferUtilByKey.put(k, selfBufUtil);
-                        lastNeighborPBaseByKey.put(k, neighborPBase);
+                        lastMaxNeighborPBaseByKey.put(k, maxNeighborPBase);
 
                         if (this.logActions && loggedLocal < this.logActionsMax) {
                             write(now + " A " + hostStr + " - " + destStr + " " + format(delta));
@@ -561,25 +565,25 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                                 }
                                 if (!Double.isFinite(bufUtil)) { bufUtil = 0.0; }
 
-                                // Get neighbor's p_base from ALL other nodes' Prophet tables
-                                double neighborPBase = 0.0;
+                                // Get max neighbor's p_base from ALL other nodes' Prophet tables (diagnostic/optional reward)
+                                double maxNeighborPBase = 0.0;
                                 if (destHost != null) {
                                     for (DTNHost otherNode : hosts) {
                                         if (otherNode == h) continue; // Skip self
                                         MessageRouter otherRouter = otherNode.getRouter();
                                         if (otherRouter instanceof ProphetRouter) {
                                             double otherPred = ((ProphetRouter) otherRouter).getBasePredFor(destHost);
-                                            if (otherPred > neighborPBase) {
-                                                neighborPBase = otherPred;  // Use maximum across all nodes
+                                            if (otherPred > maxNeighborPBase) {
+                                                maxNeighborPBase = otherPred;  // Use maximum across all nodes
                                             }
                                         }
                                     }
                                 }
 
-                                // Store action, buffer util, and neighbor_p_base for Gradient Alignment Reward
+                                // Store action, buffer util, and max_neighbor_p_base for reward logic
                                 lastActionByKey.put(key, delta);
                                 lastBufferUtilByKey.put(key, bufUtil);
-                                lastNeighborPBaseByKey.put(key, neighborPBase);
+                                lastMaxNeighborPBaseByKey.put(key, maxNeighborPBase);
 
                                 if (this.logActions && logged < this.logActionsMax) { write(now + " A " + hostStr + " - " + destStr + " " + format(delta)); logged++; }
                             }
@@ -812,6 +816,17 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         String destStr = m.getTo().toString();
         String key = hostStr + "#" + destStr;
         Integer vr = relayedByKey.get(key); relayedByKey.put(key, (vr==null?1:vr+1));
+
+        // Capture the actual peer's base predictability for neighbor-based reward
+        try {
+            DTNHost destHost = m.getTo();
+            MessageRouter toRouter = to.getRouter();
+            if (toRouter instanceof ProphetRouter && destHost != null) {
+                double peerBase = ((ProphetRouter) toRouter).getBasePredFor(destHost);
+                if (!Double.isFinite(peerBase)) { peerBase = 0.0; }
+                lastPeerPBaseByKey.put(key, peerBase);
+            }
+        } catch (Exception ignore) { /* best effort only */ }
         if (firstDelivery) {
             Integer vd = deliveredByKey.get(key); deliveredByKey.put(key, (vd==null?1:vd+1));
             // Calculate delivery delay: current time - message creation time

@@ -28,3 +28,24 @@ venv/
 
 # Logs
 *.log
+*.out
+
+# Report directories
+reports/
+reports_drl_eval/
+reports_drl_train/
+reports_summary/
+
+# Backup directories
+backup/
+backup_reports/
+
+# Model files (large binaries)
+models_rmappo/
+models/
+
+# LaTeX files
+*.tex
+*.aux
+*.bbl
+*.blg

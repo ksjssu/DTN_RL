@@ -43,6 +43,11 @@ This repo contains a live DRL (PPO) bridge between The ONE simulator (Java) and 
 - `RLBridgeReport.deltaLimit = 0.05` (? clamp)
 - `RLBridgeReport.maxMessagesPerNode = 20` (inference cap)
 - `RLBridgeReport.url = http://localhost:5000/infer_and_update`
+- `RLBridgeReport.activationTime = 0` (optional delay in sim-seconds before DRL takes over; Prophet runs alone before this time)
+
+The buffer-based heuristic overlay (`BufferLoadHeuristicReport`) accepts the same
+`activationTime` knob, so you can let vanilla PRoPHET drive the network and only
+enable heuristics after, e.g., `14400` seconds.
 
 ### Observation Vector (DRL)
 
@@ -89,6 +94,33 @@ git push -u origin main  # or master, depending on your repo
     curl -X POST http://127.0.0.1:5000/save  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
     curl -X POST http://127.0.0.1:5000/load  -d '{"path":"models/ppo_model.pt"}' -H 'Content-Type: application/json'
     ```
+
+## Local R-MAPPO Inference (No HTTP Hop)
+
+You can now run the trained recurrent actor directly inside the Java simulator for
+almost realtime inference (e.g., 0.1 s sampling) without depending on the Python server.
+
+1. **Export the actor weights** from a checkpoint produced by `drl_server_rmappo.py`:
+   ```bash
+   python toolkit/export_rmappo_actor.py models_rmappo/buf30_policy.pt models_rmappo/buf30_actor_local.txt
+   ```
+   The output is a plain text file (`arch=rmappo_gru`) that contains the embedding,
+   GRU, and head weights needed for deterministic inference.
+2. **Point the scenario to the local policy** by editing your `.txt` settings:
+   ```
+   RLBridgeReport.localPolicyPath = models_rmappo/buf30_actor_local.txt
+   RLBridgeReport.sampleInterval = 0.1      # optional: 0.1 s for near-realtime actions
+   RLBridgeReport.url =                     # leave empty when running fully local
+   ```
+   When the file carries the `rmappo_gru` flag, `RLBridgeReport` automatically loads
+   `LocalRmappoPolicy`, keeps per host-destination hidden states, and bypasses the HTTP call.
+3. **Run the simulator** normally. All deltas are produced locally, so the Python server
+   can stay offline for evaluation-only runs. Place the exported file in `Report.reportDir`
+   or any readable path; the bridge logs `policy=(local)` when the local mode is active.
+
+> The exporter only writes the actor (policy) weights. Training should still be done via
+> the Python server; after training completes, export the actor you want to evaluate
+> and reconfigure `RLBridgeReport` as shown above.
 
 
 

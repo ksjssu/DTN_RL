@@ -156,6 +156,18 @@ public class ProphetRouter extends ActiveRouter {
     }
 
 	/**
+	 * Returns the base prediction (P) value for a host WITHOUT external offset.
+	 * This is the pure PROPHET delivery predictability before DRL delta is applied.
+	 * Used for reward calculation to prevent reward hacking.
+	 * @param host The host to look the base P for
+	 * @return the base P value (without external offset)
+	 */
+	public double getBasePredFor(DTNHost host) {
+		ageDeliveryPreds(); // make sure preds are updated before getting
+		return preds.containsKey(host) ? preds.get(host) : 0.0;
+	}
+
+	/**
 	 * Updates transitive (A->B->C) delivery predictions.
 	 * <CODE>P(a,c) = P(a,c)_old + (1 - P(a,c)_old) * P(a,b) * P(b,c) * BETA
 	 * </CODE>

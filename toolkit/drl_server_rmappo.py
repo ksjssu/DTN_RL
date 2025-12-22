@@ -60,8 +60,9 @@ Java Simulator와 Python DRL Server 간 통신 프로토콜:
      "buffer_size_mb": float,  # 버퍼 크기 (MB)
 
      # ===== Gradient Alignment용 추가 필드 (Java RLBridgeReport에서 추가 필요) =====
-     "p_base": float,          # ⭐ 순수 PROPHET 예측도 (delta 적용 전) - Reward 계산용
-     "neighbor_p_base": float, # 이웃 노드의 순수 PROPHET 예측도 (TODO: 향후 구현, 현재 0.0)
+   "p_base": float,                # ⭐ 순수 PROPHET 예측도 (delta 적용 전) - Reward 계산용
+   "neighbor_p_base": float,       # 실제 릴레이 이웃의 순수 PROPHET 예측도 (있으면 사용)
+   "max_neighbor_p_base": float,   # 네트워크 내 최대 이웃 p_base (진단/옵션 보상용)
      "my_buffer_norm": float,  # 내 노드의 버퍼 사용률 (0.0~1.0)
      "action": float,          # 이전 step에서 적용한 delta 값 (-1.0~1.0)
    }
@@ -108,14 +109,14 @@ Java Simulator와 Python DRL Server 간 통신 프로토콜:
     1. "p_base": 순수 PROPHET 예측도 (ProphetRouter에서 가져오기)
     2. "action": 이전 step에서 적용한 delta 값
     3. "my_buffer_norm": 버퍼 사용률
-  - (선택) "neighbor_p_base": 접촉한 이웃의 예측도 계산 로직 추가
+  - (선택) "neighbor_p_base": 접촉한 실제 이웃의 예측도 (릴레이 이벤트 시 기록)
+  - (선택) "max_neighbor_p_base": 네트워크 내 최대 이웃 예측도 (진단/옵션 보상)
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-import heapq
 import math
 import os
 import random
@@ -124,70 +125,20 @@ import time
 import numpy as np
 import traceback
 
-# Recommended defaults (can be overridden via environment)
-ENV_DEFAULTS = {
-    # === Active reward knobs (non-zero) ===
-    "PBASE_REWARD_WEIGHT": "1.0",
-    "PBASE_DIFF_EPS": "0",
-    "BUFFER_DIFF_REWARD_WEIGHT": "4.0",
-    "SUCCESS_RATE_WEIGHT": "400.0",
-    "SUCCESS_RATE_EPS": "0",
-    "SUCCESS_RATE_BONUS_WEIGHT": "400.0",
-    # === Disabled reward knobs (all zero) ===
-    "DELIVERY_REWARD_WEIGHT": "0.0",
-    "OVERHEAD_PENALTY_WEIGHT": "0.0",
-    "HIGH_LOAD_PENALTY_WEIGHT": "0.0",
-    "HIGH_LOAD_UTIL_BASE": "0.35",
-    "HIGH_LOAD_UTIL_THRESHOLD": "0.65",
-    "HIGH_LOAD_FLAG_THRESHOLD": "0.45",
-    "RELAY_BONUS_WEIGHT": "0.0",
-    "RELAY_LOW_UTIL_THRESHOLD": "0.65",
-    "RELAY_PRED_THRESHOLD": "0.6",
-    "ACTION_GAIN_LOW": "0.0",
-    "ACTION_GAIN_HIGH": "0.0",
-    "ACTION_GAIN_THRESHOLD": "0.8",
-    "MID_RANGE_REWARD": "0.0",
-    "MID_UTIL_THRESHOLD": "0.0",
-    "MID_UTIL_PENALTY_WEIGHT": "0.0",
-    "MID_UTIL_PRESSURE_MIN": "0.0",
-    "RELAY_HIGH_LOAD_FACTOR_MIN": "0.15",
-    "HEURISTIC_REWARD_WEIGHT": "0.0",
-    "HEURISTIC_PBASE_MIN": "0.6",
-    "HEURISTIC_BUF_MAX": "0.55",
-    "TREND_UTIL_THRESHOLD": "0.75",
-    "TREND_DELTA_THRESHOLD": "0.01",
-    "TREND_MIN_STEPS": "5",
-    "TREND_PENALTY_WEIGHT": "0.0",
-    # === Training / buffer / misc settings ===
-    "TRUNCATED_BPTT_LEN": "256",
-    "MAX_SEQS_PER_UPDATE": "768",
-    "MIN_SEQUENCES_TO_TRAIN": "64",
-    "TARGET_REWARD_TIME": "0",
-    "TARGET_REWARD_WEIGHT": "0",
-    "TOPK_BUFFER_SIZE": "256",
-    "TOPK_MIX_RATIO": "0.30",
-    "TOPK_MIN_SCORE": "0.0",
-}
-for key, value in ENV_DEFAULTS.items():
-    os.environ.setdefault(key, value)
-
-
-def env_float(name, fallback=None):
-    if fallback is None:
-        fallback = ENV_DEFAULTS.get(name, "0.0")
-    return float(os.environ.get(name, fallback))
-
-
-def env_int(name, fallback=None):
-    if fallback is None:
-        fallback = ENV_DEFAULTS.get(name, "0")
-    return int(float(os.environ.get(name, fallback)))
-
-
-def env_str(name, fallback=None):
-    if fallback is None:
-        fallback = ENV_DEFAULTS.get(name, "")
-    return os.environ.get(name, fallback)
+# ============================================================================
+# 보상 & 학습 파라미터 설정
+# ============================================================================
+# 기본값은 아래 os.environ.get()의 두 번째 인자에 정의되어 있습니다.
+# 환경 변수로 override 가능: export PBASE_REWARD_WEIGHT=2.0
+#
+# [활성화된 보상 - ACTIVE]
+#   - Prophet Base Comparison (neighbor-based): 1.0
+#   - Buffer Differential: 1.0
+#   - Success Rate: 0.1 (penalty) / 1.0 (bonus)
+#
+# [비활성화 - DISABLED]
+#   - Delivery, Overhead, High Load, Relay, Mid-Util, Trend, Heuristic
+# ============================================================================
 
 # Allow optional CPU-only mode via env; default uses available CUDA
 FORCE_CPU = os.environ.get("DRL_FORCE_CPU", "false").lower() in ("1", "true", "yes")
@@ -217,43 +168,58 @@ PPO_DEBUG_ACTIONS = os.environ.get("PPO_DEBUG_ACTIONS", "false").lower() == "tru
 # Step-by-step reward tracking configuration
 STEP_REWARD_TRACKING = os.environ.get("STEP_REWARD_TRACKING", "true").lower() == "true"
 
-# Reward configuration (delivery + Prophet alignment + overhead penalty)
-DELIVERY_REWARD_WEIGHT = env_float("DELIVERY_REWARD_WEIGHT")
-DELIVERY_REWARD_UTIL_MAX = env_float("DELIVERY_REWARD_UTIL_MAX")
-PBASE_REWARD_WEIGHT = env_float("PBASE_REWARD_WEIGHT")
-PBASE_DIFF_EPS = env_float("PBASE_DIFF_EPS")
-OVERHEAD_PENALTY_WEIGHT = env_float("OVERHEAD_PENALTY_WEIGHT")
-HIGH_LOAD_PENALTY_WEIGHT = env_float("HIGH_LOAD_PENALTY_WEIGHT")
-HIGH_LOAD_UTIL_BASE = env_float("HIGH_LOAD_UTIL_BASE")
-HIGH_LOAD_UTIL_THRESHOLD = env_float("HIGH_LOAD_UTIL_THRESHOLD")
-HIGH_LOAD_FLAG_THRESHOLD = env_float("HIGH_LOAD_FLAG_THRESHOLD")
-TARGET_REWARD_TIME = env_int("TARGET_REWARD_TIME")
-TARGET_REWARD_WEIGHT = env_float("TARGET_REWARD_WEIGHT")
-RELAY_BONUS_WEIGHT = env_float("RELAY_BONUS_WEIGHT")
-RELAY_LOW_UTIL_THRESHOLD = env_float("RELAY_LOW_UTIL_THRESHOLD")
-RELAY_PRED_THRESHOLD = env_float("RELAY_PRED_THRESHOLD")
-ACTION_GAIN_LOW = env_float("ACTION_GAIN_LOW")
-ACTION_GAIN_HIGH = env_float("ACTION_GAIN_HIGH")
-ACTION_GAIN_THRESHOLD = env_float("ACTION_GAIN_THRESHOLD")
-MID_RANGE_REWARD = env_float("MID_RANGE_REWARD")
-MID_UTIL_THRESHOLD = env_float("MID_UTIL_THRESHOLD")
-MID_UTIL_PENALTY_WEIGHT = env_float("MID_UTIL_PENALTY_WEIGHT")
-MID_UTIL_PRESSURE_MIN = env_float("MID_UTIL_PRESSURE_MIN")
-RELAY_HIGH_LOAD_FACTOR_MIN = env_float("RELAY_HIGH_LOAD_FACTOR_MIN")
-HEURISTIC_REWARD_WEIGHT = env_float("HEURISTIC_REWARD_WEIGHT")
-HEURISTIC_PBASE_MIN = env_float("HEURISTIC_PBASE_MIN")
-HEURISTIC_BUF_MAX = env_float("HEURISTIC_BUF_MAX")
-BUFFER_DIFF_REWARD_WEIGHT = env_float("BUFFER_DIFF_REWARD_WEIGHT")
-TREND_UTIL_THRESHOLD = env_float("TREND_UTIL_THRESHOLD")
-TREND_DELTA_THRESHOLD = env_float("TREND_DELTA_THRESHOLD")
-TREND_MIN_STEPS = env_int("TREND_MIN_STEPS")
-TREND_PENALTY_WEIGHT = env_float("TREND_PENALTY_WEIGHT")
-SUCCESS_RATE_WEIGHT = env_float("SUCCESS_RATE_WEIGHT")
-SUCCESS_RATE_EPS = env_float("SUCCESS_RATE_EPS")
-SUCCESS_RATE_BONUS_WEIGHT = env_float("SUCCESS_RATE_BONUS_WEIGHT")
-TOPK_BUFFER_SIZE = env_int("TOPK_BUFFER_SIZE")
-TOPK_MIX_RATIO = env_float("TOPK_MIX_RATIO")
-TOPK_MIN_SCORE = env_float("TOPK_MIN_SCORE")
+# ============================================================================
+# Reward Configuration Variables (수정은 위 주석의 기본값 참고)
+# ============================================================================
+PBASE_REWARD_WEIGHT = float(os.environ.get("PBASE_REWARD_WEIGHT", "1.0"))     # neighbor-based p_base
+MAX_PBASE_REWARD_WEIGHT = float(os.environ.get("MAX_PBASE_REWARD_WEIGHT", "0.0"))  # max-based p_base (disabled by default)
+PBASE_DIFF_EPS = float(os.environ.get("PBASE_DIFF_EPS", "0.02"))
+BUFFER_DIFF_REWARD_WEIGHT = float(os.environ.get("BUFFER_DIFF_REWARD_WEIGHT", "0"))          # 원래 1.0으로 함함
+SUCCESS_RATE_WEIGHT = float(os.environ.get("SUCCESS_RATE_WEIGHT", "0"))   # 원래 0.1으로 함함
+SUCCESS_RATE_EPS = float(os.environ.get("SUCCESS_RATE_EPS", "0.003"))
+SUCCESS_RATE_BONUS_WEIGHT = float(os.environ.get("SUCCESS_RATE_BONUS_WEIGHT", "0"))    # 원래 1.0으로 함함ㅁㅁ
+DELIVERY_REWARD_WEIGHT = float(os.environ.get("DELIVERY_REWARD_WEIGHT", "0.0"))
+DELIVERY_REWARD_UTIL_MAX = float(os.environ.get("DELIVERY_REWARD_UTIL_MAX", "0.65"))
+OVERHEAD_PENALTY_WEIGHT = float(os.environ.get("OVERHEAD_PENALTY_WEIGHT", "0.0"))
+HIGH_LOAD_PENALTY_WEIGHT = float(os.environ.get("HIGH_LOAD_PENALTY_WEIGHT", "0.0"))
+HIGH_LOAD_UTIL_BASE = float(os.environ.get("HIGH_LOAD_UTIL_BASE", "0.35"))
+HIGH_LOAD_UTIL_THRESHOLD = float(os.environ.get("HIGH_LOAD_UTIL_THRESHOLD", "0.65"))
+HIGH_LOAD_FLAG_THRESHOLD = float(os.environ.get("HIGH_LOAD_FLAG_THRESHOLD", "0.45"))
+TARGET_REWARD_TIME = int(float(os.environ.get("TARGET_REWARD_TIME", "0")))
+TARGET_REWARD_WEIGHT = float(os.environ.get("TARGET_REWARD_WEIGHT", "0"))
+RELAY_BONUS_WEIGHT = float(os.environ.get("RELAY_BONUS_WEIGHT", "0.0"))
+RELAY_LOW_UTIL_THRESHOLD = float(os.environ.get("RELAY_LOW_UTIL_THRESHOLD", "0.65"))
+RELAY_PRED_THRESHOLD = float(os.environ.get("RELAY_PRED_THRESHOLD", "0.6"))
+RELAY_HIGH_LOAD_FACTOR_MIN = float(os.environ.get("RELAY_HIGH_LOAD_FACTOR_MIN", "0.15"))
+ACTION_GAIN_LOW = float(os.environ.get("ACTION_GAIN_LOW", "1.0"))
+ACTION_GAIN_HIGH = float(os.environ.get("ACTION_GAIN_HIGH", "4.0"))
+ACTION_GAIN_THRESHOLD = float(os.environ.get("ACTION_GAIN_THRESHOLD", "0.8"))
+MID_RANGE_REWARD = float(os.environ.get("MID_RANGE_REWARD", "0.5"))
+MID_UTIL_PENALTY_WEIGHT = float(os.environ.get("MID_UTIL_PENALTY_WEIGHT", "0.0"))
+MID_UTIL_THRESHOLD = float(os.environ.get("MID_UTIL_THRESHOLD", "0.80"))
+MID_UTIL_PRESSURE_MIN = float(os.environ.get("MID_UTIL_PRESSURE_MIN", "0.01"))
+HEURISTIC_REWARD_WEIGHT = float(os.environ.get("HEURISTIC_REWARD_WEIGHT", "0.0"))
+HEURISTIC_PBASE_MIN = float(os.environ.get("HEURISTIC_PBASE_MIN", "0.6"))
+HEURISTIC_BUF_MAX = float(os.environ.get("HEURISTIC_BUF_MAX", "0.55"))
+TREND_PENALTY_WEIGHT = float(os.environ.get("TREND_PENALTY_WEIGHT", "0.0"))
+TREND_UTIL_THRESHOLD = float(os.environ.get("TREND_UTIL_THRESHOLD", "0.75"))
+TREND_DELTA_THRESHOLD = float(os.environ.get("TREND_DELTA_THRESHOLD", "0.01"))
+TREND_MIN_STEPS = int(float(os.environ.get("TREND_MIN_STEPS", "5")))
+
+# ===== Success-Rate EMA Normalization (Exploration Moving Average friendly) =====
+# Enable EMA-based normalization so late-episode small success-rate changes still
+# produce meaningful reward signals while clamping to avoid blow-ups.
+SR_NORM_ENABLE = os.environ.get("SR_NORM_ENABLE", "true").lower() in ("1", "true", "yes")
+SR_DELTA_EMA_BETA = float(os.environ.get("SR_DELTA_EMA_BETA", "0.9"))
+SR_EMA_WARMUP_STEPS = int(float(os.environ.get("SR_EMA_WARMUP_STEPS", "10")))
+# Use 2*EPS as default denominator floor to prevent excessive gain when deltas are tiny
+SR_NORM_MIN_DENOM = float(os.environ.get("SR_NORM_MIN_DENOM", str(max(1e-6, 2 * SUCCESS_RATE_EPS))))
+SR_NORM_MAX_GAIN = float(os.environ.get("SR_NORM_MAX_GAIN", "3.0"))
+
+# Optional: adapt EPS based on EMA magnitude
+SR_ADAPTIVE_EPS = os.environ.get("SR_ADAPTIVE_EPS", "false").lower() in ("1", "true", "yes")
+SR_EPS_K = float(os.environ.get("SR_EPS_K", "0.5"))
+SR_EPS_FLOOR = float(os.environ.get("SR_EPS_FLOOR", "0.003"))
 
 def log_step_rewards(sim_time, rewards_per_host, buffer_size_mb=None, episode_num=1):
     """Log step-by-step rewards for tracking and graphing."""
@@ -286,6 +252,94 @@ def log_step_rewards(sim_time, rewards_per_host, buffer_size_mb=None, episode_nu
             f.write(f"{episode_num},{sim_time},{total_reward},{avg_reward},{num_hosts}\n")
     except Exception:
         pass  # Silent fail for logging
+
+def log_step_reward_components(sim_time, components, buffer_size_mb=None, episode_num=1):
+    """Log per-step reward component totals for analysis/plotting.
+
+    components: dict with keys like 'pbase','buffer_diff','success_delta','delivery',
+                'heuristic','high_load_penalty','mid_util_penalty','trend_penalty',
+                'relay_bonus','target_bonus','total_hosts_reward' (any missing treated as 0).
+    """
+    if not STEP_REWARD_TRACKING:
+        return
+
+    try:
+        log_dir = os.path.join("reports", "reward_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        if buffer_size_mb:
+            log_file = os.path.join(log_dir, f"step_reward_components_buf{int(buffer_size_mb)}M_rmappo.csv")
+            log_file_detailed = os.path.join(log_dir, f"step_reward_components_detailed_buf{int(buffer_size_mb)}M_rmappo.csv")
+        else:
+            log_file = os.path.join(log_dir, "step_reward_components_rmappo.csv")
+            log_file_detailed = os.path.join(log_dir, "step_reward_components_detailed_rmappo.csv")
+
+        # Ensure stable column order
+        cols = [
+            "episode","sim_time",
+            "pbase","pbase_max","buffer_diff","success_delta",
+            "delivery","heuristic","high_load_penalty",
+            "mid_util_penalty","trend_penalty","relay_bonus",
+            "target_bonus","total_hosts_reward"
+        ]
+
+        write_header = not os.path.exists(log_file)
+        with open(log_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write(",".join(cols) + "\n")
+
+            row = {
+                "episode": episode_num,
+                "sim_time": sim_time,
+                "pbase": components.get("pbase", 0.0),
+                "pbase_max": components.get("pbase_max", 0.0),
+                "buffer_diff": components.get("buffer_diff", 0.0),
+                "success_delta": components.get("success_delta", 0.0),
+                "delivery": components.get("delivery", 0.0),
+                "heuristic": components.get("heuristic", 0.0),
+                "high_load_penalty": components.get("high_load_penalty", 0.0),
+                "mid_util_penalty": components.get("mid_util_penalty", 0.0),
+                "trend_penalty": components.get("trend_penalty", 0.0),
+                "relay_bonus": components.get("relay_bonus", 0.0),
+                "target_bonus": components.get("target_bonus", 0.0),
+                "total_hosts_reward": components.get("total_hosts_reward", 0.0),
+            }
+            f.write(",".join(str(row[c]) for c in cols) + "\n")
+
+        # Also write a detailed version with separate success bonus/penalty columns to distinguish contributions
+        cols_det = [
+            "episode","sim_time",
+            "pbase","pbase_max","buffer_diff",
+            "success_bonus","success_penalty","success_delta",
+            "delivery","heuristic","high_load_penalty",
+            "mid_util_penalty","trend_penalty","relay_bonus",
+            "target_bonus","total_hosts_reward"
+        ]
+        write_header_det = not os.path.exists(log_file_detailed)
+        with open(log_file_detailed, "a", encoding="utf-8") as f2:
+            if write_header_det:
+                f2.write(",".join(cols_det) + "\n")
+            row2 = {
+                "episode": episode_num,
+                "sim_time": sim_time,
+                "pbase": components.get("pbase", 0.0),
+                "pbase_max": components.get("pbase_max", 0.0),
+                "buffer_diff": components.get("buffer_diff", 0.0),
+                "success_bonus": components.get("success_bonus", 0.0),
+                "success_penalty": components.get("success_penalty", 0.0),
+                "success_delta": components.get("success_delta", 0.0),
+                "delivery": components.get("delivery", 0.0),
+                "heuristic": components.get("heuristic", 0.0),
+                "high_load_penalty": components.get("high_load_penalty", 0.0),
+                "mid_util_penalty": components.get("mid_util_penalty", 0.0),
+                "trend_penalty": components.get("trend_penalty", 0.0),
+                "relay_bonus": components.get("relay_bonus", 0.0),
+                "target_bonus": components.get("target_bonus", 0.0),
+                "total_hosts_reward": components.get("total_hosts_reward", 0.0),
+            }
+            f2.write(",".join(str(row2[c]) for c in cols_det) + "\n")
+    except Exception:
+        pass
 
 # Training configuration
 EPISODE_SECONDS = int(float(os.environ.get("EPISODE_SECONDS", "100000")))
@@ -498,12 +552,12 @@ class RecurrentPPOPolicy:
         self.value_coef = float(os.environ.get("PPO_VALUE_COEF", "0.5"))
         self.entropy_coef = float(os.environ.get("PPO_ENTROPY", "0.015"))
         self.lr = float(os.environ.get("PPO_LR", "3e-4"))
-        self.batch_size = int(os.environ.get("PPO_BATCH_SIZE", "1024"))
-        self.minibatch = int(os.environ.get("PPO_MINIBATCH", "256"))
+        self.batch_size = int(os.environ.get("PPO_BATCH_SIZE", "128"))
+        self.minibatch = int(os.environ.get("PPO_MINIBATCH", "128"))
         self.epochs = int(os.environ.get("PPO_EPOCHS", "3"))  # Reduced from 10 for faster updates
         self.gamma = float(os.environ.get("PPO_GAMMA", "0.99"))
         self.gae_lambda = float(os.environ.get("PPO_GAE_LAMBDA", "0.95"))
-        self.max_sequences_per_update = int(os.environ.get("MAX_SEQS_PER_UPDATE", "768"))  # Reduced from 1024
+        self.max_sequences_per_update = int(os.environ.get("MAX_SEQS_PER_UPDATE", "512"))  # Reduced from 1024
 
         # Device configuration: use GPU if available
         device_str = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -564,16 +618,11 @@ class RecurrentPPOPolicy:
         # Sequence management (NEW: SequenceWindow based)
         self.sequence_windows = {}  # key -> SequenceWindow
         self.ready_sequences = []   # List[dict] - finalized sequences ready for training
-        self.topk_buffer_size = TOPK_BUFFER_SIZE
-        self.topk_mix_ratio = TOPK_MIX_RATIO
-        self.topk_min_score = TOPK_MIN_SCORE
-        self.topk_sequences = []  # min-heap storing (score, counter, seq_copy)
-        self._topk_counter = 0
 
         # Memory management settings
         self.max_window_age = float(os.environ.get("MAX_WINDOW_AGE", "300.0"))  # 5 minutes
         self.max_active_windows = int(os.environ.get("MAX_ACTIVE_WINDOWS", "1000"))
-        self.min_sequences_to_train = int(os.environ.get("MIN_SEQUENCES_TO_TRAIN", "64"))  # Increased to stabilize updates
+        self.min_sequences_to_train = int(os.environ.get("MIN_SEQUENCES_TO_TRAIN", "32"))  # Increased to stabilize updates
 
         # Last actions cache (for reward assignment)
         # Elements include hidden states captured before the action
@@ -853,7 +902,7 @@ class RecurrentPPOPolicy:
                     # Finalize and add to ready sequences
                     seq_data = window.finalize(bootstrap_val)
                     if seq_data is not None:
-                        self._enqueue_sequence(seq_data)
+                        self.ready_sequences.append(seq_data)
                         # Debug: Log sequence finalization
                         print(f"[TBPTT] Finalized sequence: key={k}, len={len(window.local_obs)}, "
                               f"done={done}, bootstrap={bootstrap_val:.3f}")
@@ -903,7 +952,7 @@ class RecurrentPPOPolicy:
             # 강제 finalize (bootstrap=0.0)
             seq_data = self.sequence_windows[k].finalize(bootstrap_value=0.0)
             if seq_data is not None:
-                self._enqueue_sequence(seq_data)
+                self.ready_sequences.append(seq_data)
 
             # Window 제거
             del self.sequence_windows[k]
@@ -926,74 +975,11 @@ class RecurrentPPOPolicy:
             for k in sorted_keys[:n_to_remove]:
                 seq_data = self.sequence_windows[k].finalize(bootstrap_value=0.0)
                 if seq_data is not None:
-                    self._enqueue_sequence(seq_data)
+                    self.ready_sequences.append(seq_data)
 
                 del self.sequence_windows[k]
                 self.actor_hidden_manager.reset([k])
                 self.critic_hidden_manager.reset([k])
-
-    def _enqueue_sequence(self, seq_data):
-        """Append finalized sequence to training queue + optional top-k buffer."""
-        if seq_data is None:
-            return
-        self.ready_sequences.append(seq_data)
-        self._maybe_store_topk(seq_data)
-
-    def _maybe_store_topk(self, seq_data):
-        """Keep high-quality sequences in a min-heap for future mixing."""
-        if (
-            self.topk_buffer_size <= 0
-            or seq_data is None
-            or not TORCH_OK  # sequences rely on torch tensors
-        ):
-            return
-        rewards = seq_data.get('rewards')
-        if rewards is None or not torch.is_tensor(rewards):
-            return
-        score = float(rewards.sum().item())
-        if score <= self.topk_min_score:
-            return
-        seq_copy = self._clone_sequence(seq_data)
-        entry = (score, self._topk_counter, seq_copy)
-        self._topk_counter += 1
-        if len(self.topk_sequences) < self.topk_buffer_size:
-            heapq.heappush(self.topk_sequences, entry)
-        else:
-            if score > self.topk_sequences[0][0]:
-                heapq.heapreplace(self.topk_sequences, entry)
-
-    def _sample_topk_sequences(self, count):
-        """Sample up to `count` cloned sequences from the priority buffer."""
-        if count <= 0 or not self.topk_sequences:
-            return []
-        actual = min(count, len(self.topk_sequences))
-        picked = random.sample(self.topk_sequences, actual)
-        return [self._clone_sequence(entry[2]) for entry in picked]
-
-    def _clone_sequence(self, seq_data):
-        """Deep-clone sequence tensors so they can be reused safely."""
-        if seq_data is None:
-            return None
-
-        def clone_tensor(tensor):
-            if tensor is None:
-                return None
-            return tensor.clone().detach()
-
-        return {
-            'key': seq_data.get('key'),
-            'length': seq_data.get('length', len(seq_data.get('local_obs', []))),
-            'local_obs': clone_tensor(seq_data['local_obs']),
-            'global_obs': clone_tensor(seq_data['global_obs']),
-            'actions': clone_tensor(seq_data['actions']),
-            'logprobs': clone_tensor(seq_data['logprobs']),
-            'values': clone_tensor(seq_data['values']),
-            'rewards': clone_tensor(seq_data['rewards']),
-            'dones': clone_tensor(seq_data['dones']),
-            'init_actor_h': clone_tensor(seq_data.get('init_actor_h')),
-            'init_critic_h': clone_tensor(seq_data.get('init_critic_h')),
-            'bootstrap_value': clone_tensor(seq_data['bootstrap_value'])
-        }
 
     def _compute_gae_for_sequence(self, seq_data):
         """
@@ -1065,21 +1051,7 @@ class RecurrentPPOPolicy:
         total_steps = 0
 
         invalid_seqs = 0
-        base_sequences = list(self.ready_sequences[:n_train])
-
-        # Mix in high-performing sequences from the priority buffer
-        priority_sequences = []
-        if self.topk_buffer_size > 0 and self.topk_mix_ratio > 0 and self.topk_sequences:
-            target_extra = int(len(base_sequences) * self.topk_mix_ratio)
-            if target_extra <= 0 and len(base_sequences) > 0:
-                target_extra = 1
-            priority_sequences = self._sample_topk_sequences(target_extra)
-            if priority_sequences:
-                print(f"[PPO] Injecting {len(priority_sequences)} top-k sequences (buffer={len(self.topk_sequences)})")
-
-        seq_candidates = base_sequences + priority_sequences
-
-        for seq in seq_candidates:
+        for seq in self.ready_sequences[:n_train]:
             local = seq['local_obs']
             global_obs = seq['global_obs']
             if local.shape[-1] != self.obs_dim or global_obs.shape[-1] != self.global_obs_dim:
@@ -1381,6 +1353,7 @@ class Handler(BaseHTTPRequestHandler):
 
     POLICY_ID = BASE_POLICY_ID
 
+    # Optional: load initial model if provided
     if MODEL_PATH:
         try:
             if TORCH_OK:
@@ -1405,6 +1378,22 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as opt_exc:
                     print(f"[BOOT] Failed to reset optimizer: {opt_exc}")
 
+    # Establish a baseline checkpoint to allow per-combo resets
+    BASELINE_PATH = os.path.join(MODEL_DIR, "rmappo_baseline_init.pt") if TORCH_OK else None
+    if TORCH_OK:
+        try:
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            if not os.path.isfile(BASELINE_PATH):
+                res = AGENT.save(BASELINE_PATH)
+                if res.get("ok", False):
+                    print(f"[BOOT] Saved baseline checkpoint at {BASELINE_PATH}")
+                else:
+                    print(f"[BOOT] Failed to save baseline: {res.get('error')}")
+            else:
+                print(f"[BOOT] Baseline exists at {BASELINE_PATH}")
+        except Exception as e:
+            print(f"[BOOT] Failed to establish baseline: {e}")
+
     # Episode tracking
     EP_CUR = None
     EP_REWARD_ACC = 0.0
@@ -1420,50 +1409,12 @@ class Handler(BaseHTTPRequestHandler):
     TRAINING_ENABLED = not EVAL_ONLY
     MODEL_SAVED_AT = None
     LAST_SUCCESS_RATE = None
-    SIGNAL_LOG_PATH = os.path.join("reports", "reward_logs", "reward_signal_stats.csv")
-    SIGNAL_LOG_HEADER = "time,signal,count,min,max,mean,stddev\n"
-    SIGNAL_LOG_READY = False
+    # Success-rate EMA normalization state
+    SR_DELTA_EMA = None
+    SR_EMA_COUNT = 0
 
-    @classmethod
-    def _ensure_signal_log(cls):
-        if cls.SIGNAL_LOG_READY:
-            return
-        directory = os.path.dirname(cls.SIGNAL_LOG_PATH)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        if not os.path.exists(cls.SIGNAL_LOG_PATH):
-            with open(cls.SIGNAL_LOG_PATH, "w", encoding="utf-8") as fh:
-                fh.write(cls.SIGNAL_LOG_HEADER)
-        cls.SIGNAL_LOG_READY = True
-
-    @staticmethod
-    def _compute_stats(values):
-        count = len(values)
-        if count == 0:
-            return None
-        min_v = min(values)
-        max_v = max(values)
-        mean = sum(values) / count
-        if count > 1:
-            var = sum((v - mean) ** 2 for v in values) / count
-            std = math.sqrt(max(var, 0.0))
-        else:
-            std = 0.0
-        return count, min_v, max_v, mean, std
-
-    @classmethod
-    def log_signal_stats(cls, sim_time, signal_values):
-        cls._ensure_signal_log()
-        rows = []
-        for name, values in signal_values.items():
-            stats = cls._compute_stats(values)
-            if not stats:
-                continue
-            count, min_v, max_v, mean, std = stats
-            rows.append(f"{sim_time},{name},{count},{min_v:.6f},{max_v:.6f},{mean:.6f},{std:.6f}\n")
-        if rows:
-            with open(cls.SIGNAL_LOG_PATH, "a", encoding="utf-8") as fh:
-                fh.writelines(rows)
+    # Store pending reward weights to apply at next episode boundary
+    NEXT_REWARD_WEIGHTS = None
 
     def do_POST(self):
         # Episode end handler
@@ -1510,6 +1461,20 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"[ERROR] Failed to save model: {e}")
 
+            # If there is a pending reward weight update scheduled for next episode, apply it now
+            try:
+                if Handler.NEXT_REWARD_WEIGHTS:
+                    cfg = Handler.NEXT_REWARD_WEIGHTS or {}
+                    # Apply known weights if present
+                    globals_ref = globals()
+                    for key, val in cfg.items():
+                        if key in globals_ref and isinstance(val, (int, float)):
+                            globals_ref[key] = float(val)
+                    print(f"[EPISODE_END] Applied pending reward weights for episode {Handler.EP_COUNT}: {cfg}")
+                    Handler.NEXT_REWARD_WEIGHTS = None
+            except Exception as e:
+                print(f"[WARN] Failed to apply next-episode reward weights: {e}")
+
             # Reset episode stats
             Handler.EP_DELIVERED_SUM = 0.0
             Handler.EP_DROPPED_SUM = 0.0
@@ -1518,6 +1483,8 @@ class Handler(BaseHTTPRequestHandler):
             Handler.TARGET_REWARD_APPLIED = False
             Handler.LAST_ACTIVE_HOSTS = set()
             Handler.LAST_SUCCESS_RATE = None
+            Handler.SR_DELTA_EMA = None
+            Handler.SR_EMA_COUNT = 0
 
             body = json.dumps({"ok": True, "episode": Handler.EP_COUNT}).encode("utf-8")
             self.send_response(200)
@@ -1525,6 +1492,175 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        # Set reward weights handler (runtime control)
+        if self.path == "/set_reward_weights":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                req = json.loads(raw.decode("utf-8")) if length > 0 else {}
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(("Bad Request: %s" % e).encode("utf-8"))
+                return
+
+            # apply_mode: now | next_episode
+            apply_mode = str(req.get("apply", "now")).lower()
+            weights = req.get("weights", req)  # allow flat JSON as well
+
+            # Accepted keys (subset of reward vars)
+            allowed = {
+                "PBASE_REWARD_WEIGHT",
+                "MAX_PBASE_REWARD_WEIGHT",
+                "PBASE_DIFF_EPS",
+                "BUFFER_DIFF_REWARD_WEIGHT",
+                "SUCCESS_RATE_WEIGHT",
+                "SUCCESS_RATE_BONUS_WEIGHT",
+                "SUCCESS_RATE_EPS",
+                "DELIVERY_REWARD_WEIGHT",
+                "DELIVERY_REWARD_UTIL_MAX",
+                "HIGH_LOAD_PENALTY_WEIGHT",
+                "MID_UTIL_PENALTY_WEIGHT",
+                "MID_UTIL_THRESHOLD",
+                "RELAY_BONUS_WEIGHT",
+            }
+
+            if apply_mode == "next" or apply_mode == "next_episode":
+                # Stash for application at next /episode_end
+                cfg = {}
+                for k, v in (weights or {}).items():
+                    if k in allowed:
+                        try:
+                            cfg[k] = float(v)
+                        except Exception:
+                            pass
+                Handler.NEXT_REWARD_WEIGHTS = cfg
+                print(f"[CONTROL] Queued next-episode reward weights: {cfg}")
+                body = json.dumps({"ok": True, "applied": False, "queued": True, "weights": cfg}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # Apply immediately (unsafe if done mid-episode, but useful for experimentation)
+            applied = {}
+            try:
+                globals_ref = globals()
+                for k, v in (weights or {}).items():
+                    if k in allowed:
+                        try:
+                            globals_ref[k] = float(v)
+                            applied[k] = float(v)
+                        except Exception:
+                            continue
+                print(f"[CONTROL] Applied reward weights NOW: {applied}")
+            except Exception as e:
+                print(f"[ERROR] Failed to apply reward weights: {e}")
+
+            body = json.dumps({"ok": True, "applied": True, "weights": applied}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Save current model checkpoint
+        if self.path == "/save_model":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                req = json.loads(raw.decode("utf-8")) if length > 0 else {}
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(("Bad Request: %s" % e).encode("utf-8"))
+                return
+            if not TORCH_OK:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"PyTorch disabled")
+                return
+            out_path = req.get("path") or os.path.join(MODEL_DIR, f"rmappo_manual_{int(time.time())}.pt")
+            res = Handler.AGENT.save(out_path)
+            body = json.dumps({"ok": res.get("ok", False), "path": out_path, "error": res.get("error")}).encode("utf-8")
+            self.send_response(200 if res.get("ok", False) else 500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Load model checkpoint from path
+        if self.path == "/load_model":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                req = json.loads(raw.decode("utf-8")) if length > 0 else {}
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(("Bad Request: %s" % e).encode("utf-8"))
+                return
+            if not TORCH_OK:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"PyTorch disabled")
+                return
+            in_path = req.get("path")
+            if not in_path:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Missing 'path'")
+                return
+            res = Handler.AGENT.load(in_path)
+            # Reset optimizer after load
+            try:
+                Handler.AGENT.optimizer = optim.Adam(
+                    Handler.AGENT.parameters(),
+                    lr=Handler.AGENT.lr,
+                    eps=Handler.AGENT.adam_eps
+                )
+            except Exception:
+                pass
+            ok = res.get("ok", False)
+            body = json.dumps({"ok": ok, "meta": res.get("meta"), "error": res.get("error")}).encode("utf-8")
+            self.send_response(200 if ok else 500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Restore baseline checkpoint (per-combo reset)
+        if self.path == "/restore_baseline":
+            if not TORCH_OK or not Handler.BASELINE_PATH or not os.path.isfile(Handler.BASELINE_PATH):
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"Baseline not available")
+                return
+            res = Handler.AGENT.load(Handler.BASELINE_PATH)
+            try:
+                Handler.AGENT.optimizer = optim.Adam(
+                    Handler.AGENT.parameters(),
+                    lr=Handler.AGENT.lr,
+                    eps=Handler.AGENT.adam_eps
+                )
+                Handler.AGENT.reset_hidden_states(episode_start=True)
+            except Exception:
+                pass
+            ok = res.get("ok", False)
+            body = json.dumps({"ok": ok, "baseline": Handler.BASELINE_PATH, "error": res.get("error")}).encode("utf-8")
+            self.send_response(200 if ok else 500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
             return
 
         # Main inference endpoint - reuse logic from original server
@@ -1570,21 +1706,22 @@ class Handler(BaseHTTPRequestHandler):
         rewards_per_key = {}
         done_keys = set()
         stress_keys = set()
-        pbase_signals = []
-        buffer_diff_signals = []
-        success_rate_deltas = []
-        def _scale_dense(weight: float, signal: float) -> float:
-            """Scale dense reward signals directly by their magnitude."""
-            if weight == 0.0 or signal == 0.0:
-                return 0.0
-            return weight * signal
-
-        def _scale_success(weight: float, delta: float) -> float:
-            """Clip success-rate delta so the weight remains a true multiplier."""
-            if weight == 0.0 or delta == 0.0:
-                return 0.0
-            clipped = max(-1.0, min(1.0, delta))
-            return weight * clipped
+        # Accumulators for per-step component logging (host-level contributions)
+        step_comp = {
+            'pbase': 0.0,          # neighbor-based
+            'pbase_max': 0.0,      # max-based
+            'buffer_diff': 0.0,
+            'success_delta': 0.0,
+            'success_bonus': 0.0,
+            'success_penalty': 0.0,
+            'delivery': 0.0,
+            'heuristic': 0.0,
+            'high_load_penalty': 0.0,
+            'mid_util_penalty': 0.0,
+            'trend_penalty': 0.0,
+            'relay_bonus': 0.0,
+            'target_bonus': 0.0,
+        }
 
         for item in prev_tr:
             try:
@@ -1607,25 +1744,40 @@ class Handler(BaseHTTPRequestHandler):
                     and DELIVERY_REWARD_WEIGHT != 0.0
                     and my_buf_norm <= DELIVERY_REWARD_UTIL_MAX
                 ):
-                    reward += _scale_dense(DELIVERY_REWARD_WEIGHT, min(delivered, 1.0))
+                    comp = DELIVERY_REWARD_WEIGHT * delivered
+                    reward += comp
+                    step_comp['delivery'] += comp
 
-                # 2) Prophet base comparison reward
+                # 2) Prophet base comparison reward (neighbor-based and optional max-based)
                 my_p_base = _to_float(item.get("p_base", 0.0), 0.0)
                 my_buf_norm = _to_float(item.get("my_buffer_norm", 0.0), 0.0)
                 neighbor_p_base = _to_float(item.get("neighbor_p_base", 0.0), 0.0)
+                max_neighbor_p_base = _to_float(item.get("max_neighbor_p_base", 0.0), 0.0)
+                # 2A) Neighbor-based (actual peer) comparison
                 if (
                     PBASE_REWARD_WEIGHT != 0.0
                     and math.isfinite(my_p_base)
                     and math.isfinite(neighbor_p_base)
+                    and relayed > 0
                 ):
                     diff = neighbor_p_base - my_p_base
                     if abs(diff) >= PBASE_DIFF_EPS:
-                        magnitude = abs(diff)
-                        direction = 1.0 if diff > 0 else -1.0
-                        action_aligned = (relayed > 0 and direction > 0) or (relayed == 0 and direction < 0)
-                        signal = magnitude if action_aligned else -magnitude
-                        pbase_signals.append(diff)
-                        reward += _scale_dense(PBASE_REWARD_WEIGHT, signal)
+                        comp = PBASE_REWARD_WEIGHT * diff  # magnitude-proportional reward/penalty
+                        reward += comp
+                        step_comp['pbase'] += comp
+
+                # 2B) Max-based (diagnostic) comparison
+                if (
+                    MAX_PBASE_REWARD_WEIGHT != 0.0
+                    and math.isfinite(my_p_base)
+                    and math.isfinite(max_neighbor_p_base)
+                    and relayed > 0
+                ):
+                    diffm = max_neighbor_p_base - my_p_base
+                    if abs(diffm) >= PBASE_DIFF_EPS:
+                        compm = MAX_PBASE_REWARD_WEIGHT * diffm  # magnitude-proportional
+                        reward += compm
+                        step_comp['pbase_max'] += compm
 
                 # 3) Heuristic-aligned reward: high predictability & ample buffer
                 if (
@@ -1637,8 +1789,9 @@ class Handler(BaseHTTPRequestHandler):
                     # Scale by how much the node exceeds thresholds to mimic heuristic intent
                     p_scale = (my_p_base - HEURISTIC_PBASE_MIN) / max(1e-6, 1.0 - HEURISTIC_PBASE_MIN)
                     buf_scale = max(0.0, (HEURISTIC_BUF_MAX - my_buf_norm) / max(1e-6, HEURISTIC_BUF_MAX))
-                    heuristic_signal = relayed * (0.5 * p_scale + 0.5 * buf_scale)
-                    reward += _scale_dense(HEURISTIC_REWARD_WEIGHT, heuristic_signal)
+                    comp = HEURISTIC_REWARD_WEIGHT * relayed * (0.5 * p_scale + 0.5 * buf_scale)
+                    reward += comp
+                    step_comp['heuristic'] += comp
 
                 # 4) Buffer-vs-network average differential reward
                 cached = Handler.STATE_CACHE.get(key) if key else None
@@ -1651,8 +1804,9 @@ class Handler(BaseHTTPRequestHandler):
                     avg_buf = cached.get("buf_mean")
                     if avg_buf is not None and math.isfinite(avg_buf):
                         diff = my_buf_norm - avg_buf
-                        buffer_diff_signals.append(diff)
-                        reward += _scale_dense(BUFFER_DIFF_REWARD_WEIGHT, diff)
+                        comp = BUFFER_DIFF_REWARD_WEIGHT * diff
+                        reward += comp
+                        step_comp['buffer_diff'] += comp
 
                 if reward != 0.0:
                     rewards_per_host[host] = rewards_per_host.get(host, 0.0) + reward
@@ -1797,6 +1951,8 @@ class Handler(BaseHTTPRequestHandler):
                     rewards_per_host[host] = rewards_per_host.get(host, 0.0) + per_host_bonus
                     for key in map_host_to_keys.get(host, []):
                         rewards_per_key[key] = rewards_per_key.get(key, 0.0) + per_host_bonus
+                # host-level total contribution for logging
+                step_comp['target_bonus'] += per_host_bonus * len(target_hosts)
                 Handler.TARGET_REWARD_APPLIED = True
                 print(f"[REWARD] t={sim_time:.1f}s episode bonus success_rate={success_rate:.3f} "
                       f"bonus={bonus:.3f} targets={len(target_hosts)}")
@@ -1825,6 +1981,7 @@ class Handler(BaseHTTPRequestHandler):
                 for k in filtered_keys:
                     rewards_per_key[k] = rewards_per_key.get(k, 0.0) + penalty_per_key
                 penalized_keys += len(filtered_keys)
+                step_comp['high_load_penalty'] += total_penalty
             if penalized_keys > 0:
                 print(f"[REWARD] t={sim_time:.1f}s high-load penalty factor={high_load_factor:.3f} "
                       f"per_key={penalty_per_key:.3f} penalized_keys={penalized_keys}")
@@ -1844,6 +2001,7 @@ class Handler(BaseHTTPRequestHandler):
                         rewards_per_key[k] = rewards_per_key.get(k, 0.0) + penalty
                         rewards_per_host[host] = rewards_per_host.get(host, 0.0) + penalty
                         mid_penalized += 1
+                        step_comp['mid_util_penalty'] += penalty
             if mid_penalized > 0:
                 print(f"[REWARD] t={sim_time:.1f}s mid-util penalty applied={mid_penalized} "
                       f"threshold={MID_UTIL_THRESHOLD:.2f}")
@@ -1862,41 +2020,89 @@ class Handler(BaseHTTPRequestHandler):
                         rewards_per_key[k] = rewards_per_key.get(k, 0.0) + penalty
                         rewards_per_host[host] = rewards_per_host.get(host, 0.0) + penalty
                         trend_penalized += 1
+                        step_comp['trend_penalty'] += penalty
             if trend_penalized > 0:
                 print(f"[REWARD] t={sim_time:.1f}s trend penalty applied={trend_penalized} "
                       f"avg_slope>= {TREND_DELTA_THRESHOLD:.3f}")
 
-        # Penalize drops in cumulative success rate
+        # Penalize/bonus based on changes in cumulative success rate (EMA-normalized)
         if success_rate is not None and Handler.LAST_SUCCESS_RATE is not None:
             delta_sr = success_rate - Handler.LAST_SUCCESS_RATE
-            success_rate_deltas.append(delta_sr)
+            # Update EMA of |delta_sr| for normalization
+            try:
+                abs_delta = abs(delta_sr)
+                if Handler.SR_DELTA_EMA is None or not math.isfinite(Handler.SR_DELTA_EMA):
+                    Handler.SR_DELTA_EMA = abs_delta
+                    Handler.SR_EMA_COUNT = 1
+                else:
+                    Handler.SR_DELTA_EMA = (
+                        SR_DELTA_EMA_BETA * Handler.SR_DELTA_EMA
+                        + (1.0 - SR_DELTA_EMA_BETA) * abs_delta
+                    )
+                    Handler.SR_EMA_COUNT += 1
+            except Exception:
+                pass
+
+            # Adaptive EPS threshold (optional)
+            eps_thr = SUCCESS_RATE_EPS
+            if SR_ADAPTIVE_EPS and Handler.SR_DELTA_EMA is not None and math.isfinite(Handler.SR_DELTA_EMA):
+                try:
+                    eps_thr = max(SR_EPS_FLOOR, SR_EPS_K * Handler.SR_DELTA_EMA)
+                except Exception:
+                    eps_thr = SUCCESS_RATE_EPS
+
+            # Normalization gain based on EMA (with warm-up and clamping)
+            mult = 1.0
+            use_norm = SR_NORM_ENABLE and Handler.SR_EMA_COUNT >= SR_EMA_WARMUP_STEPS
+            if use_norm:
+                try:
+                    denom = max(
+                        SR_NORM_MIN_DENOM,
+                        2.0 * SUCCESS_RATE_EPS,
+                        Handler.SR_DELTA_EMA if Handler.SR_DELTA_EMA is not None else 0.0,
+                    )
+                    if denom <= 1e-12 or not math.isfinite(denom):
+                        denom = SR_NORM_MIN_DENOM
+                    mult = 1.0 / denom
+                    if not math.isfinite(mult):
+                        mult = 1.0
+                    mult = max(1.0, min(SR_NORM_MAX_GAIN, mult))
+                except Exception:
+                    mult = 1.0
+
             target_hosts = list(map_host_to_keys.keys()) or list(Handler.LAST_ACTIVE_HOSTS)
-            if delta_sr < -SUCCESS_RATE_EPS and SUCCESS_RATE_WEIGHT > 0 and target_hosts:
-                penalty = _scale_success(SUCCESS_RATE_WEIGHT, delta_sr)  # negative value
+            if delta_sr < -eps_thr and SUCCESS_RATE_WEIGHT > 0 and target_hosts:
+                penalty = (SUCCESS_RATE_WEIGHT * mult) * delta_sr  # negative value
                 for host in target_hosts:
                     rewards_per_host[host] = rewards_per_host.get(host, 0.0) + penalty
                     for key in map_host_to_keys.get(host, []):
                         rewards_per_key[key] = rewards_per_key.get(key, 0.0) + penalty
-                print(f"[REWARD] t={sim_time:.1f}s success-rate penalty delta={delta_sr:.4f}")
-            elif delta_sr > SUCCESS_RATE_EPS and SUCCESS_RATE_BONUS_WEIGHT > 0 and target_hosts:
-                bonus = _scale_success(SUCCESS_RATE_BONUS_WEIGHT, delta_sr)
+                # host-level total contribution (penalty < 0)
+                step_comp['success_delta'] += penalty * len(target_hosts)
+                step_comp['success_penalty'] += penalty * len(target_hosts)
+                print(
+                    f"[REWARD] t={sim_time:.1f}s success-rate penalty delta={delta_sr:.4f} "
+                    f"ema={Handler.SR_DELTA_EMA if Handler.SR_DELTA_EMA is not None else float('nan'):.4f} "
+                    f"eps={eps_thr:.4f} mult={mult:.2f} eff_w={(SUCCESS_RATE_WEIGHT*mult):.3f}"
+                )
+            elif delta_sr > eps_thr and SUCCESS_RATE_BONUS_WEIGHT > 0 and target_hosts:
+                bonus = (SUCCESS_RATE_BONUS_WEIGHT * mult) * delta_sr
                 for host in target_hosts:
                     rewards_per_host[host] = rewards_per_host.get(host, 0.0) + bonus
                     for key in map_host_to_keys.get(host, []):
                         rewards_per_key[key] = rewards_per_key.get(key, 0.0) + bonus
-                print(f"[REWARD] t={sim_time:.1f}s success-rate bonus delta={delta_sr:.4f}")
+                # host-level total contribution
+                step_comp['success_delta'] += bonus * len(target_hosts)
+                step_comp['success_bonus'] += bonus * len(target_hosts)
+                print(
+                    f"[REWARD] t={sim_time:.1f}s success-rate bonus  delta={delta_sr:.4f} "
+                    f"ema={Handler.SR_DELTA_EMA if Handler.SR_DELTA_EMA is not None else float('nan'):.4f} "
+                    f"eps={eps_thr:.4f} mult={mult:.2f} eff_w={(SUCCESS_RATE_BONUS_WEIGHT*mult):.3f}"
+                )
+
 
         if success_rate is not None:
             Handler.LAST_SUCCESS_RATE = success_rate
-
-        Handler.log_signal_stats(
-            sim_time,
-            {
-                "pbase_signal": pbase_signals,
-                "buffer_diff": buffer_diff_signals,
-                "success_rate_delta": success_rate_deltas,
-            },
-        )
 
         # Bonus for low-util relays during detected high-load phases (Prophet-guided)
         if RELAY_BONUS_WEIGHT > 0 and relay_load_active and map_host_to_keys:
@@ -1916,9 +2122,19 @@ class Handler(BaseHTTPRequestHandler):
                         host_reward = rewards_per_host.get(host, 0.0) + bonus
                         rewards_per_host[host] = host_reward
                         relay_bonus_count += 1
+                        step_comp['relay_bonus'] += bonus
             if relay_bonus_count > 0:
                 print(f"[REWARD] t={sim_time:.1f}s relay bonus applied={relay_bonus_count} "
                       f"bonus_per_key~{RELAY_BONUS_WEIGHT:.2f}")
+
+        # Log per-step reward component totals (host-level) after all contributions
+        if STEP_REWARD_TRACKING:
+            try:
+                buffer_size = extract_buffer_size_mb(sim_id)
+                step_comp['total_hosts_reward'] = sum(rewards_per_host.values()) if rewards_per_host else 0.0
+                log_step_reward_components(sim_time, step_comp, buffer_size, Handler.EP_COUNT)
+            except Exception:
+                pass
 
         # Update policy
         update_result = {}
@@ -1959,7 +2175,6 @@ class Handler(BaseHTTPRequestHandler):
         # Group actions by host
         per_host = defaultdict(list)
         flat_map = {}
-        rewards_payload = {}
         for i, item in enumerate(filtered_items):
             try:
                 host = str(item.get("host", ""))
@@ -1973,19 +2188,10 @@ class Handler(BaseHTTPRequestHandler):
                 flat_map[f"{host}#{dest}"] = delta_c
             except Exception:
                 continue
-        for key, value in rewards_per_key.items():
-            try:
-                rewards_payload[key] = float(value)
-            except Exception:
-                continue
 
         actions = [{"host": h, "per_message": v} for h, v in per_host.items()]
-        resp = {
-            "policy_id": Handler.POLICY_ID,
-            "actions": actions,
-            "actions_kv": flat_map,
-            "rewards_kv": rewards_payload,
-        }
+        resp = {"policy_id": Handler.POLICY_ID, "actions": actions, "actions_kv": flat_map}
+
 
         body = json.dumps(resp).encode("utf-8")
         self.send_response(200)
