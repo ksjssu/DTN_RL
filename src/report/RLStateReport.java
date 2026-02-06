@@ -114,7 +114,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
         this.wAbort = s.getDouble(W_ABORT_S, 0.5);
         this.reportUrl = s.getSetting(REPORT_URL_S, "");
 
-        write("# time type host msgId dest contacts_norm pred bufocc_mean capacity_norm self_buf_util relayed drops aborted reward legacy_reward global_active_conns global_total_msgs global_avg_buf global_avg_contacts global_msg_change_rate global_msg_change_momentum global_buf_util_change_rate global_buf_util_momentum global_avg_free_buf global_high_util_frac");
+        write("# time type host msgId dest contacts_norm pred bufocc_mean capacity_norm self_buf_util relayed drops aborted delivered reward legacy_reward global_active_conns global_total_msgs global_avg_buf global_avg_contacts global_msg_change_rate global_msg_change_momentum global_buf_util_change_rate global_buf_util_momentum global_avg_free_buf global_high_util_frac");
     }
 
     @Override
@@ -278,7 +278,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
             double g7 = safe(globalFeatures[7]);
             double g8 = safe(globalFeatures[8]);
             double g9 = safe(globalFeatures[9]);
-            write(now + " R " + hostStr + " - - " + format(safe(contactsNorm)) + " NaN " + format(safe(bufOccMean)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " " + rel + " " + dr + " " + ab + " " + format(finalReward) + " " + format(legacyReward) + " " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
+            write(now + " R " + hostStr + " - - " + format(safe(contactsNorm)) + " NaN " + format(safe(bufOccMean)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " " + rel + " " + dr + " " + ab + " " + del + " " + format(finalReward) + " " + format(legacyReward) + " " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
 
             // Per-message state lines (type S)
             int emitted = 0;
@@ -290,7 +290,7 @@ public class RLStateReport extends SamplingReport implements MessageListener {
                 double pred = getPredFor(h, m.getTo());
                 double bufOccMean2 = this.bufOccTracker.getMeanOccupancy(addr);
                 String destStr = m.getTo().toString();
-                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(safe(contactsNorm)) + " " + format(safe(pred)) + " " + format(safe(bufOccMean2)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " 0 0 0 0.0000 0.0000 " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
+                write(now + " S " + hostStr + " " + m.getId() + " " + destStr + " " + format(safe(contactsNorm)) + " " + format(safe(pred)) + " " + format(safe(bufOccMean2)) + " " + format(safe(capacityNorm)) + " " + format(safe(selfBufUtil)) + " 0 0 0 0 0.0000 0.0000 " + format(g0) + " " + format(g1) + " " + format(g2) + " " + format(g3) + " " + format(g4) + " " + format(g5) + " " + format(g6) + " " + format(g7) + " " + format(g8) + " " + format(g9));
                 emitted++;
             }
         }

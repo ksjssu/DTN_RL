@@ -224,7 +224,9 @@ Events12.time = 79200,86399
 Events12.prefix = L3
 
 Report.reportDir = reports/prophet_mixbuf/
-Report.nrofReports = 1
+Report.nrofReports = 3
 Report.report1 = DeliveryRatePerIntervalReport
+Report.report2 = OverheadPerIntervalReport
+Report.report3 = LatencyPerIntervalReport
 DeliveryRatePerIntervalReport.binSize = 3600
 DeliveryRatePerIntervalReport.cumulativeMode = true

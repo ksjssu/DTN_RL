@@ -69,6 +69,10 @@ public class ProphetRouter extends ActiveRouter {
     private Map<DTNHost, Double> preds;
     /** external offset for predictabilities (e.g., DRL delta per-destination) */
     private Map<DTNHost, Double> extOffsets = new HashMap<DTNHost, Double>();
+    /** counts of skipped relays due to lower peer predictability, per destination */
+    private Map<DTNHost, Integer> lowPredSkips = new HashMap<DTNHost, Integer>();
+    /** counts of opportunities where peer has higher predictability, per destination */
+    private Map<DTNHost, Integer> highPredOpportunities = new HashMap<DTNHost, Integer>();
 	/** last delivery predictability update (sim)time */
 	private double lastAgeUpdate;
 
@@ -264,10 +268,15 @@ public class ProphetRouter extends ActiveRouter {
 				if (othRouter.hasMessage(m.getId())) {
 					continue; // skip messages that the other one has
 				}
-				if (othRouter.getPredFor(m.getTo()) > getPredFor(m.getTo())) {
+                double otherPred = othRouter.getPredFor(m.getTo());
+                double selfPred = getPredFor(m.getTo());
+				if (otherPred > selfPred) {
 					// the other node has higher probability of delivery
 					messages.add(new Tuple<Message, Connection>(m,con));
-				}
+                    recordHighPredOpportunity(m.getTo());
+				} else if (otherPred < selfPred) {
+                    recordLowPredSkip(m.getTo());
+                }
 			}
 		}
 
@@ -343,6 +352,36 @@ public class ProphetRouter extends ActiveRouter {
         this.extOffsets.put(dest, new Double(offset));
     }
 
+    /** Returns and resets counts of low-predictability relay skips per destination. */
+    public Map<DTNHost, Integer> drainLowPredSkips() {
+        Map<DTNHost, Integer> out = new HashMap<DTNHost, Integer>(this.lowPredSkips);
+        this.lowPredSkips.clear();
+        return out;
+    }
+
+    /** Returns and resets counts of higher-predictability peer opportunities per destination. */
+    public Map<DTNHost, Integer> drainHighPredOpportunities() {
+        Map<DTNHost, Integer> out = new HashMap<DTNHost, Integer>(this.highPredOpportunities);
+        this.highPredOpportunities.clear();
+        return out;
+    }
+
+    private void recordLowPredSkip(DTNHost dest) {
+        if (dest == null) {
+            return;
+        }
+        Integer v = this.lowPredSkips.get(dest);
+        this.lowPredSkips.put(dest, (v == null ? 1 : v + 1));
+    }
+
+    private void recordHighPredOpportunity(DTNHost dest) {
+        if (dest == null) {
+            return;
+        }
+        Integer v = this.highPredOpportunities.get(dest);
+        this.highPredOpportunities.put(dest, (v == null ? 1 : v + 1));
+    }
+
 	@Override
 	public MessageRouter replicate() {
 		ProphetRouter r = new ProphetRouter(this);
@@ -350,4 +389,3 @@ public class ProphetRouter extends ActiveRouter {
 	}
 
 }
-

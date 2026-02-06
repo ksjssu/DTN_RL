@@ -43,6 +43,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     public static final String LOG_ACTIONS_MAX_S = "logActionsMax"; // max lines per step
     public static final String BUF_OCC_MAX_AGE_S = "bufOccMaxAge"; // seconds to keep shared occupancy samples
     public static final String ACTIVATION_TIME_S = "activationTime"; // seconds before controller activates
+    public static final String EPISODE_SECONDS_S = "episodeSeconds"; // episode duration for progress
+    public static final String CREATED_RATE_MAX_PER_NODE_S = "createdRateMaxPerNodeSec"; // msgs/sec/node cap for normalization
 
     private final String endpoint;
     private final String localPolicyPath;
@@ -60,11 +62,16 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final int logActionsMax;
     private final boolean unboundedDelta;
     private final double activationTime;
+    private final double episodeSeconds;
+    private final double messageTtlMinutes;
     private boolean activationNotified = false;
     private LocalPpoPolicy localPolicy = null; // feed-forward local policy
     private LocalRmappoPolicy localRmappoPolicy = null; // recurrent local policy
     private final BufferOccupancyTracker bufOccTracker = new BufferOccupancyTracker();
     private final int bufOccMaxAge;
+    // Global message-creation tracking (since last sample)
+    private int createdSinceLastSample = 0;
+    private final double createdRateMaxPerNodeSec;
 
     // Histories for windowed features
     private final Map<Integer, Deque<Double>> contactsHistory = new HashMap<Integer, Deque<Double>>();
@@ -77,7 +84,11 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final Map<String, Integer> droppedByKey = new HashMap<String, Integer>();
     private final Map<String, Integer> abortedByKey = new HashMap<String, Integer>();
     private final Map<String, Integer> deliveredByKey = new HashMap<String, Integer>();
+    private final Map<String, Integer> lowPredSkipByKey = new HashMap<String, Integer>();
+    private final Map<String, Integer> highPredOppByKey = new HashMap<String, Integer>();
     private final Map<String, Double> totalDelayByKey = new HashMap<String, Double>();  // total delay for delivered messages
+    private final Map<String, Double> ttlRatioSumByKey = new HashMap<String, Double>();
+    private final Map<String, Double> hopCountSumByKey = new HashMap<String, Double>();
     private static final Map<String, RewardRecord> LAST_DRL_REWARD_BY_HOST = new HashMap<String, RewardRecord>();
     private static int LAST_REWARD_TIMESTAMP = -1;
     private static class RewardRecord {
@@ -158,7 +169,10 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         int age = (int)Math.round(s.getDouble(BUF_OCC_MAX_AGE_S, this.windowSizeSeconds));
         if (age < 0) { age = this.windowSizeSeconds; }
         this.bufOccMaxAge = age;
+        this.createdRateMaxPerNodeSec = s.getDouble(CREATED_RATE_MAX_PER_NODE_S, 1.0);
         this.activationTime = Math.max(0.0, s.getDouble(ACTIVATION_TIME_S, 0.0));
+        this.episodeSeconds = Math.max(1.0, s.getDouble(EPISODE_SECONDS_S, 100000.0));
+        this.messageTtlMinutes = s.getDouble(MessageRouter.MSG_TTL_S, -1.0);
         if (this.activationTime > 0.0) {
             write("# RLBridge inactive until t >= " + format(this.activationTime));
         }
@@ -228,6 +242,9 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             bufOccTracker.update(hosts, now, this.bufOccMaxAge);
         } catch (Exception ignore) { /* best effort */ }
 
+        // Save created count before collectGlobalFeatures resets it
+        int createdThisStep = this.createdSinceLastSample;
+
         // CTDE: Collect global network features once per step
         double[] globalFeatures = collectGlobalFeatures(hosts, maxBufferSize);
 
@@ -235,7 +252,9 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         if (remoteMode) {
             String simId = escape(getScenarioName());
             req.append("{\"sim_id\":\"").append(simId).append("\",\"time\":").append(now)
-               .append(",\"delta_limit\":").append(effDeltaLimit).append(",\"prev_transition\":[");
+               .append(",\"delta_limit\":").append(effDeltaLimit)
+               .append(",\"created_since_last\":").append(createdThisStep)
+               .append(",\"prev_transition\":[");
             stateBatch.append("\"state_batch\":[");
         }
 
@@ -255,6 +274,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             final int addr = h.getAddress();
 
             final String hostStr = h.toString();
+            ingestLowPredSkips(h, hostStr);
+            ingestHighPredOpportunities(h, hostStr);
 
             // Build peers set
             final Set<Integer> peers = new HashSet<Integer>();
@@ -330,8 +351,14 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     int dr = getAndResetStr(droppedByKey, k);
                     int ab = getAndResetStr(abortedByKey, k);
                     int de = getAndResetStr(deliveredByKey, k);
+                    int lowPredSkips = getAndResetStr(lowPredSkipByKey, k);
+                    int highPredOpps = getAndResetStr(highPredOppByKey, k);
                     double totalDelay = getAndResetDouble(totalDelayByKey, k);
                     double avgDelay = (de > 0) ? (totalDelay / de) : 0.0;
+                    double ttlRatioSum = getAndResetDouble(ttlRatioSumByKey, k);
+                    double hopCountSum = getAndResetDouble(hopCountSumByKey, k);
+                    double avgTtlRatio = (de > 0) ? (ttlRatioSum / de) : 0.0;
+                    double avgHops = (de > 0) ? (hopCountSum / de) : 0.0;
 
                     // Get Gradient Alignment Reward fields
                     double lastAction = getAndResetDouble(lastActionByKey, k);
@@ -356,13 +383,17 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     }
 
                     if (remoteMode) {
-                        if (rel != 0 || dr != 0 || ab != 0 || de != 0) {
+                        if (rel != 0 || dr != 0 || ab != 0 || de != 0 || lowPredSkips != 0 || highPredOpps != 0) {
                             if (!firstPrev) req.append(","); firstPrev=false;
                             req.append("{\"host\":\"").append(escape(hostStr)).append("\",")
                                .append("\"dest\":\"").append(escape(destStr)).append("\",")
                                .append("\"relayed\":").append(rel).append(",\"drops\":").append(dr)
                                .append(",\"aborted\":").append(ab).append(",\"delivered\":").append(de)
-                                .append(",\"avg_delay\":").append(String.format("%.3f", avgDelay))
+                               .append(",\"avg_delay\":").append(String.format("%.3f", avgDelay))
+                                .append(",\"avg_ttl_ratio\":").append(format(avgTtlRatio))
+                                .append(",\"avg_hops\":").append(format(avgHops))
+                                .append(",\"skip_low_pred\":").append(lowPredSkips)
+                                .append(",\"peer_high_pred\":").append(highPredOpps)
                                 .append(",\"buffer_size\":").append(bufferCapacity).append(",")
                                 // Gradient Alignment Reward fields
                                 .append("\"p_base\":").append(format(pBase)).append(",")
@@ -473,6 +504,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                     double g9 = Double.isFinite(globalFeatures[9]) ? globalFeatures[9] : 0.0;
                     double g10 = Double.isFinite(globalFeatures[10]) ? globalFeatures[10] : 0.0;
                     double g11 = Double.isFinite(globalFeatures[11]) ? globalFeatures[11] : 0.0;
+                    double g12 = Double.isFinite(globalFeatures[12]) ? globalFeatures[12] : 0.0;
+                    double g13 = (globalFeatures.length > 13 && Double.isFinite(globalFeatures[13])) ? globalFeatures[13] : 0.0;
                     stateBatch.append("{\"host\":\"").append(escape(hostStr)).append("\",")
                             .append("\"dest\":\"").append(escape(destStr)).append("\",")
                             .append("\"buffer_size_mb\":").append(String.format("%.2f", bufferSizeMB)).append(",")
@@ -496,7 +529,9 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
                             .append("\"global_avg_free_buf\":").append(format(g8)).append(",")
                             .append("\"global_high_util_frac\":").append(format(g9)).append(",")
                             .append("\"global_high_util_flag\":").append(format(g10)).append(",")
-                            .append("\"global_avg_buf_delta\":").append(format(g11)).append("}");
+                            .append("\"global_avg_buf_delta\":").append(format(g11)).append(",")
+                            .append("\"global_episode_time_norm\":").append(format(g12)).append(",")
+                            .append("\"global_created_rate\":").append(format(g13)).append("}");
                     emitted++; stateCount++;
                 } else if (appliedLocally) {
                     emitted++; stateCount++;
@@ -793,7 +828,7 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     }
 
     // MessageListener-like hooks to collect rewards at host-dest granularity
-    public void newMessage(Message m) {}
+    public void newMessage(Message m) { this.createdSinceLastSample++; }
     public void messageTransferStarted(Message m, DTNHost from, DTNHost to) {}
     public void messageDeleted(Message m, DTNHost where, boolean dropped) {
         if (dropped) {
@@ -833,6 +868,21 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             double deliveryDelay = SimClock.getTime() - m.getCreationTime();
             Double totalDelay = totalDelayByKey.get(key);
             totalDelayByKey.put(key, (totalDelay == null ? deliveryDelay : totalDelay + deliveryDelay));
+
+            double ttlRatio = 1.0;
+            if (this.messageTtlMinutes > 0.0) {
+                double ttlRemaining = this.messageTtlMinutes - (deliveryDelay / 60.0);
+                ttlRemaining = Math.max(0.0, ttlRemaining);
+                ttlRatio = (ttlRemaining / this.messageTtlMinutes);
+            }
+            if (!Double.isFinite(ttlRatio) || ttlRatio < 0.0) { ttlRatio = 0.0; }
+            if (ttlRatio > 1.0) { ttlRatio = 1.0; }
+            Double ttlSum = ttlRatioSumByKey.get(key);
+            ttlRatioSumByKey.put(key, ttlSum == null ? ttlRatio : ttlSum + ttlRatio);
+
+            double hopCount = m.getHopCount();
+            Double hopSum = hopCountSumByKey.get(key);
+            hopCountSumByKey.put(key, hopSum == null ? hopCount : hopSum + hopCount);
         }
         markUpdated(hostStr, destStr);
     }
@@ -843,17 +893,75 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         s.add(destStr);
     }
 
+    private void ingestLowPredSkips(DTNHost host, String hostStr) {
+        if (host == null) {
+            return;
+        }
+        MessageRouter router = host.getRouter();
+        if (!(router instanceof ProphetRouter)) {
+            return;
+        }
+        Map<DTNHost, Integer> skips = ((ProphetRouter) router).drainLowPredSkips();
+        if (skips == null || skips.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<DTNHost, Integer> e : skips.entrySet()) {
+            DTNHost destHost = e.getKey();
+            if (destHost == null) {
+                continue;
+            }
+            int count = (e.getValue() != null) ? e.getValue().intValue() : 0;
+            if (count <= 0) {
+                continue;
+            }
+            String destStr = destHost.toString();
+            String key = hostStr + "#" + destStr;
+            Integer prev = lowPredSkipByKey.get(key);
+            lowPredSkipByKey.put(key, (prev == null ? count : prev + count));
+            markUpdated(hostStr, destStr);
+        }
+    }
+
+    private void ingestHighPredOpportunities(DTNHost host, String hostStr) {
+        if (host == null) {
+            return;
+        }
+        MessageRouter router = host.getRouter();
+        if (!(router instanceof ProphetRouter)) {
+            return;
+        }
+        Map<DTNHost, Integer> opps = ((ProphetRouter) router).drainHighPredOpportunities();
+        if (opps == null || opps.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<DTNHost, Integer> e : opps.entrySet()) {
+            DTNHost destHost = e.getKey();
+            if (destHost == null) {
+                continue;
+            }
+            int count = (e.getValue() != null) ? e.getValue().intValue() : 0;
+            if (count <= 0) {
+                continue;
+            }
+            String destStr = destHost.toString();
+            String key = hostStr + "#" + destStr;
+            Integer prev = highPredOppByKey.get(key);
+            highPredOppByKey.put(key, (prev == null ? count : prev + count));
+            markUpdated(hostStr, destStr);
+        }
+    }
+
     /**
-     * CTDE: Collect global network state features (10 dimensions).
+     * CTDE: Collect global network state features (base 12 + episode progress + created_rate).
      * These features provide network-wide context for the centralized critic.
      *
      * @param hosts List of all hosts in the network
      * @param maxBufferSize Maximum buffer size for normalization
-     * @return Array of 10 global features
+     * @return Array of global features (length 14)
      */
     private double[] collectGlobalFeatures(List<DTNHost> hosts, double maxBufferSize) {
         if (hosts == null || hosts.isEmpty()) {
-            return new double[10]; // Return zeros if no hosts
+            return new double[14]; // Return zeros if no hosts
         }
 
         double now = SimClock.getTime();
@@ -968,7 +1076,7 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         this.currentAvgBufDelta = avgBufDelta;
         double highUtilFlag = (highUtilFraction >= HIGH_UTIL_FLAG_THRESHOLD) ? 1.0 : 0.0;
 
-        double[] globalFeatures = new double[12];
+        double[] globalFeatures = new double[14];
         globalFeatures[0] = activeConnections / maxConnections;       // active_connections_norm
         globalFeatures[1] = totalMessages / maxMessages;              // total_messages_norm
         globalFeatures[2] = avgBufferUtil;                            // avg_buffer_util
@@ -981,6 +1089,26 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
         globalFeatures[9] = highUtilFraction;                         // high_util_fraction
         globalFeatures[10] = highUtilFlag;                            // high_util_flag
         globalFeatures[11] = avgBufDelta;                             // avg_buf_delta
+        // Episode progress in [0,1]
+        double ep = (this.episodeSeconds > 0.0 ? this.episodeSeconds : 100000.0);
+        double tInEp = now % ep;
+        double episodeProgress = (ep > 0.0 ? (tInEp / ep) : 0.0);
+        if (!Double.isFinite(episodeProgress)) { episodeProgress = 0.0; }
+        if (episodeProgress < 0.0) episodeProgress = 0.0; if (episodeProgress > 1.0) episodeProgress = 1.0;
+        globalFeatures[12] = episodeProgress;                         // episode_time_norm
+
+        // Created messages: per-second per-node, normalized by a configurable cap
+        double createdRatePerNode = 0.0;
+        if (timeDelta > 0.0 && hosts.size() > 0) {
+            createdRatePerNode = (double)this.createdSinceLastSample / (timeDelta * (double)hosts.size());
+        }
+        // Reset counter for next window
+        this.createdSinceLastSample = 0;
+        double denomCreated = (this.createdRateMaxPerNodeSec > 1e-9 ? this.createdRateMaxPerNodeSec : 1.0);
+        double createdNorm = createdRatePerNode / denomCreated;
+        if (!Double.isFinite(createdNorm)) { createdNorm = 0.0; }
+        if (createdNorm < 0.0) createdNorm = 0.0; if (createdNorm > 1.0) createdNorm = 1.0;
+        globalFeatures[13] = createdNorm;                             // global_created_rate
 
         return globalFeatures;
     }

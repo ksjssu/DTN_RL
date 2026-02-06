@@ -4,6 +4,7 @@ package report;
 import core.DTNHost;
 import core.Message;
 import core.Settings;
+import core.SettingsError;
 import core.SimClock;
 import core.UpdateListener;
 import routing.MessageRouter;
@@ -13,6 +14,8 @@ import routing.ProphetRouter;
 
 
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -38,15 +41,19 @@ public class BufferLoadHeuristicReport extends SamplingReport implements UpdateL
     public static final String LOG_ACTIONS_S = "logActions";
     public static final String LOG_ACTIONS_MAX_S = "logActionsMax";
     public static final String ACTIVATION_TIME_S = "activationTime";
+    public static final String THRESHOLD_SCHEDULE_S = "thresholdSchedule";
+    private static final double SCHEDULE_TIME_EPS = 1e-7;
 
     private final double deltaValue;
-    private final double lowThreshold;
-    private final double highThreshold;
+    private double lowThreshold;
+    private double highThreshold;
     private final int bufOccMaxAge;
     private final boolean logActions;
     private final int logActionsMax;
     private final double activationTime;
     private boolean activationNotified = false;
+    private final List<ThresholdScheduleEntry> thresholdSchedule;
+    private int scheduleCursor = 0;
 
     private final BufferOccupancyTracker tracker = new BufferOccupancyTracker();
 
@@ -85,11 +92,15 @@ public class BufferLoadHeuristicReport extends SamplingReport implements UpdateL
         if (this.activationTime > 0.0) {
             write("# BufferLoadHeuristic inactive until t >= " + format(this.activationTime));
         }
+        this.thresholdSchedule = parseThresholdSchedule(s);
 
         write("# BufferLoadHeuristic active delta=" + format(this.deltaValue) +
                 " low<= " + format(this.lowThreshold) +
                 " high>= " + format(this.highThreshold) +
                 " sampleInterval=" + format(super.interval));
+        if (!this.thresholdSchedule.isEmpty()) {
+            write("# BufferLoadHeuristic threshold schedule entries=" + this.thresholdSchedule.size());
+        }
     }
 
     @Override
@@ -98,6 +109,7 @@ public class BufferLoadHeuristicReport extends SamplingReport implements UpdateL
             return;
         }
         final int now = (int) SimClock.getTime();
+        maybeAdvanceThresholdSchedule(now);
         try {
             tracker.update(hosts, now, this.bufOccMaxAge);
         } catch (Exception ignore) { /* best effort */ }
@@ -190,5 +202,103 @@ public class BufferLoadHeuristicReport extends SamplingReport implements UpdateL
         // fall back to 600s like RL bridge/state reports if interval not exposed
         return 600.0;
     }
-}
 
+    private void maybeAdvanceThresholdSchedule(int now) {
+        if (this.thresholdSchedule.isEmpty()) {
+            return;
+        }
+        boolean updated = false;
+        while (this.scheduleCursor < this.thresholdSchedule.size()) {
+            ThresholdScheduleEntry entry = this.thresholdSchedule.get(this.scheduleCursor);
+            if ((double) now + SCHEDULE_TIME_EPS < entry.activationTime) {
+                break;
+            }
+            this.lowThreshold = entry.low;
+            this.highThreshold = entry.high;
+            this.scheduleCursor++;
+            updated = true;
+        }
+        if (updated) {
+            write("# BufferLoadHeuristic thresholds updated at t=" + now +
+                    " low<= " + format(this.lowThreshold) +
+                    " high>= " + format(this.highThreshold));
+        }
+    }
+
+    private List<ThresholdScheduleEntry> parseThresholdSchedule(Settings s) {
+        List<ThresholdScheduleEntry> entries = new ArrayList<ThresholdScheduleEntry>();
+        if (!s.contains(THRESHOLD_SCHEDULE_S)) {
+            return entries;
+        }
+        String[] tokens = s.getCsvSetting(THRESHOLD_SCHEDULE_S);
+        for (String token : tokens) {
+            if (token == null || token.isEmpty()) {
+                continue;
+            }
+            String[] fields = token.split(":");
+            if (fields.length != 3) {
+                throw new SettingsError("Invalid thresholdSchedule entry '" + token +
+                        "'. Expected format time:low:high");
+            }
+            double activation = parseDouble(fields[0], "activationTime");
+            double low = parseDouble(fields[1], "lowThreshold");
+            double high = parseDouble(fields[2], "highThreshold");
+            double[] normalized = normalizeThresholds(low, high);
+            entries.add(new ThresholdScheduleEntry(
+                    Math.max(0.0, activation),
+                    normalized[0],
+                    normalized[1]));
+        }
+        Collections.sort(entries);
+        return entries;
+    }
+
+    private double parseDouble(String raw, String name) {
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException nfe) {
+            throw new SettingsError("Invalid numeric value '" + raw + "' for " + name, nfe);
+        }
+    }
+
+    private double[] normalizeThresholds(double low, double high) {
+        double normalizedLow = clamp01(low);
+        double normalizedHigh = clamp01(high);
+        if (normalizedLow > normalizedHigh) {
+            double tmp = normalizedLow;
+            normalizedLow = normalizedHigh;
+            normalizedHigh = tmp;
+        }
+        return new double[]{normalizedLow, normalizedHigh};
+    }
+
+    private double clamp01(double value) {
+        if (value < 0.0) {
+            return 0.0;
+        }
+        if (value > 1.0) {
+            return 1.0;
+        }
+        return value;
+    }
+
+    private static final class ThresholdScheduleEntry implements Comparable<ThresholdScheduleEntry> {
+        private final double activationTime;
+        private final double low;
+        private final double high;
+
+        private ThresholdScheduleEntry(double activationTime, double low, double high) {
+            this.activationTime = activationTime;
+            this.low = low;
+            this.high = high;
+        }
+
+        @Override
+        public int compareTo(ThresholdScheduleEntry other) {
+            if (this.activationTime == other.activationTime) {
+                return 0;
+            }
+            return this.activationTime < other.activationTime ? -1 : 1;
+        }
+    }
+}

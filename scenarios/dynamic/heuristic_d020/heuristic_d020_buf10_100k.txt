@@ -77,9 +77,6 @@ Group6.nrofHosts = 2
 
 ## Reports
 Report.warmup = 0
-Report.nrofReports = 2
-Report.report1 = DeliveryRatePerIntervalReport
-Report.report2 = RLStateReport
 DeliveryRatePerIntervalReport.binSize = 3600
 RLStateReport.sampleInterval = 20
 RLStateReport.windowSize = 600

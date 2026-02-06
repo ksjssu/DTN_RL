@@ -30,11 +30,18 @@ venv/
 *.log
 *.out
 
+# Windows/WSL artifacts
+NUL
+
 # Report directories
 reports/
 reports_drl_eval/
 reports_drl_train/
 reports_summary/
+reports_plots/
+
+# Scratch outputs
+.tmp/auto_onpolicy/
 
 # Backup directories
 backup/

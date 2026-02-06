@@ -201,10 +201,11 @@ OverheadPerIntervalReport.binSize = 3600
 OverheadPerIntervalReport.cumulativeMode = true
 LatencyPerIntervalReport.binSize = 3600
 LatencyPerIntervalReport.cumulativeMode = true
-BufferLoadHeuristicReport.sampleInterval = 100
+BufferLoadHeuristicReport.sampleInterval = 1000
 BufferLoadHeuristicReport.lowThreshold = 0.33
 BufferLoadHeuristicReport.highThreshold = 0.66
 BufferLoadHeuristicReport.bufOccMaxAge = 600
 BufferLoadHeuristicReport.logActions = false
 BufferLoadHeuristicReport.output = NUL
-
+RLBridgeReport.activationTime = 28800
+BufferLoadHeuristicReport.activationTime = 28800 

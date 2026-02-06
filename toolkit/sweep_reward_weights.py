@@ -113,25 +113,55 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", required=True, help="Path to ONE settings file")
     ap.add_argument("--server", default="http://127.0.0.1:5010", help="DRL server base URL")
-    ap.add_argument("--samples", type=int, default=0, help="Random sample count from grid (0=disabled)")
-    ap.add_argument("--grid", action="store_true", help="Use grid order instead of random samples")
-    ap.add_argument("--max-combos", type=int, default=0, help="Cap number of grid combos (0=no cap)")
+    ap.add_argument("--samples", type=int, default=0, help="Random sample count from candidate grid (0=disabled)")
+    ap.add_argument("--grid", action="store_true", help="Use grid order over the candidate grid (default: random sample)")
+    ap.add_argument("--max-combos", type=int, default=0, help="Cap number of combos (0=no cap)")
+    # Custom ranges (format: start:end:step). If omitted, defaults are used.
+    ap.add_argument("--pbase-range", type=str, default=None, help="PBASE range as start:end:step (e.g., 0.4:0.8:0.05)")
+    ap.add_argument("--buf-range", type=str, default=None, help="BUFFER_DIFF range as start:end:step (e.g., 1.4:1.8:0.05)")
+    ap.add_argument("--sr-range", type=str, default=None, help="SUCCESS_RATE range as start:end:step (e.g., 250:350:25)")
+    ap.add_argument("--sr-bonus-range", type=str, default=None, help="SUCCESS_RATE_BONUS range as start:end:step")
+    ap.add_argument("--tie-sr", action="store_true", help="Tie SUCCESS_RATE_BONUS to SUCCESS_RATE (srb=srw per combo)")
     ap.add_argument("--one", default="./one.sh", help="ONE launcher (default ./one.sh)")
     ap.add_argument("--batch", type=int, default=1, help="ONE -b runs (default 1)")
     ap.add_argument("--no-reset-per-combo", action="store_true", help="Do not restore baseline before each combo (default: reset)")
     args = ap.parse_args()
 
-    # Define search ranges
-    pbase_vals = frange(0.0, 2.0, 0.2)  # 11
-    buf_vals = frange(0.0, 2.0, 0.2)    # 11
-    sr_vals = list(range(0, 401, 50))   # 0,50,...,400 (9)
+    # Define search ranges (defaults)
+    def parse_range_arg(arg: str | None, default_list):
+        if not arg:
+            return default_list
+        try:
+            s, e, st = arg.split(":")
+            s, e, st = float(s), float(e), float(st)
+            # int-like step? still use frange for floats
+            return frange(s, e, st)
+        except Exception as e:
+            print(f"[WARN] Bad range '{arg}', using default")
+            return default_list
+
+    pbase_default = frange(0.0, 2.0, 0.2)  # 11
+    buf_default = frange(0.0, 2.0, 0.2)    # 11
+    sr_default = [float(x) for x in range(0, 401, 50)]  # 0..400 step 50
+
+    pbase_vals = parse_range_arg(args.pbase_range, pbase_default)
+    buf_vals = parse_range_arg(args.buf_range, buf_default)
+    sr_vals = parse_range_arg(args.sr_range, sr_default)
+    if args.tie_sr:
+        sr_bonus_vals = sr_vals
+    else:
+        sr_bonus_vals = parse_range_arg(args.sr_bonus_range, sr_default)
 
     combos = []
     for p in pbase_vals:
         for b in buf_vals:
-            for srw in sr_vals:
-                for srb in sr_vals:
-                    combos.append((p, b, float(srw), float(srb)))
+            if args.tie_sr:
+                for srw in sr_vals:
+                    combos.append((float(p), float(b), float(srw), float(srw)))
+            else:
+                for srw in sr_vals:
+                    for srb in sr_bonus_vals:
+                        combos.append((float(p), float(b), float(srw), float(srb)))
 
     total = len(combos)
     if not args.grid:

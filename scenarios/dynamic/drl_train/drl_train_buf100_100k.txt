@@ -189,10 +189,12 @@ Group.bufferSize = 100M
 ProphetRouter.heuristicDelta = 0.0
 
 Report.reportDir = reports_drl_train/buf100/
-Report.nrofReports = 3
+Report.nrofReports = 5
 Report.report1 = DeliveryRatePerIntervalReport
 Report.report2 = RLBridgeReport
 Report.report3 = RLStateReport
+Report.report4 = OverheadPerIntervalReport
+Report.report5 = LatencyPerIntervalReport
 DeliveryRatePerIntervalReport.binSize = 3600
 DeliveryRatePerIntervalReport.cumulativeMode = true
 RLBridgeReport.sampleInterval = 100

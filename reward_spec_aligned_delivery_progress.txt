@@ -1,0 +1,101 @@
+Reward Spec (DTN / R-MAPPO) - Aligned Delivery + Destination-Progress Redistribution
+=================================================================================
+
+Purpose
+-------
+1) Make sure "max reward" aligns with "max final delivery success".
+2) Still use "relay to destination-related nodes" as a shaping signal, but prevent reward hacking.
+
+This file documents the reward currently implemented in:
+- DTN_RL/toolkit/drl_server_rmappo.py
+  - REWARD_MODE = "aligned_delivery_progress"
+
+Inputs (From Java)
+------------------
+Java report:
+- DTN_RL/src/report/RLBridgeReport.java
+
+For each step, Java sends a list prev_transition items (host,dest granularity).
+Each item includes:
+- delivered: number of first deliveries for (host,dest) in this step
+- relayed:   number of relays for (host,dest) in this step
+- p_prog_sum: sum of logit-progress across relays (see below)
+- p_prog_cnt: number of relays included in p_prog_sum
+
+Java per-relay progress (computed at messageTransferred):
+- peerBase = p_base(to, dest)   (pure PROPHET base predictability, NO RL delta)
+- selfBase = p_base(from, dest)
+- progress_relay = logit(peerBase) - logit(selfBase)
+- logit(p) = ln(p/(1-p)), with p clamped to [1e-6, 1-1e-6]
+
+Then per step (host#dest key):
+- p_prog_sum = sum(progress_relay)
+- p_prog_cnt = count(relays)
+
+
+Reward Mode: aligned_delivery_progress
+-------------------------------------
+At each step t:
+
+Definitions:
+- D_t = total delivered count in this step
+        D_t = sum_over_prev_transition_items(delivered)
+
+- K_t = set of keys that produced actions in the previous step:
+        K_t = keys(Handler.AGENT.last_actions)
+  N = |K_t|
+
+Base team reward (global objective):
+- For every key k in K_t:
+  r_base(k) = D_t / N
+
+Destination progress score (per key):
+- For each key k:
+  avg_prog(k) is implemented as:
+  - prog_sum = float(prev_transition_item["p_prog_sum"]) (default 0.0)
+  - prog_cnt_raw = float(prev_transition_item["p_prog_cnt"]) (default 0.0)
+  - prog_cnt = int(round(prog_cnt_raw))
+  - if prog_cnt <= 0 and relayed > 0: prog_cnt = int(round(relayed))
+  - avg_prog(k) = prog_sum / max(1, prog_cnt)
+
+  (If p_prog_sum/p_prog_cnt are missing or prog_cnt<=0 and relayed==0, avg_prog(k)=0.0)
+  g(k) = tanh( avg_prog(k) / ALIGNED_PROGRESS_TAU )
+
+Zero-sum redistribution term:
+- g_bar = (1/N) * sum_k g(k)
+- r_prog(k) = ALIGNED_PROGRESS_WEIGHT * ( g(k) - g_bar )
+
+Final per-key reward:
+- r(k) = r_base(k) + r_prog(k)
+
+Key property (alignment guarantee):
+- sum_k r_prog(k) = 0  (by construction, mean-subtracted)
+- sum_k r(k) = sum_k r_base(k) = D_t
+So maximizing total reward across the episode is equivalent to maximizing total delivered.
+Progress cannot increase total reward; it only redistributes rewards among keys.
+
+
+Parameters
+----------
+In DTN_RL/toolkit/drl_server_rmappo.py:
+- REWARD_MODE
+  - "aligned_delivery_progress"  (recommended for alignment)
+  - "progress_only"              (NOT aligned; can reward-hack)
+  - "full"                       (normal behavior with other channels)
+
+Aligned mode tuning:
+- ALIGNED_PROGRESS_WEIGHT (default 0.5)
+  - Higher: stronger credit reallocation toward "more destination-related relays"
+  - Must be used with care; too large can increase variance across keys.
+
+- ALIGNED_PROGRESS_TAU (default 1.0)
+  - Smaller: g(k)=tanh(avg_prog/tau) saturates faster
+  - Larger: more linear response (less saturation)
+
+
+Notes / Practical Interpretation
+-------------------------------
+1) The ONLY way to increase total episode reward is to increase delivered messages.
+2) Progress affects learning by shifting advantage/credit among keys that acted.
+3) This is intended to keep the proxy signal (destination-related forwarding)
+   helpful without letting it dominate the true objective (delivery).

@@ -1,0 +1,207 @@
+Scenario.name = low_high_combi_d020_buf40_low50_high80_100k_rng%%MovementModel.rngSeed%%
+MovementModel.rngSeed = [1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22; 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40; 41; 42; 43; 44; 45; 46; 47; 48; 49; 50; 51; 52; 53; 54; 55; 56; 57; 58; 59; 60; 61; 62; 63; 64; 65; 66; 67; 68; 69; 70; 71; 72; 73; 74; 75; 76; 77; 78; 79; 80; 81; 82; 83; 84; 85; 86; 87; 88; 89; 90; 91; 92; 93; 94; 95; 96; 97; 98; 99; 100]
+Scenario.endTime = 86400
+## Scenario settings
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+highspeedInterface.type = SimpleBroadcastInterface
+highspeedInterface.transmitSpeed = 10M
+highspeedInterface.transmitRange = 1000
+
+## Groups
+Scenario.nrofHostGroups = 6
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.msgTtl = 300
+
+Group.nrofHosts = 40
+
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.okMaps = 1
+Group2.speed = 2.7, 13.9
+
+Group3.groupID = w
+
+Group4.groupID = t
+Group4.bufferSize = 50M
+Group4.movementModel = MapRouteMovement
+Group4.routeFile = data/tram3.wkt
+Group4.routeType = 1
+Group4.waitTime = 10, 30
+Group4.speed = 7, 10
+Group4.nrofHosts = 2
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = highspeedInterface
+
+Group5.groupID = t
+Group5.bufferSize = 50M
+Group5.movementModel = MapRouteMovement
+Group5.routeFile = data/tram4.wkt
+Group5.routeType = 2
+Group5.waitTime = 10, 30
+Group5.speed = 7, 10
+Group5.nrofHosts = 2
+
+Group6.groupID = t
+Group6.bufferSize = 50M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram10.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 10
+Group6.nrofHosts = 2
+
+## Message creation: High/Medium/Low per 10000-second cycle
+# High:   interval 5..10s
+# Medium: interval 25..35s
+# Low:    interval 120..180s
+
+
+
+
+
+# (repeat the 3-entry pattern for each 10000s window up to 600000s as in dynamic_traffic_long_settings.txt)
+
+## Reports
+Report.warmup = 0
+DeliveryRatePerIntervalReport.binSize = 3600
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+SprayAndWaitRouter.nrofCopies = 6
+SprayAndWaitRouter.binaryMode = true
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100
+
+
+
+## Auto-generated M/H/M/L/M/H/M/L/M/H/M/L/ cycles
+Events.nrof = 420
+Events1.class = MessageEventGenerator
+Events1.interval = 25,35
+Events1.size = 1M,2M
+Events1.hosts = 0,126
+Events1.time = 0,7199
+Events1.prefix = L0
+
+Events2.class = MessageEventGenerator
+Events2.interval = 5,10
+Events2.size = 1M,2M
+Events2.hosts = 0,126
+Events2.time = 7200,14399
+Events2.prefix = M0
+
+Events3.class = MessageEventGenerator
+Events3.interval = 25,35
+Events3.size = 1M,2M
+Events3.hosts = 0,126
+Events3.time = 14400,21599
+Events3.prefix = H0
+
+Events4.class = MessageEventGenerator
+Events4.interval = 120,180
+Events4.size = 1M,2M
+Events4.hosts = 0,126
+Events4.time = 21600,28799
+Events4.prefix = M1
+
+Events5.class = MessageEventGenerator
+Events5.interval = 25,35
+Events5.size = 1M,2M
+Events5.hosts = 0,126
+Events5.time = 28800,35999
+Events5.prefix = L1
+
+Events6.class = MessageEventGenerator
+Events6.interval = 5,10
+Events6.size = 1M,2M
+Events6.hosts = 0,126
+Events6.time = 36000,43199
+Events6.prefix = M2
+
+Events7.class = MessageEventGenerator
+Events7.interval = 25,35
+Events7.size = 1M,2M
+Events7.hosts = 0,126
+Events7.time = 43200,50399
+Events7.prefix = H1
+
+Events8.class = MessageEventGenerator
+Events8.interval = 120,180
+Events8.size = 1M,2M
+Events8.hosts = 0,126
+Events8.time = 50400,57599
+Events8.prefix = L2
+
+Events9.class = MessageEventGenerator
+Events9.interval = 25,35
+Events9.size = 1M,2M
+Events9.hosts = 0,126
+Events9.time = 57600,64799
+Events9.prefix = M3
+
+Events10.class = MessageEventGenerator
+Events10.interval = 5,10
+Events10.size = 1M,2M
+Events10.hosts = 0,126
+Events10.time = 64800,71999
+Events10.prefix = H2
+
+Events11.class = MessageEventGenerator
+Events11.interval = 25,35
+Events11.size = 1M,2M
+Events11.hosts = 0,126
+Events11.time = 72000,79199
+Events11.prefix = M4
+
+Events12.class = MessageEventGenerator
+Events12.interval = 120,180
+Events12.size = 1M,2M
+Events12.hosts = 0,126
+Events12.time = 79200,86399
+Events12.prefix = L3
+
+Group.router = ProphetRouter
+Group.bufferSize = 40M
+ProphetRouter.heuristicDelta = 0.2
+
+Report.reportDir = reports/heuristic_test/low_high_combi/delta020/buf40/low50_high80/
+Report.nrofReports = 4
+Report.report1 = DeliveryRatePerIntervalReport
+Report.report2 = BufferLoadHeuristicReport
+Report.report3 = OverheadPerIntervalReport
+Report.report4 = LatencyPerIntervalReport
+DeliveryRatePerIntervalReport.binSize = 3600
+DeliveryRatePerIntervalReport.cumulativeMode = true
+OverheadPerIntervalReport.binSize = 3600
+OverheadPerIntervalReport.cumulativeMode = true
+LatencyPerIntervalReport.binSize = 3600
+LatencyPerIntervalReport.cumulativeMode = true
+BufferLoadHeuristicReport.sampleInterval = 100
+BufferLoadHeuristicReport.lowThreshold = 0.500
+BufferLoadHeuristicReport.highThreshold = 0.800
+BufferLoadHeuristicReport.bufOccMaxAge = 600
+BufferLoadHeuristicReport.logActions = false
+BufferLoadHeuristicReport.output = NUL

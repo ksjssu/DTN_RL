@@ -205,3 +205,5 @@ BufferLoadHeuristicReport.highThreshold = 0.66
 BufferLoadHeuristicReport.bufOccMaxAge = 600
 BufferLoadHeuristicReport.logActions = false
 BufferLoadHeuristicReport.output = NUL
+BufferLoadHeuristicReport.activationTime = 28800 
+RLBridgeReport.activationTime = 28800

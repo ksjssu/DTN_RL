@@ -1,0 +1,182 @@
+Reward Spec (DTN / R-MAPPO) - Aligned Delivery + Context-Aware Destination-Progress Redistribution
+=================================================================================================
+
+Purpose
+-------
+1) "Max reward" == "max final delivery success" (avoid proxy reward hacking).
+2) Still give *differential* learning signal for "relay to destination-related / likely-to-deliver nodes",
+   but make that signal depend on (a) destination progress, (b) observation/self state, (c) network/traffic state.
+3) Keep it compatible with R-MAPPO (per-step rewards, CTDE obs available via last_actions).
+
+This file documents the reward implemented in:
+- DTN_RL/toolkit/drl_server_rmappo.py
+  - REWARD_MODE = "aligned_delivery_context_progress"
+
+
+Inputs
+------
+Java report:
+- DTN_RL/src/report/RLBridgeReport.java
+
+Per step, Java sends a list `prev_transition` items (host,dest granularity).
+Each item may include:
+- delivered: number of first deliveries for (host,dest) in this step
+- relayed:   number of relays for (host,dest) in this step
+- p_prog_sum: sum of logit-progress across relays (see below)
+- p_prog_cnt: number of relays included in p_prog_sum
+- p_base:         p_base(self, dest) (pure PROPHET base predictability, NO RL delta)
+- neighbor_p_base: p_base(peer, dest) captured at last relay in this step (best-effort)
+- peer_buf_sum: sum of receiver(peer) buffer utilization at relay time
+- peer_buf_cnt: count of samples included in peer_buf_sum
+
+Java per-relay progress (computed at messageTransferred):
+- peerBase = p_base(to, dest)   (pure PROPHET base predictability, NO RL delta)
+- selfBase = p_base(from, dest)
+- progress_relay = logit(peerBase) - logit(selfBase)
+- logit(p) = ln(p/(1-p)), with p clamped to [1e-6, 1-1e-6]
+
+Then per step (host#dest key):
+- p_prog_sum = sum(progress_relay)
+- p_prog_cnt = count(relays)
+
+R-MAPPO action-time observation (Python):
+- For each acted key k, Handler.AGENT.last_actions[k] stores tensors:
+  - local_obs = [contacts_norm, pred, buf_mean, cap_norm, self_util, pressure_diff, rate_delta]
+  - global_obs = concat(local_obs, global_features[14])
+    - global_avg_buf is at global_obs index 9
+    - global_created_rate is at global_obs index 20
+
+
+Reward Mode: aligned_delivery_context_progress
+---------------------------------------------
+At each step t:
+
+Definitions:
+- D_t = total delivered count in this step
+        D_t = sum_over_prev_transition_items(delivered)
+
+- K_t = set of keys that produced actions in the previous step:
+        K_t = keys(Handler.AGENT.last_actions)
+  N = |K_t|
+
+Base team reward (global objective):
+- For every key k in K_t:
+  r_base(k) = D_t / N
+
+Per-key destination progress (logit delta):
+- For each key k, compute avg_prog(k) from prev_transition:
+  - prog_sum = float(item["p_prog_sum"]) (default 0.0)
+  - prog_cnt_raw = float(item["p_prog_cnt"]) (default 0.0)
+  - prog_cnt = int(round(prog_cnt_raw))
+  - if prog_cnt <= 0 and relayed > 0: prog_cnt = int(round(relayed))
+  - if prog_cnt <= 0: avg_prog(k) = 0.0
+    else:            avg_prog(k) = prog_sum / max(1, prog_cnt)
+
+We treat keys with prog_cnt>0 as "active for redistribution" in this step:
+- A_t = { k in K_t | prog_cnt(k) > 0 }
+
+Context-aware margin threshold (dynamic selectivity):
+For each active key k, read action-time obs from last_actions:
+- c  = contacts_norm
+- p  = pred
+- u  = self_util
+- pd = pressure_diff
+- gB = global_avg_buf
+- gR = global_created_rate
+
+Then compute:
+  theta(k) =
+      THETA0
+    + THETA_BUF     * clamp01(gB)
+    + THETA_RATE    * clamp01(gR)
+    + THETA_CONTACT * clamp01(c)
+    + THETA_PRED    * clamp01(p)
+    - THETA_SELF    * clamp01(u)
+    - THETA_PRESS   * max(0, pd)
+
+Interpretation:
+- Traffic / congestion high -> theta increases -> require stronger progress to get bonus
+- Self under buffer pressure (pd>0 or u high) -> theta decreases -> accept smaller progress
+- Self already likely to deliver (pred high) -> theta increases -> discourage forwarding away unless peer is much better
+
+Peer-quality gate (avoid rewarding progress toward still-bad peers):
+- peer_p(k):
+  - Prefer neighbor_p_base from prev_transition when finite
+  - Else estimate using p_base(self,dest) and avg_prog:
+      peer_p_est = sigmoid( logit(p_base(self,dest)) + avg_prog(k) )
+
+- gate_peer_p(k) in [0,1]:
+  - if PEER_P_SIGMA > 0:
+      gate_peer_p = sigmoid( (peer_p - PEER_P_MID) / PEER_P_SIGMA )
+  - else:
+      gate_peer_p = 1 if peer_p >= PEER_P_MID else 0
+
+Peer-buffer gate (avoid rewarding relays into congested peers):
+- avg_peer_buf(k) = peer_buf_sum / max(1, peer_buf_cnt)  (if peer_buf_cnt>0)
+- gate_peer_buf(k) in [0,1] prefers LOWER buffer utilization:
+  - if PEER_BUF_SIGMA > 0:
+      gate_peer_buf = sigmoid( (PEER_BUF_MID - avg_peer_buf) / PEER_BUF_SIGMA )
+  - else:
+      gate_peer_buf = 1 if avg_peer_buf <= PEER_BUF_MID else 0
+
+Relay-count confidence (downweight noisy single samples):
+- if CNT_TAU > 0:
+    conf(k) = 1 - exp( -prog_cnt(k) / CNT_TAU )
+  else:
+    conf(k) = 1
+
+Bounded contextual score:
+  margin(k) = (avg_prog(k) - theta(k)) / MARGIN_TAU
+  v(k) = conf(k) * gate_peer_p(k) * gate_peer_buf(k) * tanh( margin(k) )
+
+Zero-sum redistribution:
+- v_bar = (1/|A_t|) * sum_{k in A_t} v(k)   (if A_t empty => no redistribution)
+- For k in A_t:
+    r_bonus(k) = W * ( v(k) - v_bar )
+  For k in K_t \ A_t:
+    r_bonus(k) = 0
+
+Final per-key reward:
+  r(k) = r_base(k) + r_bonus(k)
+
+Alignment property (what you wanted):
+- sum_{k in A_t} r_bonus(k) = 0 (mean-subtracted)
+- sum_{k in K_t} r(k) = sum_{k in K_t} r_base(k) = D_t
+So: the ONLY way to increase episode total_reward is to increase total delivered messages.
+The context/progress term only redistributes credit among keys.
+
+
+Parameters (Python env vars; defaults are hardcoded)
+---------------------------------------------------
+Core:
+- ALIGNED_PROGRESS_WEIGHT = W
+- ALIGNED_CTX_MARGIN_TAU  = MARGIN_TAU
+
+Theta (dynamic selectivity):
+- ALIGNED_CTX_THETA0
+- ALIGNED_CTX_THETA_BUF
+- ALIGNED_CTX_THETA_RATE
+- ALIGNED_CTX_THETA_CONTACT
+- ALIGNED_CTX_THETA_PRED
+- ALIGNED_CTX_THETA_SELF
+- ALIGNED_CTX_THETA_PRESS
+
+Peer-quality gate:
+- ALIGNED_CTX_PEER_P_MID
+- ALIGNED_CTX_PEER_P_SIGMA
+
+Peer-buffer gate:
+- ALIGNED_CTX_PEER_BUF_MID
+- ALIGNED_CTX_PEER_BUF_SIGMA
+
+Confidence:
+- ALIGNED_CTX_CNT_TAU
+
+
+Practical Notes
+---------------
+1) `episode_rewards*_rmappo.csv` total_reward now directly tracks delivered count (sum over steps),
+   so "reward goes up but delivery goes down" should not happen anymore (metric alignment).
+2) If you want stronger shaping without breaking alignment metrics, increase W slowly (e.g., 0.1 -> 0.3 -> 0.5).
+3) If policy becomes too aggressive under high traffic, increase THETA_BUF / THETA_RATE (more selectivity).
+4) If policy refuses to relay under buffer pressure, increase THETA_PRESS / THETA_SELF (more offload bias).
