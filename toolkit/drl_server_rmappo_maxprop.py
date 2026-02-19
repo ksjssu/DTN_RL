@@ -4739,7 +4739,7 @@ SAC_DEFAULT_LOGPROB_EPS = 1e-6
 # Recurrent (RMA-SAC-style) defaults for MP_v1.
 # Note: MP_v1 step is often 100s (RmappoMaxpropBridgeReport.sampleInterval=100),
 # so seq_len=32 covers ~3200s of history, burn_in=8 covers ~800s.
-SAC_RNN_DEFAULT_ENABLE = False
+SAC_RNN_DEFAULT_ENABLE = True
 SAC_RNN_DEFAULT_SEQ_LEN = 32
 SAC_RNN_DEFAULT_BURN_IN = 8
 SAC_RNN_DEFAULT_BATCH_SEQS = 32

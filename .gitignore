@@ -51,6 +51,7 @@ backup/
 backup_reports/
 
 # Model files (large binaries)
+best_models/
 models_rmappo/
 models_masac/
 models_rmappo_export/
