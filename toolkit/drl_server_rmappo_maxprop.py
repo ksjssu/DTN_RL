@@ -4736,6 +4736,150 @@ SAC_DEFAULT_LOG_STD_MIN = -20.0
 SAC_DEFAULT_LOG_STD_MAX = 2.0
 SAC_DEFAULT_LOGPROB_EPS = 1e-6
 
+# Recurrent (RMA-SAC-style) defaults for MP_v1.
+# Note: MP_v1 step is often 100s (RmappoMaxpropBridgeReport.sampleInterval=100),
+# so seq_len=32 covers ~3200s of history, burn_in=8 covers ~800s.
+SAC_RNN_DEFAULT_ENABLE = False
+SAC_RNN_DEFAULT_SEQ_LEN = 32
+SAC_RNN_DEFAULT_BURN_IN = 8
+SAC_RNN_DEFAULT_BATCH_SEQS = 32
+SAC_RNN_DEFAULT_MIN_EPISODES = 64
+SAC_RNN_DEFAULT_MAX_EPISODES = 4096
+SAC_RNN_DEFAULT_UPDATES_PER_EPISODE_END = 8
+
+
+class RecurrentSquashedGaussianActor(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_size = int(hidden_size)
+
+        self.gru = nn.GRU(self.obs_dim, self.hidden_size, batch_first=True)
+        self.mu = nn.Linear(self.hidden_size, self.action_dim)
+        self.log_std = nn.Linear(self.hidden_size, self.action_dim)
+
+    def forward(self, obs_seq: "torch.Tensor", h0=None):
+        if obs_seq.ndim != 3 or obs_seq.shape[-1] != self.obs_dim:
+            raise ValueError(
+                f"[RecurrentActor] obs_seq shape mismatch: got {tuple(obs_seq.shape)} expected (*,*,{self.obs_dim})"
+            )
+        out, h1 = self.gru(obs_seq, h0)
+        mean = self.mu(out)
+        log_std = self.log_std(out)
+        log_std = torch.clamp(log_std, SAC_DEFAULT_LOG_STD_MIN, SAC_DEFAULT_LOG_STD_MAX)
+        return mean, log_std, h1
+
+    def sample(self, obs_seq: "torch.Tensor", h0=None):
+        mean, log_std, h1 = self.forward(obs_seq, h0=h0)
+        std = torch.exp(log_std)
+        normal = torch.distributions.Normal(mean, std)
+        x = normal.rsample()
+        y = torch.tanh(x)
+        logp = normal.log_prob(x) - torch.log(1.0 - y.pow(2) + SAC_DEFAULT_LOGPROB_EPS)
+        logp = logp.sum(dim=-1, keepdim=True)
+        mean_a = torch.tanh(mean)
+        return y, logp, mean_a, h1
+
+
+class RecurrentSACQNetwork(nn.Module):
+    def __init__(self, global_obs_dim: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.global_obs_dim = int(global_obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_size = int(hidden_size)
+
+        self.gru = nn.GRU(self.global_obs_dim, self.hidden_size, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_size + self.action_dim, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 1),
+        )
+
+    def encode(self, global_obs_seq: "torch.Tensor", h0=None):
+        if global_obs_seq.ndim != 3 or global_obs_seq.shape[-1] != self.global_obs_dim:
+            raise ValueError(
+                f"[RecurrentCritic] global_obs_seq shape mismatch: got {tuple(global_obs_seq.shape)} "
+                f"expected (*,*,{self.global_obs_dim})"
+            )
+        return self.gru(global_obs_seq, h0)
+
+    def forward(self, global_obs_seq: "torch.Tensor", action_seq: "torch.Tensor", h0=None):
+        if action_seq.ndim != 3 or action_seq.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"[RecurrentCritic] action_seq shape mismatch: got {tuple(action_seq.shape)} expected (*,*,{self.action_dim})"
+            )
+        out, h1 = self.encode(global_obs_seq, h0=h0)
+        x = torch.cat([out, action_seq], dim=-1)
+        b, t, d = x.shape
+        q = self.head(x.reshape(b * t, d)).reshape(b, t, 1)
+        return q, h1
+
+
+class RecurrentEpisodeReplay:
+    def __init__(self, max_episodes: int, obs_dim: int, global_obs_dim: int, action_dim: int):
+        self.max_episodes = int(max(1, max_episodes))
+        self.obs_dim = int(obs_dim)
+        self.global_obs_dim = int(global_obs_dim)
+        self.action_dim = int(action_dim)
+        self.episodes = []
+
+    def __len__(self):
+        return int(len(self.episodes))
+
+    def add_episode(self, ep: dict):
+        self.episodes.append(ep)
+        overflow = len(self.episodes) - self.max_episodes
+        if overflow > 0:
+            del self.episodes[:overflow]
+
+    def sample(self, batch_seqs: int, seq_len: int, device: "torch.device"):
+        if not self.episodes:
+            raise ValueError("No episodes in replay")
+        batch_seqs = int(max(1, batch_seqs))
+        seq_len = int(max(2, seq_len))
+
+        obs_b = np.zeros((batch_seqs, seq_len, self.obs_dim), dtype=np.float32)
+        gobs_b = np.zeros((batch_seqs, seq_len, self.global_obs_dim), dtype=np.float32)
+        act_b = np.zeros((batch_seqs, seq_len, self.action_dim), dtype=np.float32)
+        rew_b = np.zeros((batch_seqs, seq_len, 1), dtype=np.float32)
+        nobs_b = np.zeros((batch_seqs, seq_len, self.obs_dim), dtype=np.float32)
+        ngobs_b = np.zeros((batch_seqs, seq_len, self.global_obs_dim), dtype=np.float32)
+        done_b = np.ones((batch_seqs, seq_len, 1), dtype=np.float32)
+        mask_b = np.zeros((batch_seqs, seq_len, 1), dtype=np.float32)
+
+        for i in range(batch_seqs):
+            for _ in range(64):
+                ep = random.choice(self.episodes)
+                l = int(ep["obs"].shape[0])
+                if l >= seq_len:
+                    start = random.randint(0, l - seq_len)
+                    end = start + seq_len
+                    obs_b[i] = ep["obs"][start:end]
+                    gobs_b[i] = ep["gobs"][start:end]
+                    act_b[i] = ep["act"][start:end]
+                    rew_b[i, :, 0] = ep["rew"][start:end]
+                    nobs_b[i] = ep["nobs"][start:end]
+                    ngobs_b[i] = ep["ngobs"][start:end]
+                    done_b[i, :, 0] = ep["done"][start:end]
+                    mask_b[i, :, 0] = 1.0
+                    break
+            else:
+                raise ValueError("Not enough episode length for recurrent sampling")
+
+        return (
+            torch.as_tensor(obs_b, device=device),
+            torch.as_tensor(gobs_b, device=device),
+            torch.as_tensor(act_b, device=device),
+            torch.as_tensor(rew_b, device=device),
+            torch.as_tensor(nobs_b, device=device),
+            torch.as_tensor(ngobs_b, device=device),
+            torch.as_tensor(done_b, device=device),
+            torch.as_tensor(mask_b, device=device),
+        )
+
 
 class SACReplayBuffer:
     def __init__(self, capacity: int, obs_dim: int, global_obs_dim: int, action_dim: int):
@@ -5347,6 +5491,426 @@ class CTDESACPolicy:
             return {"ok": True, "meta": meta}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+
+class CTDERMASACPolicy(CTDESACPolicy):
+    """
+    Recurrent CTDE SAC (RMA-SAC style) for MP_v1.
+
+    - Actor/critic are GRU-based.
+    - Experience is stored as per-key (host) episodes; training samples subsequences.
+    - Training timing remains controlled by the server (episode_end-only by default).
+    """
+
+    def __init__(self, obs_dim: int, global_obs_dim: int, hidden_size: int, action_dim: int):
+        super().__init__(obs_dim, global_obs_dim, hidden_size, action_dim)
+
+        self.recurrent_enable = os.environ.get(
+            "MP_V1_SAC_RECURRENT", "true" if SAC_RNN_DEFAULT_ENABLE else "false"
+        ).lower() in ("1", "true", "yes")
+
+        seq_len = int(os.environ.get("SAC_RNN_SEQ_LEN", str(SAC_RNN_DEFAULT_SEQ_LEN)))
+        burn_in = int(os.environ.get("SAC_RNN_BURN_IN", str(SAC_RNN_DEFAULT_BURN_IN)))
+        batch_seqs = int(os.environ.get("SAC_RNN_BATCH_SEQS", str(SAC_RNN_DEFAULT_BATCH_SEQS)))
+        min_eps = int(os.environ.get("SAC_RNN_MIN_EPISODES", str(SAC_RNN_DEFAULT_MIN_EPISODES)))
+        max_eps = int(os.environ.get("SAC_RNN_MAX_EPISODES", str(SAC_RNN_DEFAULT_MAX_EPISODES)))
+        upd_ep_end = int(os.environ.get("SAC_RNN_UPDATES_PER_EPISODE_END", str(SAC_RNN_DEFAULT_UPDATES_PER_EPISODE_END)))
+
+        self.seq_len = max(2, seq_len)
+        self.burn_in = max(0, burn_in)
+        self.batch_seqs = max(1, batch_seqs)
+        self.min_episodes_to_train = max(1, min_eps)
+        self.updates_per_episode_end = max(1, upd_ep_end)
+
+        self.actor = RecurrentSquashedGaussianActor(self.obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q1 = RecurrentSACQNetwork(self.global_obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q2 = RecurrentSACQNetwork(self.global_obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q1_target = copy.deepcopy(self.q1).to(self.device)
+        self.q2_target = copy.deepcopy(self.q2).to(self.device)
+        for p in self.q1_target.parameters():
+            p.requires_grad_(False)
+        for p in self.q2_target.parameters():
+            p.requires_grad_(False)
+
+        actor_lr = float(os.environ.get("SAC_ACTOR_LR", str(SAC_DEFAULT_ACTOR_LR)))
+        critic_lr = float(os.environ.get("SAC_CRITIC_LR", str(SAC_DEFAULT_CRITIC_LR)))
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=critic_lr)
+
+        self.replay_ep = RecurrentEpisodeReplay(
+            max_episodes=max_eps,
+            obs_dim=self.obs_dim,
+            global_obs_dim=self.global_obs_dim,
+            action_dim=self.action_dim,
+        )
+        self._cur_ep = defaultdict(lambda: {"obs": [], "gobs": [], "act": [], "rew": [], "nobs": [], "ngobs": [], "done": []})
+        self._actor_h = {}
+
+        self.policy_id = "rmasac_maxprop_v1"
+
+        try:
+            print(
+                "[CTDERMASACPolicy] Recurrent enabled: "
+                f"seq_len={self.seq_len} burn_in={self.burn_in} batch_seqs={self.batch_seqs} "
+                f"min_eps={self.min_episodes_to_train} max_eps={max_eps} updates_ep_end={self.updates_per_episode_end}"
+            )
+        except Exception:
+            pass
+
+    def reset_hidden_states(self, episode_start=False):
+        if episode_start:
+            self._actor_h.clear()
+
+    def act_batch(self, obs_batch, delta_limit, keys, global_features=None):
+        if not self.recurrent_enable:
+            self.policy_id = "masac_maxprop_v1"
+            return super().act_batch(obs_batch, delta_limit, keys, global_features=global_features)
+
+        if not obs_batch:
+            return []
+        local_obs = torch.nan_to_num(self._to_tensor(obs_batch))
+        if local_obs.ndim != 2 or local_obs.shape[1] != self.obs_dim:
+            raise ValueError(f"[CTDERMASACPolicy] obs_dim mismatch: got {tuple(local_obs.shape)} expected (*,{self.obs_dim})")
+        batch_size = int(local_obs.shape[0])
+        if keys is not None and len(keys) != batch_size:
+            raise ValueError(f"[CTDERMASACPolicy] keys length mismatch: {len(keys)} vs batch {batch_size}")
+
+        if global_features is None or len(global_features) == 0:
+            gf_dim = max(0, self.global_obs_dim - self.obs_dim)
+            global_feat = torch.zeros((batch_size, gf_dim), dtype=torch.float32, device=self.device)
+        else:
+            global_feat = torch.nan_to_num(self._to_tensor(global_features))
+            if global_feat.ndim != 2 or global_feat.shape[0] != batch_size:
+                raise ValueError("[CTDERMASACPolicy] global_features batch mismatch")
+            if global_feat.shape[1] != (self.global_obs_dim - self.obs_dim):
+                raise ValueError("[CTDERMASACPolicy] global_features dim mismatch")
+
+        x = local_obs.unsqueeze(1)  # [B,1,D]
+        h0_list = []
+        for k in keys or []:
+            kk = str(k)
+            h = self._actor_h.get(kk)
+            if h is None:
+                h = torch.zeros((1, 1, self.hidden_size), dtype=torch.float32, device=self.device)
+            h0_list.append(h)
+        h0 = torch.cat(h0_list, dim=1) if h0_list else None  # [1,B,H]
+
+        with torch.no_grad():
+            if EVAL_ONLY:
+                mean, _, h1 = self.actor.forward(x, h0=h0)
+                a = torch.tanh(mean)
+            else:
+                a, _, _, h1 = self.actor.sample(x, h0=h0)
+        a = torch.nan_to_num(a[:, 0, :])
+
+        if h1 is not None and keys:
+            for i, k in enumerate(keys):
+                self._actor_h[str(k)] = h1[:, i:i + 1, :].detach()
+
+        scale = float(delta_limit) if (delta_limit is not None and float(delta_limit) > 0) else 1.0
+        a_scaled = torch.clamp(a * scale, min=-abs(scale), max=abs(scale))
+
+        global_obs = self._construct_global_obs(local_obs, global_feat)
+        a_store = a.detach().cpu().numpy().astype(np.float32)
+        local_store = local_obs.detach().cpu().numpy().astype(np.float32)
+        global_store = global_obs.detach().cpu().numpy().astype(np.float32)
+        for i, k in enumerate(keys or []):
+            self.last_actions[str(k)] = (local_store[i], global_store[i], a_store[i])
+
+        out = a_scaled.detach().cpu().numpy().tolist()
+        return out
+
+    def update(self, *args, **kwargs):
+        if not self.recurrent_enable:
+            self.policy_id = "masac_maxprop_v1"
+            return super().update(*args, **kwargs)
+
+        (
+            rewards_per_host,
+            rewards_per_key,
+            mapping_host_to_keys,
+            _delta_limit,
+        ) = (args[0], args[1], args[2], args[3])
+
+        done_keys = kwargs.get("done_keys")
+        train_now = kwargs.get("train_now", True)
+        step_id = int(kwargs.get("step_id", -1) or -1)
+        next_obs_batch = kwargs.get("next_obs_batch")
+        next_keys = kwargs.get("next_keys")
+        next_global_features = kwargs.get("next_global_features")
+
+        if not self.last_actions:
+            return {"updated": False, "ready_sequences": len(self.replay_ep)}
+
+        next_state_local = {}
+        next_state_global = {}
+        if next_obs_batch and next_keys:
+            next_local_t = torch.nan_to_num(self._to_tensor(next_obs_batch))
+            if next_local_t.ndim != 2 or next_local_t.shape[1] != self.obs_dim:
+                raise ValueError(
+                    f"[CTDERMASACPolicy] next_obs_dim mismatch: got {tuple(next_local_t.shape)} expected (*,{self.obs_dim})"
+                )
+            batch_n = int(next_local_t.shape[0])
+            if len(next_keys) != batch_n:
+                raise ValueError(f"[CTDERMASACPolicy] next_keys length mismatch: {len(next_keys)} vs {batch_n}")
+
+            if next_global_features is None or len(next_global_features) == 0:
+                gf_dim = max(0, self.global_obs_dim - self.obs_dim)
+                next_gf_t = torch.zeros((batch_n, gf_dim), dtype=torch.float32, device=self.device)
+            else:
+                next_gf_t = torch.nan_to_num(self._to_tensor(next_global_features))
+                if next_gf_t.ndim != 2 or next_gf_t.shape[0] != batch_n:
+                    raise ValueError("[CTDERMASACPolicy] next_global_features batch mismatch")
+                if next_gf_t.shape[1] != (self.global_obs_dim - self.obs_dim):
+                    raise ValueError("[CTDERMASACPolicy] next_global_features dim mismatch")
+
+            next_global_t = self._construct_global_obs(next_local_t, next_gf_t)
+            next_local_np = next_local_t.detach().cpu().numpy().astype(np.float32)
+            next_global_np = next_global_t.detach().cpu().numpy().astype(np.float32)
+            for i, k in enumerate(next_keys):
+                kk = str(k)
+                next_state_local[kk] = next_local_np[i]
+                next_state_global[kk] = next_global_np[i]
+
+        done_index = set(done_keys or [])
+
+        acted_by_host = defaultdict(list)
+        for k in self.last_actions.keys():
+            host = k.split("#", 1)[0] if "#" in k else ""
+            acted_by_host[host].append(k)
+
+        step_cap = int(getattr(self, "step_max_sequences", 0) or 0)
+        selected_keys = None
+        if step_cap > 0:
+            all_keys = list(self.last_actions.keys())
+            if len(all_keys) > step_cap:
+                random.shuffle(all_keys)
+                selected_keys = set(all_keys[:step_cap])
+
+        for host, acted_keys in acted_by_host.items():
+            if not acted_keys:
+                continue
+            r_host = float(rewards_per_host.get(host, 0.0) or 0.0)
+            r_each = r_host / float(len(acted_keys)) if acted_keys else 0.0
+            for k in acted_keys:
+                if selected_keys is not None and k not in selected_keys:
+                    continue
+                local_obs_np, global_obs_np, action_np = self.last_actions.get(k)
+                r = float(rewards_per_key.get(k, r_each) or 0.0)
+                done = (k in done_index)
+
+                if k in next_state_local:
+                    next_local_np = next_state_local[k]
+                    next_global_np = next_state_global[k]
+                else:
+                    next_local_np = local_obs_np
+                    next_global_np = global_obs_np
+                    done = True
+
+                ep = self._cur_ep[str(k)]
+                ep["obs"].append(local_obs_np)
+                ep["gobs"].append(global_obs_np)
+                ep["act"].append(action_np)
+                ep["rew"].append(float(r))
+                ep["nobs"].append(next_local_np)
+                ep["ngobs"].append(next_global_np)
+                ep["done"].append(1.0 if done else 0.0)
+
+                if done:
+                    # Host/key ended mid-episode; finalize this sequence early.
+                    try:
+                        n = len(ep["obs"])
+                        if n >= max(2, self.seq_len):
+                            self.replay_ep.add_episode(
+                                {
+                                    "obs": np.asarray(ep["obs"], dtype=np.float32).reshape(n, self.obs_dim),
+                                    "gobs": np.asarray(ep["gobs"], dtype=np.float32).reshape(n, self.global_obs_dim),
+                                    "act": np.asarray(ep["act"], dtype=np.float32).reshape(n, self.action_dim),
+                                    "rew": np.asarray(ep["rew"], dtype=np.float32).reshape(n,),
+                                    "nobs": np.asarray(ep["nobs"], dtype=np.float32).reshape(n, self.obs_dim),
+                                    "ngobs": np.asarray(ep["ngobs"], dtype=np.float32).reshape(n, self.global_obs_dim),
+                                    "done": np.asarray(ep["done"], dtype=np.float32).reshape(n,),
+                                }
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        del self._cur_ep[str(k)]
+                    except Exception:
+                        pass
+
+        self.last_actions.clear()
+
+        if not train_now:
+            return {"updated": False, "ready_sequences": len(self.replay_ep), "step_id": step_id}
+
+        # Training is handled by train_ready_sequences() at episode_end to match existing timing.
+        return {"updated": False, "ready_sequences": len(self.replay_ep), "step_id": step_id}
+
+    def finalize_all_sequences(self, force_terminal=False, allow_trim=False):
+        if not self.recurrent_enable:
+            self.policy_id = "masac_maxprop_v1"
+            return super().finalize_all_sequences(force_terminal=force_terminal, allow_trim=allow_trim)
+
+        # Convert any in-progress per-key episodes into replay episodes.
+        for k, data in list(self._cur_ep.items()):
+            try:
+                n = len(data["obs"])
+            except Exception:
+                n = 0
+            if n <= 0:
+                continue
+            if force_terminal:
+                try:
+                    data["done"][-1] = 1.0
+                except Exception:
+                    pass
+            try:
+                ep = {
+                    "obs": np.asarray(data["obs"], dtype=np.float32).reshape(n, self.obs_dim),
+                    "gobs": np.asarray(data["gobs"], dtype=np.float32).reshape(n, self.global_obs_dim),
+                    "act": np.asarray(data["act"], dtype=np.float32).reshape(n, self.action_dim),
+                    "rew": np.asarray(data["rew"], dtype=np.float32).reshape(n,),
+                    "nobs": np.asarray(data["nobs"], dtype=np.float32).reshape(n, self.obs_dim),
+                    "ngobs": np.asarray(data["ngobs"], dtype=np.float32).reshape(n, self.global_obs_dim),
+                    "done": np.asarray(data["done"], dtype=np.float32).reshape(n,),
+                }
+                if int(ep["obs"].shape[0]) >= max(2, self.seq_len):
+                    self.replay_ep.add_episode(ep)
+            except Exception:
+                pass
+
+        self._cur_ep.clear()
+        self.last_actions.clear()
+        self._actor_h.clear()
+        return {"ok": True, "episodes": len(self.replay_ep)}
+
+    def train_ready_sequences(self, force=False, consume_all=False):
+        if not self.recurrent_enable:
+            self.policy_id = "masac_maxprop_v1"
+            return super().train_ready_sequences(force=force, consume_all=consume_all)
+
+        if len(self.replay_ep) < self.min_episodes_to_train:
+            return {"updated": False, "reason": "warmup", "ready_sequences": len(self.replay_ep)}
+
+        n = self.updates_per_episode_end if consume_all else self.updates_per_train_call
+        return self._train_steps_recurrent(int(n))
+
+    def _soft_update(self, src: nn.Module, dst: nn.Module):
+        tau = float(self.tau)
+        with torch.no_grad():
+            for p, tp in zip(src.parameters(), dst.parameters()):
+                tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
+
+    def _train_steps_recurrent(self, n_updates: int):
+        n_updates = max(1, int(n_updates))
+
+        last_actor_loss = 0.0
+        last_critic_loss = 0.0
+        last_alpha_loss = 0.0
+        last_entropy = 0.0
+        last_alpha = self.alpha
+
+        burn = int(max(0, min(self.burn_in, self.seq_len - 1)))
+
+        for _ in range(n_updates):
+            obs, gobs, act, rew, nobs, ngobs, done, mask = self.replay_ep.sample(
+                self.batch_seqs, self.seq_len, self.device
+            )
+
+            if burn > 0:
+                obs_b = obs[:, :burn, :]
+                gobs_b = gobs[:, :burn, :]
+                nobs_b = nobs[:, :burn, :]
+                ngobs_b = ngobs[:, :burn, :]
+            else:
+                obs_b = gobs_b = nobs_b = ngobs_b = None
+
+            obs_l = obs[:, burn:, :]
+            gobs_l = gobs[:, burn:, :]
+            act_l = act[:, burn:, :]
+            rew_l = rew[:, burn:, :]
+            nobs_l = nobs[:, burn:, :]
+            ngobs_l = ngobs[:, burn:, :]
+            done_l = done[:, burn:, :]
+            mask_l = mask[:, burn:, :]
+
+            # Build initial h from burn-in (no grad) to avoid BPTT through the entire prefix.
+            with torch.no_grad():
+                h_a_obs = None
+                h_a_next = None
+                h_q1 = None
+                h_q2 = None
+                h_q1t = None
+                h_q2t = None
+                if burn > 0:
+                    _, _, h_a_obs = self.actor.forward(obs_b, h0=None)
+                    _, _, h_a_next = self.actor.forward(nobs_b, h0=None)
+                    _, h_q1 = self.q1.encode(gobs_b, h0=None)
+                    _, h_q2 = self.q2.encode(gobs_b, h0=None)
+                    _, h_q1t = self.q1_target.encode(ngobs_b, h0=None)
+                    _, h_q2t = self.q2_target.encode(ngobs_b, h0=None)
+
+            with torch.no_grad():
+                next_a, next_logp, _, _ = self.actor.sample(nobs_l, h0=h_a_next)
+                q1_t, _ = self.q1_target(ngobs_l, next_a, h0=h_q1t)
+                q2_t, _ = self.q2_target(ngobs_l, next_a, h0=h_q2t)
+                min_q_t = torch.min(q1_t, q2_t)
+                alpha_t = self.alpha
+                target_q = rew_l + (1.0 - done_l) * float(self.gamma) * (min_q_t - alpha_t * next_logp)
+
+            q1, _ = self.q1(gobs_l, act_l, h0=h_q1)
+            q2, _ = self.q2(gobs_l, act_l, h0=h_q2)
+            denom = torch.clamp(mask_l.sum(), min=1.0)
+            critic_loss = (((q1 - target_q).pow(2) + (q2 - target_q).pow(2)) * mask_l).sum() / denom
+
+            self.critic_opt.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            if self.grad_clip and self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), self.grad_clip)
+            self.critic_opt.step()
+
+            a_pi, logp_pi, _, _ = self.actor.sample(obs_l, h0=h_a_obs)
+            q1_pi, _ = self.q1(gobs_l, a_pi, h0=h_q1)
+            q2_pi, _ = self.q2(gobs_l, a_pi, h0=h_q2)
+            min_q_pi = torch.min(q1_pi, q2_pi)
+            alpha_val = self.alpha
+            actor_loss = ((alpha_val * logp_pi - min_q_pi) * mask_l).sum() / denom
+
+            self.actor_opt.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            if self.grad_clip and self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
+            self.actor_opt.step()
+
+            alpha_loss = torch.tensor(0.0, device=self.device)
+            if self.auto_alpha:
+                alpha_loss = -(
+                    self.log_alpha * ((logp_pi.detach() + float(self.target_entropy)) * mask_l).sum() / denom
+                )
+                self.alpha_opt.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                self.alpha_opt.step()
+
+            self._soft_update(self.q1, self.q1_target)
+            self._soft_update(self.q2, self.q2_target)
+
+            last_actor_loss = float(actor_loss.detach().cpu().item())
+            last_critic_loss = float(critic_loss.detach().cpu().item())
+            last_alpha_loss = float(alpha_loss.detach().cpu().item()) if alpha_loss is not None else 0.0
+            last_entropy = float(((-logp_pi) * mask_l).sum().detach().cpu().item() / float(denom.detach().cpu().item()))
+            last_alpha = float(self.alpha)
+
+        return {
+            "updated": True,
+            "trained_on": int(n_updates),
+            "policy_loss": last_actor_loss,
+            "value_loss": last_critic_loss,
+            "cost_value_loss": 0.0,
+            "entropy": last_entropy,
+            "alpha": last_alpha,
+            "alpha_loss": last_alpha_loss,
+        }
 
 
 class HeuristicPolicy:
@@ -8047,6 +8611,13 @@ def handle_rmappo_maxprop_v1(req):
             avg_overhead = (float(transferred) - float(delivered)) / float(delivered)
 
         try:
+            algo_tag = "masac"
+            try:
+                pid = getattr(getattr(Handler, "MP_V1_AGENT", None), "policy_id", "") or ""
+                if str(pid).lower().startswith("rmasac"):
+                    algo_tag = "rmasac"
+            except Exception:
+                algo_tag = "masac"
             drop_rate_metric = None
             if created > 0:
                 try:
@@ -8075,7 +8646,7 @@ def handle_rmappo_maxprop_v1(req):
                 buffer_size_mb=buffer_size_mb,
                 drop_rate=(None if drop_rate_metric is None else round(float(drop_rate_metric), 6)),
                 avg_energy_used=(None if avg_energy_used_metric is None else round(float(avg_energy_used_metric), 6)),
-                algo_tag="masac",
+                algo_tag=algo_tag,
             )
         except Exception:
             pass
@@ -8085,7 +8656,7 @@ def handle_rmappo_maxprop_v1(req):
                 sim_time=sim_time_end,
                 sim_id=sim_id,
                 buffer_size_mb=buffer_size_mb,
-                algo_tag="masac",
+                algo_tag=algo_tag,
             )
         except Exception:
             pass
@@ -8135,7 +8706,7 @@ def handle_rmappo_maxprop_v1(req):
             try:
                 metrics_with_sim = dict(train_result)
                 metrics_with_sim["sim_id"] = sim_id
-                log_update_metrics(sim_time_end, metrics_with_sim, buffer_size_mb, Handler.MP_V1_EP_COUNT, algo_tag="masac")
+                log_update_metrics(sim_time_end, metrics_with_sim, buffer_size_mb, Handler.MP_V1_EP_COUNT, algo_tag=algo_tag)
             except Exception:
                 pass
 
@@ -8158,7 +8729,7 @@ def handle_rmappo_maxprop_v1(req):
                 updates=int(Handler.MP_V1_EP_LOSS_UPDATE_COUNT or 0),
                 entropy_avg=entropy_avg,
                 buffer_size_mb=buffer_size_mb,
-                algo_tag="masac",
+                algo_tag=algo_tag,
             )
         except Exception:
             pass
@@ -8167,13 +8738,20 @@ def handle_rmappo_maxprop_v1(req):
         if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None and Handler.MP_V1_EP_COUNT > 0:
             try:
                 os.makedirs(MP_V1_MODEL_DIR, exist_ok=True)
+                prefix = "masac"
+                try:
+                    pid = getattr(getattr(Handler, "MP_V1_AGENT", None), "policy_id", "") or ""
+                    if str(pid).lower().startswith("rmasac"):
+                        prefix = "rmasac"
+                except Exception:
+                    prefix = "masac"
                 if buffer_size_mb:
-                    model_name = f"masac_maxprop_buf{int(buffer_size_mb)}_ep{Handler.MP_V1_EP_COUNT}.pt"
+                    model_name = f"{prefix}_maxprop_buf{int(buffer_size_mb)}_ep{Handler.MP_V1_EP_COUNT}.pt"
                 else:
-                    model_name = f"masac_maxprop_{sim_id or 'sim'}_ep{Handler.MP_V1_EP_COUNT}.pt"
+                    model_name = f"{prefix}_maxprop_{sim_id or 'sim'}_ep{Handler.MP_V1_EP_COUNT}.pt"
                 path = MP_V1_MODEL_PATH or os.path.join(MP_V1_MODEL_DIR, model_name)
                 res = Handler.MP_V1_AGENT.save(path)
-                print(f"[EPISODE_END] Saved MA-SAC MaxProp++ model ep{Handler.MP_V1_EP_COUNT}: {res.get('path')}")
+                print(f"[EPISODE_END] Saved {prefix.upper()} MaxProp++ model ep{Handler.MP_V1_EP_COUNT}: {res.get('path')}")
             except Exception as e:
                 print(f"[ERROR] Failed to save MP_V1 model: {e}")
 
@@ -8360,13 +8938,24 @@ def handle_rmappo_maxprop_v1(req):
             gf_dim = int(len(global_features)) if isinstance(global_features, list) else 0
             if gf_dim <= 0:
                 gf_dim = 5
-            Handler.MP_V1_AGENT = CTDESACPolicy(
-                obs_dim=obs_dim,
-                global_obs_dim=obs_dim + gf_dim,
-                hidden_size=LSTM_HIDDEN_SIZE,
-                action_dim=5,
-            )
-            Handler.MP_V1_AGENT.policy_id = "masac_maxprop_v1"
+            use_recurrent = os.environ.get(
+                "MP_V1_SAC_RECURRENT", "true" if SAC_RNN_DEFAULT_ENABLE else "false"
+            ).lower() in ("1", "true", "yes")
+            if use_recurrent:
+                Handler.MP_V1_AGENT = CTDERMASACPolicy(
+                    obs_dim=obs_dim,
+                    global_obs_dim=obs_dim + gf_dim,
+                    hidden_size=LSTM_HIDDEN_SIZE,
+                    action_dim=5,
+                )
+            else:
+                Handler.MP_V1_AGENT = CTDESACPolicy(
+                    obs_dim=obs_dim,
+                    global_obs_dim=obs_dim + gf_dim,
+                    hidden_size=LSTM_HIDDEN_SIZE,
+                    action_dim=5,
+                )
+                Handler.MP_V1_AGENT.policy_id = "masac_maxprop_v1"
             # For host-level MaxProp++ control, ingest all hosts each step by default.
             try:
                 Handler.MP_V1_AGENT.step_max_sequences = int(MP_V1_STEP_MAX_SEQUENCES)
