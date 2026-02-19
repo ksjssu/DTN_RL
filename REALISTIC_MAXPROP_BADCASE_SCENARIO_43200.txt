@@ -1,0 +1,107 @@
+Realistic MaxProp-Unfavorable Scenario (43200s) - Settings + Rationale
+====================================================================
+
+Goal
+----
+- Make a scenario that still looks "deployable in reality", but exposes MaxProp weaknesses:
+  - non-stationary traffic (phase changes + spikes)
+  - heterogeneous links (range/capacity changes + contention)
+  - heterogeneous energy budgets (nodes die / duty cycle)
+  - many short contacts (fast movers) + short TTL traffic
+  - time-varying graph (backhaul appears only after incident)
+
+Settings Files (same scenario, different routing)
+-------------------------------------------------
+- realistic_event_43200_maxprop_settings.txt
+- realistic_event_43200_prophet_settings.txt
+- realistic_event_43200_spraywait_settings.txt
+
+Run Commands
+------------
+- Compile once:
+  ./compile.sh
+
+- Run (batch, 1 run):
+  ./one.sh -b 1 realistic_event_43200_maxprop_settings.txt
+  ./one.sh -b 1 realistic_event_43200_prophet_settings.txt
+  ./one.sh -b 1 realistic_event_43200_spraywait_settings.txt
+
+Outputs are written under:
+- reports/
+
+Core Scenario Timeline
+----------------------
+- Simulation time: 0 .. 43200 seconds
+- Phase A (0..14400): background chatter (citizens/vehicles)
+- Phase B (14400..18000): incident spike (large media uploads + frequent status)
+- Phase C (18000..43200): recovery with periodic "aftershock" spikes + continued backhaul
+
+Host Groups (total 124 nodes; node count is constant, positions change due to mobility)
+------------------------------------------------------------------------------------
+- Group 1 (citizens, smartphones): 80 nodes, ShortestPathMapBasedMovement, BLE-like link
+  - buffer: 10M, speed: 0.5..1.8 m/s
+  - energy: 15000..25000 (default Group.*)
+
+- Group 2 (vehicles): 20 nodes, Wi-Fi Direct link (InterferenceLimitedInterface)
+  - buffer: 30M, speed: 4..18
+  - energy lower: 5000..9000, scan every 2s (more aggressive discovery)
+
+- Group 3 (responders): 8 nodes, BLE + Wi-Fi, short TTL
+  - buffer: 50M, speed: 6..22, msgTtl: 60s
+  - energy: 20000..30000, scan every 1s
+
+- Group 4 (drones): 6 nodes, DistanceCapacityInterface (capacity drops with distance)
+  - buffer: 20M, speed: 25..60, msgTtl: 15s
+  - duty cycling via activeTimes (periods of being "off")
+  - energy small: 2500..4500 (fast drain)
+
+- Group 5 (shelters / field hubs): 4 nodes, GridLocation (stationary), large buffer
+  - buffer: 200M, wifi, "infinite" energy (1e9) and scanInterval=0
+  - located within default world bounds (MovementModel.worldSize = 4500x3400)
+
+- Group 6 (backhaul buses): 6 nodes, MapRouteMovement (data/tram4.wkt)
+  - buffer: 200M, BLE + Wi-Fi
+  - active only after incident starts: activeTimes = 14400..43200
+
+Interfaces (to stress MaxProp with link heterogeneity)
+------------------------------------------------------
+- ble: SimpleBroadcastInterface, 200k, range 10
+- wifi: InterferenceLimitedInterface, 12M, range 120 (contention reduces effective rate)
+- droneWifi: DistanceCapacityInterface, range 250
+  - transmitSpeeds = 12M, 6M, 2M, 500k, 80k (distance buckets)
+
+Traffic (12 generators; realistic-ish but MaxProp-unfavorable)
+-------------------------------------------------------------
+- Background (Phase A): interval 30..60s, 5k..40k, hosts 0..100
+- Incident window (Phase B):
+  - citizens -> shelters: 200k..2M at 10..30s (below phone buffers but still heavy)
+  - responders -> shelters: 2k..20k at 2..4s (very frequent)
+  - drones -> shelters: 2k..15k at 3..6s (short TTL + short contacts)
+- Aftershock spikes (short bursts): 20k..200k at 2..6s, targeted to shelters
+- Post-incident low-rate: 5k..60k at 120..240s
+- Backhaul: shelters -> vehicles 50k..500k at 10..30s (keeps the graph time-varying)
+- Responder coordination + drone->responder quick tasks + vehicle->shelter crowd updates
+
+Why This Hurts MaxProp (intuition)
+---------------------------------
+- MaxProp's meeting-probability + transitive exchange assumes "recent past predicts near future".
+  - Here, the graph changes abruptly at t=14400 (incident + backhaul activation),
+    and drones/backhaul have duty cycles.
+- Dijkstra cost based on P(u,v) can be misled when capacity/contact-time dominate success.
+  - Short contacts + low BLE rate + bursts of large messages punish "probability-only" routing.
+- Queue scheduling + drop use a threshold/hop + cost ordering; under high burstiness,
+  the ordering can become systematically wrong for short-TTL or high-utility traffic.
+- Energy drain changes who is even available for scanning/transmission; MaxProp doesn't
+  model "future availability" explicitly.
+
+Reports Included (all three settings)
+-------------------------------------
+- MessageStatsReport
+- DeliveryRatePerIntervalReport (binSize=1800)
+- OverheadPerIntervalReport (binSize=1800)
+- BufferOccupancyReport
+- EnergyLevelReport (granularity=1800)
+- ContactTimesReport
+- MessageCopyCountReport (granularity=1800)
+- StepBinMetricsReport
+

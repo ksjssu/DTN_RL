@@ -119,12 +119,20 @@ import json
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import copy
 import math
 import os
+import re
+import sys
 import random
 import pathlib
 import time
-import numpy as np
+try:
+    import numpy as np
+    NP_OK = True
+except Exception:
+    np = None
+    NP_OK = False
 import traceback
 
 # ============================================================================
@@ -156,8 +164,550 @@ try:
 except Exception:
     TORCH_OK = False
 
+# If numpy is missing, force-disable torch-mode (training code depends on numpy).
+if TORCH_OK and not NP_OK:
+    TORCH_OK = False
+
 HOST = os.environ.get("DRL_HOST", "127.0.0.1")
-PORT = int(float(os.environ.get("DRL_PORT", "5010")))
+PORT = int(float(os.environ.get("DRL_PORT", "5011")))
+
+# ---------------------------------------------------------------------------
+# Report/log output directory helpers
+# ---------------------------------------------------------------------------
+def _default_report_output_dir():
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(here, os.pardir))
+        return os.path.join(repo_root, "reports")
+    except Exception:
+        return "reports"
+
+
+DEFAULT_REPORT_OUTPUT_DIR = _default_report_output_dir()
+
+
+def _sanitize_sim_id_for_filename(sim_id: str, max_len: int = 120) -> str:
+    s = str(sim_id or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("._-")
+    if not s:
+        return ""
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("._-")
+    return s
+
+
+def _canonical_sim_id_for_group_logs(sim_id: str) -> str:
+    """
+    Canonicalize sim_id for log *filenames* so batch sweeps (e.g., rng1..rng10)
+    append into a single per-scenario CSV while still keeping the original
+    sim_id inside each row.
+    """
+    s = str(sim_id or "").strip()
+    if not s:
+        return ""
+    # Common run-index suffix pattern used in this repo: "..._rng{N}"
+    s = re.sub(r"_rng\d+\b", "", s)
+    s = re.sub(r"_+", "_", s).strip("._-")
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Minimal, dependency-light server mode
+# ---------------------------------------------------------------------------
+# This repo's full R-MAPPO server depends on PyTorch and NumPy. For quick
+# end-to-end smoke tests and for environments that don't have those packages
+# installed, we still want a runnable server for the MaxProp++ v1 protocol.
+if __name__ == "__main__" and not TORCH_OK:
+    def _to_float(val, default=0.0):
+        try:
+            f = float(val)
+        except Exception:
+            return default
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+
+    def _to_int(val, default=0):
+        try:
+            i = int(float(val))
+        except Exception:
+            return default
+        return i
+
+    def _clamp(x, lo, hi):
+        try:
+            x = float(x)
+        except Exception:
+            x = lo
+        if not math.isfinite(lo):
+            lo = x
+        if not math.isfinite(hi):
+            hi = x
+        if lo > hi:
+            lo, hi = hi, lo
+        if x < lo:
+            return lo
+        if x > hi:
+            return hi
+        return x
+
+    def _clamp01(x):
+        if not math.isfinite(x):
+            return 0.0
+        if x < 0.0:
+            return 0.0
+        if x > 1.0:
+            return 1.0
+        return float(x)
+
+    def _compute_v1_reward(req):
+        mp_enable = os.environ.get("MP_V1_REWARD_ENABLE", "true").lower() in ("1", "true", "yes")
+        if not mp_enable:
+            return None
+        mp_form = os.environ.get("MP_V1_REWARD_FORM", "prod").strip().lower()
+        # Default scale reduced (1/100 of previous 1000.0) to keep value targets well-conditioned.
+        mp_scale = _to_float(os.environ.get("MP_V1_REWARD_SCALE", "10.0"), 10.0)
+        mp_eps = _to_float(os.environ.get("MP_V1_REWARD_EPS", "1e-6"), 1e-6)
+        # Defaults: prioritize delivery success while keeping mild pressure on overhead/energy.
+        # Tune via env vars as needed per scenario.
+        mp_a = _to_float(os.environ.get("MP_V1_ALPHA_SUCCESS", "4.0"), 4.0)
+        mp_b = _to_float(os.environ.get("MP_V1_BETA_OVERHEAD", "0"), 0.1)
+        mp_g = _to_float(os.environ.get("MP_V1_GAMMA_ENERGY", "0"), 0.5)
+        mp_d = _to_float(os.environ.get("MP_V1_DELTA_DROP", "0.0"), 0.0)
+        e_norm = _to_float(os.environ.get("MP_V1_ENERGY_RATE_NORM", "2.5"), 2.5)
+        e_mode = str(os.environ.get("MP_V1_ENERGY_RATE_MODE", "avg_per_host") or "").strip().lower()
+        if e_mode not in ("avg", "avg_per_host", "total"):
+            e_mode = "avg_per_host"
+        if not math.isfinite(e_norm) or e_norm <= 1e-12:
+            e_norm = 2.5
+        dt = _to_float(req.get("dt", 1.0), 1.0)
+        if not math.isfinite(dt) or dt <= 1e-9:
+            dt = 1.0
+        prev = req.get("prev_transition", []) or []
+        created = 0
+        transferred = 0
+        delivered = 0
+        dropped = 0
+        energy_used = 0.0
+        n_hosts = 0
+        for tr in prev:
+            if not isinstance(tr, dict):
+                continue
+            created += _to_int(tr.get("created_cnt", 0), 0)
+            transferred += _to_int(tr.get("transferred_cnt", 0), 0)
+            delivered += _to_int(tr.get("delivered_cnt", 0), 0)
+            dropped += _to_int(tr.get("dropped", 0), 0)
+            energy_used += _to_float(tr.get("energy_used", 0.0), 0.0)
+            n_hosts += 1
+
+        S = 0.0
+        if created > 0:
+            S = _clamp01(float(delivered) / float(created))
+        extra = max(0.0, float(transferred) - float(delivered))
+        O = _clamp01(extra / max(1.0, float(transferred)))
+        D = 0.0
+        if created > 0:
+            D = _clamp01(float(dropped) / float(created))
+        e_rate_total = max(0.0, float(energy_used)) / float(dt)
+        denom_hosts = float(max(1, int(n_hosts)))
+        e_rate_avg = e_rate_total / denom_hosts
+        e_rate_used = e_rate_total if e_mode == "total" else e_rate_avg
+        E = _clamp01(e_rate_used / max(1e-12, e_norm))
+
+        if mp_form == "log":
+            import math as _m
+            term_s = _m.log(max(mp_eps, S))
+            term_o = _m.log(max(mp_eps, O))
+            term_e = _m.log(max(mp_eps, 1.0 - E))
+            term_d = _m.log(max(mp_eps, 1.0 - D))
+            total = mp_scale * (
+                mp_a * term_s
+                + mp_b * term_o
+                + mp_g * term_e
+                + mp_d * term_d
+            )
+        else:
+            total = mp_scale * (
+                (max(mp_eps, S) ** mp_a)
+                * (max(mp_eps, O) ** mp_b)
+                * (max(mp_eps, 1.0 - E) ** mp_g)
+                * (max(mp_eps, 1.0 - D) ** mp_d)
+            )
+
+        return {
+            "total": float(total),
+            "S": float(S),
+            "O": float(O),
+            "E": float(E),
+            "D": float(D),
+            "form": str(mp_form),
+            "scale": float(mp_scale),
+            "energy_rate_total": float(e_rate_total),
+            "energy_rate_avg": float(e_rate_avg),
+            "energy_rate_mode": str(e_mode),
+            "energy_rate_norm": float(e_norm),
+            "created": int(created),
+            "transferred": int(transferred),
+            "delivered": int(delivered),
+            "dropped": int(dropped),
+            "energy_used": float(energy_used),
+            "n_hosts": int(n_hosts),
+        }
+
+    def _handle(req):
+        mode = str(req.get("mode", "")).strip().lower()
+        if mode == "episode_end":
+            # Minimal-mode episode logging: keep the same CSV filenames as torch mode.
+            try:
+                sim_id = str(req.get("sim_id", "") or "")
+            except Exception:
+                sim_id = ""
+            try:
+                sim_time_end = int(float(req.get("time", 0) or 0))
+            except Exception:
+                sim_time_end = 0
+
+            def _extract_buf(sim_id_s):
+                try:
+                    import re
+                    m = re.search(r'buf(\d+)', str(sim_id_s or "").lower())
+                    return float(m.group(1)) if m else None
+                except Exception:
+                    return None
+
+            buffer_size_mb = _extract_buf(sim_id)
+            base_dir = os.environ.get(
+                "REPORT_OUTPUT_DIR",
+                os.environ.get("REPORT_DIR", DEFAULT_REPORT_OUTPUT_DIR),
+            )
+            reward_dir = os.path.join(base_dir, "reward_logs")
+            train_dir = os.path.join(base_dir, "train_logs")
+            os.makedirs(reward_dir, exist_ok=True)
+            os.makedirs(train_dir, exist_ok=True)
+
+            # Use accumulated totals from this minimal server process.
+            try:
+                HandlerMin.EP_COUNT += 1
+            except Exception:
+                pass
+
+            created = int(getattr(HandlerMin, "CREATED_SUM", 0) or 0)
+            delivered = int(getattr(HandlerMin, "DELIVERED_SUM", 0) or 0)
+            transferred = int(getattr(HandlerMin, "TRANSFERRED_SUM", 0) or 0)
+            dropped = int(getattr(HandlerMin, "DROPPED_SUM", 0) or 0)
+            total_reward = float(getattr(HandlerMin, "REWARD_SUM", 0.0) or 0.0)
+            combo_reward = float(getattr(HandlerMin, "COMBO_SUM", 0.0) or 0.0)
+
+            avg_delivery_rate = (float(delivered) / float(created)) if created > 0 else ""
+            avg_overhead = ((float(transferred) - float(delivered)) / float(delivered)) if delivered > 0 else ""
+
+            reward_files = []
+            loss_files = []
+            upd_files = []
+            if buffer_size_mb:
+                reward_files = [os.path.join(reward_dir, f"episode_rewards_buf{int(buffer_size_mb)}M_rmappo.csv")]
+                loss_files = [os.path.join(train_dir, f"episode_losses_buf{int(buffer_size_mb)}M_rmappo.csv")]
+                upd_files = [os.path.join(train_dir, f"update_metrics_buf{int(buffer_size_mb)}M_rmappo.csv")]
+            else:
+                safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(sim_id))
+                if safe_sim:
+                    reward_files.append(os.path.join(reward_dir, f"episode_rewards_{safe_sim}_rmappo.csv"))
+                    loss_files.append(os.path.join(train_dir, f"episode_losses_{safe_sim}_rmappo.csv"))
+                    upd_files.append(os.path.join(train_dir, f"update_metrics_{safe_sim}_rmappo.csv"))
+                reward_files.append(os.path.join(reward_dir, "episode_rewards_rmappo.csv"))
+                loss_files.append(os.path.join(train_dir, "episode_losses_rmappo.csv"))
+                upd_files.append(os.path.join(train_dir, "update_metrics_rmappo.csv"))
+
+            def _append_csv(path, header, row):
+                write_header = not os.path.exists(path)
+                with open(path, "a", encoding="utf-8") as f:
+                    if write_header:
+                        f.write(header + "\n")
+                    f.write(row + "\n")
+
+            # Record MP v1 reward parameters (so we can verify env overrides applied).
+            try:
+                mp_enable = os.environ.get("MP_V1_REWARD_ENABLE", "true").lower() in ("1", "true", "yes")
+                mp_form = os.environ.get("MP_V1_REWARD_FORM", "prod").strip().lower()
+                mp_scale = _to_float(os.environ.get("MP_V1_REWARD_SCALE", "10.0"), 10.0)
+                mp_eps = _to_float(os.environ.get("MP_V1_REWARD_EPS", "1e-6"), 1e-6)
+                mp_a = _to_float(os.environ.get("MP_V1_ALPHA_SUCCESS", "1.0"), 1.0)
+                mp_b = _to_float(os.environ.get("MP_V1_BETA_OVERHEAD", "0.0"), 0.0)
+                mp_g = _to_float(os.environ.get("MP_V1_GAMMA_ENERGY", "0.0"), 0.0)
+                mp_d = _to_float(os.environ.get("MP_V1_DELTA_DROP", "0.0"), 0.0)
+                e_norm = _to_float(os.environ.get("MP_V1_ENERGY_RATE_NORM", "2.5"), 2.5)
+                e_mode = str(os.environ.get("MP_V1_ENERGY_RATE_MODE", "avg_per_host") or "").strip().lower()
+                if e_mode not in ("avg", "avg_per_host", "total"):
+                    e_mode = "avg_per_host"
+                if not math.isfinite(e_norm) or e_norm <= 1e-12:
+                    e_norm = 2.5
+
+                safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(sim_id))
+                param_files = []
+                if buffer_size_mb:
+                    param_files.append(os.path.join(reward_dir, f"reward_parameters_mp_v1_buf{int(buffer_size_mb)}M_rmappo.csv"))
+                else:
+                    if safe_sim:
+                        param_files.append(os.path.join(reward_dir, f"reward_parameters_mp_v1_{safe_sim}_rmappo.csv"))
+                    param_files.append(os.path.join(reward_dir, "reward_parameters_mp_v1_rmappo.csv"))
+
+                header = (
+                    "episode,sim_time,sim_id,MP_V1_REWARD_ENABLE,MP_V1_REWARD_FORM,"
+                    "MP_V1_REWARD_SCALE,MP_V1_REWARD_EPS,MP_V1_ALPHA_SUCCESS,MP_V1_BETA_OVERHEAD,"
+                    "MP_V1_GAMMA_ENERGY,MP_V1_DELTA_DROP,MP_V1_ENERGY_RATE_NORM,MP_V1_ENERGY_RATE_MODE"
+                )
+                ep_num = getattr(HandlerMin, "EP_COUNT", 1)
+                row = (
+                    f"{ep_num},{sim_time_end},{sim_id},{1 if mp_enable else 0},{mp_form},"
+                    f"{mp_scale},{mp_eps},{mp_a},{mp_b},{mp_g},{mp_d},{e_norm},{e_mode}"
+                )
+                for pf in param_files:
+                    # Backward-compatible: if an older header exists, write to a new *_v2.csv
+                    try:
+                        if os.path.exists(pf):
+                            with open(pf, "r", encoding="utf-8") as rf:
+                                first = (rf.readline() or "").strip()
+                            if first and "MP_V1_ENERGY_RATE_MODE" not in first:
+                                if pf.lower().endswith(".csv"):
+                                    pf = pf[:-4] + "_v2.csv"
+                    except Exception:
+                        pass
+                    _append_csv(pf, header, row)
+            except Exception:
+                pass
+
+            ep_num = getattr(HandlerMin, "EP_COUNT", 1)
+            for ep_reward_file in reward_files:
+                _append_csv(
+                    ep_reward_file,
+                    "episode,sim_id,total_reward,combo_reward,avg_delivery_rate,delivered,created,avg_overhead,avg_delay",
+                    f"{ep_num},{sim_id},{round(total_reward,6)},{round(combo_reward,6)},"
+                    f"{avg_delivery_rate},{delivered},{created},{avg_overhead},",
+                )
+            for ep_loss_file in loss_files:
+                # episode_losses (no training in minimal mode)
+                _append_csv(
+                    ep_loss_file,
+                    "episode,sim_id,actor_loss_avg,critic_loss_avg,cost_critic_loss_avg,updates,entropy_avg",
+                    f"{ep_num},{sim_id},,,,,0,",
+                )
+            for upd_file in upd_files:
+                # update_metrics (no update in minimal mode)
+                _append_csv(
+                    upd_file,
+                    "episode,sim_time,ratio_mean,ratio_std,kl,std_mean,adv_var,cost_value_loss",
+                    f"{ep_num},{sim_time_end},0,0,0,0,0,0",
+                )
+
+            # Reset accumulators for next episode
+            HandlerMin.REWARD_SUM = 0.0
+            HandlerMin.COMBO_SUM = 0.0
+            HandlerMin.CREATED_SUM = 0
+            HandlerMin.TRANSFERRED_SUM = 0
+            HandlerMin.DELIVERED_SUM = 0
+            HandlerMin.DROPPED_SUM = 0
+
+            return {"policy_id": "heuristic_v1", "status": "episode_end_ack", "actions": []}
+
+        action_spec = req.get("action_spec") or {}
+        lam_min = _to_float(action_spec.get("lambda_cost_min", 0.0), 0.0)
+        lam_max = _to_float(action_spec.get("lambda_cost_max", 2.0), 2.0)
+        tau_min = _to_float(action_spec.get("tau_age_min", 0.0), 0.0)
+        tau_max = _to_float(action_spec.get("tau_age_max", 3600.0), 3600.0)
+        beta_min = _to_float(action_spec.get("beta_x_min", 0.0), 0.0)
+        beta_max = _to_float(action_spec.get("beta_x_max", 1.0), 1.0)
+        kx_min = _to_float(action_spec.get("k_x_min", 0.1), 0.1)
+        kx_max = _to_float(action_spec.get("k_x_max", 2.0), 2.0)
+        mr_min = _to_float(action_spec.get("m_relay_min", -1e9), -1e9)
+        mr_max = _to_float(action_spec.get("m_relay_max", 5.0), 5.0)
+
+        tau_default = 600.0
+        beta_default = 0.2
+        kx_default = 1.0
+
+        action_scope = str(req.get("action_scope", "")).strip().lower()
+
+        items = (req.get("state_batch") or [])
+        reward_debug = _compute_v1_reward(req)
+        mp_debug_print = os.environ.get("MP_V1_REWARD_DEBUG_PRINT", "false").lower() in ("1", "true", "yes")
+        if reward_debug is not None and mp_debug_print:
+            try:
+                step_id = int(float(req.get("step_id", -1) or -1))
+            except Exception:
+                step_id = -1
+            print(
+                "[MP_V1_REWARD] "
+                f"step={step_id} total={reward_debug.get('total', 0.0):.6f} "
+                f"S={reward_debug.get('S', 0.0):.3f} O={reward_debug.get('O', 0.0):.3f} "
+                f"E={reward_debug.get('E', 0.0):.3f} D={reward_debug.get('D', 0.0):.3f} "
+                f"e_rate={reward_debug.get('energy_rate', 0.0):.6f} "
+                f"e_norm={reward_debug.get('energy_rate_norm', 0.0):.6f}"
+            )
+        # Accumulate episode totals for logging at episode_end.
+        if reward_debug is not None:
+            try:
+                HandlerMin.REWARD_SUM = float(getattr(HandlerMin, "REWARD_SUM", 0.0) or 0.0) + float(reward_debug.get("total", 0.0) or 0.0)
+                HandlerMin.COMBO_SUM = float(getattr(HandlerMin, "COMBO_SUM", 0.0) or 0.0) + float(reward_debug.get("total", 0.0) or 0.0)
+                HandlerMin.CREATED_SUM = int(getattr(HandlerMin, "CREATED_SUM", 0) or 0) + int(reward_debug.get("created", 0) or 0)
+                HandlerMin.TRANSFERRED_SUM = int(getattr(HandlerMin, "TRANSFERRED_SUM", 0) or 0) + int(reward_debug.get("transferred", 0) or 0)
+                HandlerMin.DELIVERED_SUM = int(getattr(HandlerMin, "DELIVERED_SUM", 0) or 0) + int(reward_debug.get("delivered", 0) or 0)
+                HandlerMin.DROPPED_SUM = int(getattr(HandlerMin, "DROPPED_SUM", 0) or 0) + int(reward_debug.get("dropped", 0) or 0)
+            except Exception:
+                pass
+        if action_scope in ("global", "shared"):
+            e_sum = 0.0
+            b_sum = 0.0
+            n = 0
+            for item in items:
+                obs = item.get("obs") or []
+                e_norm = _to_float(obs[0], 0.5) if len(obs) > 0 else 0.5
+                buf_occ = _to_float(obs[3], 0.0) if len(obs) > 3 else 0.0
+                e_sum += e_norm
+                b_sum += buf_occ
+                n += 1
+
+            e_avg = (e_sum / n) if n > 0 else 0.5
+            b_avg = (b_sum / n) if n > 0 else 0.0
+
+            lam = lam_min
+            tau = _clamp(tau_default, tau_min, tau_max)
+            beta = _clamp(beta_default, beta_min, beta_max)
+            kx = _clamp(kx_default, kx_min, kx_max)
+            mr = mr_min
+
+            if b_avg >= 0.85 or e_avg <= 0.20:
+                lam = _clamp(lam_min + 0.5 * (lam_max - lam_min), lam_min, lam_max)
+                kx = _clamp(0.7, kx_min, kx_max)
+                mr = _clamp(0.2, mr_min, mr_max)
+
+            actions = []
+            for item in items:
+                host = str(item.get("host", ""))
+                if not host:
+                    continue
+                actions.append({
+                    "host": host,
+                    "lambda_cost": float(lam),
+                    "tau_age": float(tau),
+                    "beta_x": float(beta),
+                    "k_x": float(kx),
+                    "m_relay": float(mr),
+                })
+
+            return {
+                "policy_id": "heuristic_v1",
+                "action_global": {
+                    "lambda_cost": float(lam),
+                    "tau_age": float(tau),
+                    "beta_x": float(beta),
+                    "k_x": float(kx),
+                    "m_relay": float(mr),
+                },
+                "actions": actions,
+                "reward_debug": reward_debug,
+            }
+
+        actions = []
+        for item in items:
+            host = str(item.get("host", ""))
+            if not host:
+                continue
+            obs = item.get("obs") or []
+            e_norm = _to_float(obs[0], 0.5) if len(obs) > 0 else 0.5
+            buf_occ = _to_float(obs[3], 0.0) if len(obs) > 3 else 0.0
+
+            lam = lam_min
+            tau = _clamp(tau_default, tau_min, tau_max)
+            beta = _clamp(beta_default, beta_min, beta_max)
+            kx = _clamp(kx_default, kx_min, kx_max)
+            mr = mr_min
+
+            if buf_occ >= 0.85 or e_norm <= 0.20:
+                lam = _clamp(lam_min + 0.5 * (lam_max - lam_min), lam_min, lam_max)
+                kx = _clamp(0.7, kx_min, kx_max)
+                mr = _clamp(0.2, mr_min, mr_max)
+
+            actions.append({
+                "host": host,
+                "lambda_cost": float(lam),
+                "tau_age": float(tau),
+                "beta_x": float(beta),
+                "k_x": float(kx),
+                "m_relay": float(mr),
+            })
+
+        return {"policy_id": "heuristic_v1", "actions": actions, "reward_debug": reward_debug}
+
+    class HandlerMin:
+        EP_COUNT = 0
+        REWARD_SUM = 0.0
+        COMBO_SUM = 0.0
+        CREATED_SUM = 0
+        TRANSFERRED_SUM = 0
+        DELIVERED_SUM = 0
+        DROPPED_SUM = 0
+
+    class _MinimalHandler(BaseHTTPRequestHandler):
+        def _safe_write(self, payload):
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_POST(self):
+            if self.path != "/infer_and_update":
+                self.send_response(404)
+                self.end_headers()
+                self._safe_write(b"Not Found")
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                req = json.loads(raw.decode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self._safe_write(("Bad Request: %s" % e).encode("utf-8"))
+                return
+
+            proto = str(req.get("protocol", "")).strip()
+            if proto != "rmappo_maxprop_v1":
+                self.send_response(400)
+                self.end_headers()
+                self._safe_write(b"Unsupported protocol")
+                return
+
+            resp_obj = _handle(req)
+            body = json.dumps(resp_obj).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self._safe_write(body)
+
+    print(f"[BOOT] torch unavailable; starting minimal MaxProp++ v1 server at http://{HOST}:{PORT}/infer_and_update")
+    try:
+        _mp_scale_dbg = os.environ.get("MP_V1_REWARD_SCALE", "10.0")
+        _mp_form_dbg = os.environ.get("MP_V1_REWARD_FORM", "prod")
+        _mp_enorm_dbg = os.environ.get("MP_V1_ENERGY_RATE_NORM", "2.5")
+        _mp_emode_dbg = os.environ.get("MP_V1_ENERGY_RATE_MODE", "avg_per_host")
+        print(f"[BOOT] MP_V1_REWARD_SCALE={_mp_scale_dbg} MP_V1_REWARD_FORM={_mp_form_dbg} MP_V1_ENERGY_RATE_NORM={_mp_enorm_dbg} MP_V1_ENERGY_RATE_MODE={_mp_emode_dbg}")
+    except Exception:
+        pass
+    srv = HTTPServer((HOST, PORT), _MinimalHandler)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    sys.exit(0)
 
 # R-MAPPO specific configurations
 LSTM_HIDDEN_SIZE = int(os.environ.get("LSTM_HIDDEN_SIZE", "128"))
@@ -171,9 +721,17 @@ PPO_LAYER_NORM = os.environ.get("PPO_LAYER_NORM", "false").lower() in ("1", "tru
 # Action logging configuration
 PPO_DEBUG_ACTIONS = os.environ.get("PPO_DEBUG_ACTIONS", "false").lower() == "true"
 
+# MP v1 action logging (episode-level aggregates). Default ON.
+# Set MP_V1_ACTION_LOG_ENABLE=0 to disable.
+MP_V1_ACTION_LOG_ENABLE = os.environ.get("MP_V1_ACTION_LOG_ENABLE", "true").lower() in ("1", "true", "yes")
+MP_V1_ACTION_LOG_PATH = os.environ.get("MP_V1_ACTION_LOG_PATH", "").strip()
+
 # Step-by-step reward tracking configuration
 STEP_REWARD_TRACKING = os.environ.get("STEP_REWARD_TRACKING", "true").lower() == "true"
-REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", os.environ.get("REPORT_DIR", "reports"))
+REPORT_OUTPUT_DIR = os.environ.get(
+    "REPORT_OUTPUT_DIR",
+    os.environ.get("REPORT_DIR", DEFAULT_REPORT_OUTPUT_DIR),
+)
 SCRIPT_BASENAME = os.path.basename(__file__) if "__file__" in globals() else "drl_server_rmappo.py"
 
 # ============================================================================
@@ -253,7 +811,7 @@ COMBO_FORM = os.environ.get("COMBO_FORM", "prod").strip().lower()  # 'prod' or '
 COMBO_ALPHA = float(os.environ.get("COMBO_ALPHA", "1.3"))  # success exponent
 COMBO_BETA = float(os.environ.get("COMBO_BETA", "4.0"))   # (1-overhead) exponent
 COMBO_EPS = float(os.environ.get("COMBO_EPS", "1e-6"))
-COMBO_SCALE = float(os.environ.get("COMBO_SCALE", "500000.0"))
+COMBO_SCALE = float(os.environ.get("COMBO_SCALE", "500000000.0"))
 # When true, suppress existing overhead reward-shaping to avoid double-counting
 COMBO_SUPPRESS_OVERHEAD_SHAPING = os.environ.get("COMBO_SUPPRESS_OVERHEAD_SHAPING", "true").lower() in ("1", "true", "yes")
 # When true, suppress reward-level constraint penalty shaping (combo acts as main reward)
@@ -279,6 +837,34 @@ if COMBO_IMMEDIATE_TTL_EXP_K < 0.0:
     COMBO_IMMEDIATE_TTL_EXP_K = 0.0
 # Delay (in steps) before computing true delivery rate for a step
 COMBO_HINDSIGHT_DELAY_STEPS = int(os.environ.get("COMBO_HINDSIGHT_DELAY_STEPS", "50"))
+
+# ============================================================================
+# MaxProp++ v1 (parameter-control) reward configuration
+# ============================================================================
+MP_V1_REWARD_ENABLE = os.environ.get("MP_V1_REWARD_ENABLE", "true").lower() in ("1", "true", "yes")
+MP_V1_REWARD_FORM = os.environ.get("MP_V1_REWARD_FORM", "prod").strip().lower()  # 'prod' or 'log'
+MP_V1_REWARD_SCALE = float(os.environ.get("MP_V1_REWARD_SCALE", "10.0"))
+MP_V1_REWARD_EPS = float(os.environ.get("MP_V1_REWARD_EPS", str(COMBO_EPS)))
+
+# MP v1 reward weights (defaults tuned to prioritize delivery success).
+# - alpha: emphasize delivery success
+# - beta/gamma: mild pressure on overhead/energy so solutions remain realistic
+MP_V1_ALPHA_SUCCESS = float(os.environ.get("MP_V1_ALPHA_SUCCESS", "4.0"))
+MP_V1_BETA_OVERHEAD = float(os.environ.get("MP_V1_BETA_OVERHEAD", "0.1"))
+MP_V1_GAMMA_ENERGY = float(os.environ.get("MP_V1_GAMMA_ENERGY", "0.5"))
+MP_V1_DELTA_DROP = float(os.environ.get("MP_V1_DELTA_DROP", "0.0"))
+
+# Normalize energy consumption rate (energy/sec) into [0,1] using this scale.
+# You will likely want to tune this per-scenario/energy model.
+MP_V1_ENERGY_RATE_NORM = float(os.environ.get("MP_V1_ENERGY_RATE_NORM", "2.5"))
+if not math.isfinite(MP_V1_ENERGY_RATE_NORM) or MP_V1_ENERGY_RATE_NORM <= 1e-12:
+    MP_V1_ENERGY_RATE_NORM = 2.5
+MP_V1_ENERGY_RATE_MODE = str(os.environ.get("MP_V1_ENERGY_RATE_MODE", "avg_per_host") or "").strip().lower()
+if MP_V1_ENERGY_RATE_MODE not in ("avg", "avg_per_host", "total"):
+    MP_V1_ENERGY_RATE_MODE = "avg_per_host"
+
+# Print per-step MP v1 reward diagnostics (useful for setting MP_V1_ENERGY_RATE_NORM).
+MP_V1_REWARD_DEBUG_PRINT = os.environ.get("MP_V1_REWARD_DEBUG_PRINT", "false").lower() in ("1", "true", "yes")
 
 # Reward mixer (non-fix reward network) configuration
 NON_FIX_REWARD_NETWORK = os.environ.get("NON_FIX_REWARD_NETWORK", "false").lower() in ("1", "true", "yes")
@@ -376,12 +962,12 @@ if _log_std_init_raw:
     except Exception:
         LOG_STD_INIT = 0.0
 else:
-    preset = os.environ.get("LOG_STD_INIT_PRESET", "zero").strip().lower()
+    preset = os.environ.get("LOG_STD_INIT_PRESET", "negative").strip().lower()
     if preset in ("negative", "neg", "low", "-1", "-1.0"):
         LOG_STD_INIT = -1.0
     else:
         LOG_STD_INIT = 0.0
-_log_std_max_raw = os.environ.get("LOG_STD_MAX", "").strip()
+_log_std_max_raw = os.environ.get("LOG_STD_MAX", "2.0").strip()
 if _log_std_max_raw:
     try:
         LOG_STD_MAX = float(_log_std_max_raw)
@@ -776,6 +1362,68 @@ def log_reward_parameters(episode_num, sim_time, buffer_size_mb=None):
         pass
 
 
+def log_mp_v1_reward_parameters(episode_num, sim_time, sim_id=None, buffer_size_mb=None, algo_tag="rmappo"):
+    """Record MaxProp++ v1 (parameter-control) reward parameters once per episode."""
+    try:
+        if not sim_id:
+            sim_id = ""
+        algo_tag = str(algo_tag or "rmappo").strip().lower()
+        base_dir = REPORT_OUTPUT_DIR if 'REPORT_OUTPUT_DIR' in globals() else "reports"
+        log_dir = os.path.join(base_dir, "reward_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        log_files = []
+        if buffer_size_mb:
+            log_files.append(os.path.join(log_dir, f"reward_parameters_mp_v1_buf{int(buffer_size_mb)}M_{algo_tag}.csv"))
+        else:
+            safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(sim_id))
+            if safe_sim:
+                log_files.append(os.path.join(log_dir, f"reward_parameters_mp_v1_{safe_sim}_{algo_tag}.csv"))
+            log_files.append(os.path.join(log_dir, f"reward_parameters_mp_v1_{algo_tag}.csv"))
+
+        cols = [
+            "episode", "sim_time", "sim_id",
+            "MP_V1_REWARD_ENABLE", "MP_V1_REWARD_FORM",
+            "MP_V1_REWARD_SCALE", "MP_V1_REWARD_EPS",
+            "MP_V1_ALPHA_SUCCESS", "MP_V1_BETA_OVERHEAD", "MP_V1_GAMMA_ENERGY", "MP_V1_DELTA_DROP",
+            "MP_V1_ENERGY_RATE_NORM", "MP_V1_ENERGY_RATE_MODE",
+        ]
+        row = {
+            "episode": episode_num,
+            "sim_time": sim_time,
+            "sim_id": sim_id,
+            "MP_V1_REWARD_ENABLE": int(1 if MP_V1_REWARD_ENABLE else 0),
+            "MP_V1_REWARD_FORM": str(MP_V1_REWARD_FORM),
+            "MP_V1_REWARD_SCALE": float(MP_V1_REWARD_SCALE),
+            "MP_V1_REWARD_EPS": float(MP_V1_REWARD_EPS),
+            "MP_V1_ALPHA_SUCCESS": float(MP_V1_ALPHA_SUCCESS),
+            "MP_V1_BETA_OVERHEAD": float(MP_V1_BETA_OVERHEAD),
+            "MP_V1_GAMMA_ENERGY": float(MP_V1_GAMMA_ENERGY),
+            "MP_V1_DELTA_DROP": float(MP_V1_DELTA_DROP),
+            "MP_V1_ENERGY_RATE_NORM": float(MP_V1_ENERGY_RATE_NORM),
+            "MP_V1_ENERGY_RATE_MODE": str(MP_V1_ENERGY_RATE_MODE),
+        }
+
+        for log_file in log_files:
+            # Backward-compatible: if an older header exists, write to a new *_v2.csv
+            try:
+                if os.path.exists(log_file):
+                    with open(log_file, "r", encoding="utf-8") as rf:
+                        first = (rf.readline() or "").strip()
+                    if first and "MP_V1_ENERGY_RATE_MODE" not in first:
+                        if log_file.lower().endswith(".csv"):
+                            log_file = log_file[:-4] + "_v2.csv"
+            except Exception:
+                pass
+            write_header = not os.path.exists(log_file)
+            with open(log_file, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write(",".join(cols) + "\n")
+                f.write(",".join(str(row[c]) for c in cols) + "\n")
+    except Exception:
+        pass
+
+
 def accumulate_episode_totals(episode_num, components):
     """Accumulate per-episode sums of the active reward components."""
     try:
@@ -1144,89 +1792,153 @@ def update_success_constraint_from_episode(episode_num):
 
 def log_episode_reward(episode_num, sim_id, total_reward, avg_delivery_rate=None,
                        delivered=None, created=None, avg_overhead=None,
-                       avg_delay=None, buffer_size_mb=None, combo_reward=None):
+                       avg_delay=None, buffer_size_mb=None, combo_reward=None,
+                       drop_rate=None, avg_energy_used=None, algo_tag="rmappo"):
     """Log per-episode total reward (and optional delivery summary) to CSV.
 
-    Columns: episode, sim_id, total_reward, avg_delivery_rate, delivered, created,
-             avg_overhead, avg_delay
-    Writes to reports/reward_logs/episode_rewards[_buf{MB}M]_rmappo.csv
+    Columns: episode, sim_id, total_reward, combo_reward, avg_delivery_rate, delivered,
+             created, avg_overhead, avg_delay, drop_rate, avg_energy_used
+    Writes to reports/reward_logs/episode_rewards[_buf{MB}M]_{algo_tag}.csv
     """
     try:
-        log_dir = os.path.join("reports", "reward_logs")
+        algo_tag = str(algo_tag or "rmappo").strip().lower()
+        base_dir = REPORT_OUTPUT_DIR if 'REPORT_OUTPUT_DIR' in globals() else "reports"
+        log_dir = os.path.join(base_dir, "reward_logs")
         os.makedirs(log_dir, exist_ok=True)
 
+        log_files = []
         if buffer_size_mb:
-            log_file = os.path.join(log_dir, f"episode_rewards_buf{int(buffer_size_mb)}M_rmappo.csv")
+            log_files.append(os.path.join(log_dir, f"episode_rewards_buf{int(buffer_size_mb)}M_{algo_tag}.csv"))
         else:
-            log_file = os.path.join(log_dir, "episode_rewards_rmappo.csv")
+            safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(sim_id))
+            if safe_sim:
+                log_files.append(os.path.join(log_dir, f"episode_rewards_{safe_sim}_{algo_tag}.csv"))
+            log_files.append(os.path.join(log_dir, f"episode_rewards_{algo_tag}.csv"))
 
-        write_header = not os.path.exists(log_file)
-        with open(log_file, "a", encoding="utf-8") as f:
-            if write_header:
-                f.write("episode,sim_id,total_reward,combo_reward,avg_delivery_rate,delivered,created,avg_overhead,avg_delay\n")
-            # Normalize None to empty string for optional fields
-            avg_str = "" if avg_delivery_rate is None or (isinstance(avg_delivery_rate, float) and math.isnan(avg_delivery_rate)) else str(avg_delivery_rate)
-            deliv_str = "" if delivered is None else str(delivered)
-            created_str = "" if created is None else str(created)
-            overhead_str = "" if avg_overhead is None or (isinstance(avg_overhead, float) and math.isnan(avg_overhead)) else str(avg_overhead)
-            delay_str = "" if avg_delay is None or (isinstance(avg_delay, float) and math.isnan(avg_delay)) else str(avg_delay)
-            combo_str = "" if combo_reward is None else str(combo_reward)
-            f.write(f"{episode_num},{sim_id},{total_reward},{combo_str},{avg_str},{deliv_str},{created_str},{overhead_str},{delay_str}\n")
+        header = (
+            "episode,sim_id,total_reward,combo_reward,avg_delivery_rate,delivered,created,"
+            "avg_overhead,avg_delay,drop_rate,avg_energy_used\n"
+        )
+
+        def _ensure_schema(path, expected_header):
+            try:
+                if not os.path.exists(path):
+                    return
+                with open(path, "r", encoding="utf-8") as rf:
+                    first = rf.readline()
+                    if first == expected_header:
+                        return
+                    rest = rf.read().splitlines()
+                expected_n = len(expected_header.strip().split(","))
+                out_lines = [expected_header.rstrip("\n")]
+                for line in rest:
+                    if not line:
+                        continue
+                    cols = line.split(",")
+                    if len(cols) < expected_n:
+                        cols = cols + ([""] * (expected_n - len(cols)))
+                    out_lines.append(",".join(cols))
+                with open(path, "w", encoding="utf-8") as wf:
+                    wf.write("\n".join(out_lines) + "\n")
+            except Exception:
+                return
+
+        # Normalize None to empty string for optional fields
+        avg_str = "" if avg_delivery_rate is None or (isinstance(avg_delivery_rate, float) and math.isnan(avg_delivery_rate)) else str(avg_delivery_rate)
+        deliv_str = "" if delivered is None else str(delivered)
+        created_str = "" if created is None else str(created)
+        overhead_str = "" if avg_overhead is None or (isinstance(avg_overhead, float) and math.isnan(avg_overhead)) else str(avg_overhead)
+        delay_str = "" if avg_delay is None or (isinstance(avg_delay, float) and math.isnan(avg_delay)) else str(avg_delay)
+        combo_str = "" if combo_reward is None else str(combo_reward)
+        drop_str = "" if drop_rate is None or (isinstance(drop_rate, float) and math.isnan(drop_rate)) else str(drop_rate)
+        energy_str = "" if avg_energy_used is None or (isinstance(avg_energy_used, float) and math.isnan(avg_energy_used)) else str(avg_energy_used)
+        row = f"{episode_num},{sim_id},{total_reward},{combo_str},{avg_str},{deliv_str},{created_str},{overhead_str},{delay_str},{drop_str},{energy_str}\n"
+
+        for log_file in log_files:
+            _ensure_schema(log_file, header)
+            write_header = not os.path.exists(log_file)
+            with open(log_file, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write(header)
+                f.write(row)
     except Exception:
         pass
 
 def log_episode_losses(episode_num, sim_id, actor_loss_avg=None, critic_loss_avg=None,
-                       cost_critic_loss_avg=None, updates=0, entropy_avg=None, buffer_size_mb=None):
+                       cost_critic_loss_avg=None, updates=0, entropy_avg=None, buffer_size_mb=None, algo_tag="rmappo"):
     """Log per-episode average actor/critic/cost_critic losses to CSV.
 
     Columns: episode, sim_id, actor_loss_avg, critic_loss_avg, cost_critic_loss_avg, updates, entropy_avg
-    Writes to reports/train_logs/episode_losses[_buf{MB}M]_rmappo.csv
+    Writes to reports/train_logs/episode_losses[_buf{MB}M]_{algo_tag}.csv
     """
     try:
-        log_dir = os.path.join("reports", "train_logs")
+        algo_tag = str(algo_tag or "rmappo").strip().lower()
+        base_dir = REPORT_OUTPUT_DIR if 'REPORT_OUTPUT_DIR' in globals() else "reports"
+        log_dir = os.path.join(base_dir, "train_logs")
         os.makedirs(log_dir, exist_ok=True)
 
+        log_files = []
         if buffer_size_mb:
-            log_file = os.path.join(log_dir, f"episode_losses_buf{int(buffer_size_mb)}M_rmappo.csv")
+            log_files.append(os.path.join(log_dir, f"episode_losses_buf{int(buffer_size_mb)}M_{algo_tag}.csv"))
         else:
-            log_file = os.path.join(log_dir, "episode_losses_rmappo.csv")
+            safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(sim_id))
+            if safe_sim:
+                log_files.append(os.path.join(log_dir, f"episode_losses_{safe_sim}_{algo_tag}.csv"))
+            log_files.append(os.path.join(log_dir, f"episode_losses_{algo_tag}.csv"))
 
-        write_header = not os.path.exists(log_file)
-        with open(log_file, "a", encoding="utf-8") as f:
-            if write_header:
-                f.write("episode,sim_id,actor_loss_avg,critic_loss_avg,cost_critic_loss_avg,updates,entropy_avg\n")
+        def _fmt(x):
+            try:
+                return "" if x is None else str(round(float(x), 6))
+            except Exception:
+                return ""
 
-            def _fmt(x):
-                try:
-                    return "" if x is None else str(round(float(x), 6))
-                except Exception:
-                    return ""
+        header = "episode,sim_id,actor_loss_avg,critic_loss_avg,cost_critic_loss_avg,updates,entropy_avg\n"
+        row = (
+            f"{episode_num},{sim_id},{_fmt(actor_loss_avg)},{_fmt(critic_loss_avg)},"
+            f"{_fmt(cost_critic_loss_avg)},{int(updates)},{_fmt(entropy_avg)}\n"
+        )
 
-            f.write(
-                f"{episode_num},{sim_id},{_fmt(actor_loss_avg)},{_fmt(critic_loss_avg)},{_fmt(cost_critic_loss_avg)},{int(updates)},{_fmt(entropy_avg)}\n"
-            )
+        for log_file in log_files:
+            write_header = not os.path.exists(log_file)
+            with open(log_file, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write(header)
+                f.write(row)
     except Exception:
         pass
 
-def log_update_metrics(sim_time, metrics: dict, buffer_size_mb=None, episode_num=1):
-    """Append per-update PPO diagnostics to CSV for analysis.
-
-    Columns: episode,sim_time,ratio_mean,ratio_std,kl,std_mean,adv_var,cost_value_loss
-    """
+def log_update_metrics(sim_time, metrics: dict, buffer_size_mb=None, episode_num=1, algo_tag="rmappo"):
+    """Append per-update diagnostics to CSV for analysis."""
     try:
-        log_dir = os.path.join("reports", "train_logs")
+        algo_tag = str(algo_tag or "rmappo").strip().lower()
+        base_dir = REPORT_OUTPUT_DIR if 'REPORT_OUTPUT_DIR' in globals() else "reports"
+        log_dir = os.path.join(base_dir, "train_logs")
         os.makedirs(log_dir, exist_ok=True)
 
+        log_files = []
         if buffer_size_mb:
-            log_file = os.path.join(log_dir, f"update_metrics_buf{int(buffer_size_mb)}M_rmappo.csv")
+            log_files.append(os.path.join(log_dir, f"update_metrics_buf{int(buffer_size_mb)}M_{algo_tag}.csv"))
         else:
-            log_file = os.path.join(log_dir, "update_metrics_rmappo.csv")
+            raw_sim = metrics.get("sim_id", "") if isinstance(metrics, dict) else ""
+            safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(raw_sim))
+            if not safe_sim:
+                safe_sim = _sanitize_sim_id_for_filename(_canonical_sim_id_for_group_logs(os.environ.get("SIM_ID", "")))
+            if safe_sim:
+                log_files.append(os.path.join(log_dir, f"update_metrics_{safe_sim}_{algo_tag}.csv"))
+            log_files.append(os.path.join(log_dir, f"update_metrics_{algo_tag}.csv"))
 
-        write_header = not os.path.exists(log_file)
-        cols = ["episode","sim_time","ratio_mean","ratio_std","kl","std_mean","adv_var","cost_value_loss"]
-        with open(log_file, "a", encoding="utf-8") as f:
-            if write_header:
-                f.write(",".join(cols) + "\n")
+        if algo_tag == "masac":
+            cols = ["episode", "sim_time", "policy_loss", "value_loss", "alpha", "entropy"]
+            row = {
+                "episode": episode_num,
+                "sim_time": sim_time,
+                "policy_loss": metrics.get("policy_loss", ""),
+                "value_loss": metrics.get("value_loss", ""),
+                "alpha": metrics.get("alpha", ""),
+                "entropy": metrics.get("entropy", ""),
+            }
+        else:
+            cols = ["episode", "sim_time", "ratio_mean", "ratio_std", "kl", "std_mean", "adv_var", "cost_value_loss"]
             row = {
                 "episode": episode_num,
                 "sim_time": sim_time,
@@ -1237,7 +1949,16 @@ def log_update_metrics(sim_time, metrics: dict, buffer_size_mb=None, episode_num
                 "adv_var": metrics.get("adv_var", 0.0),
                 "cost_value_loss": metrics.get("cost_value_loss", 0.0),
             }
-            f.write(",".join(str(row[c]) for c in cols) + "\n")
+
+        header = ",".join(cols) + "\n"
+        line = ",".join(str(row.get(c, "")) for c in cols) + "\n"
+
+        for log_file in log_files:
+            write_header = not os.path.exists(log_file)
+            with open(log_file, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write(header)
+                f.write(line)
     except Exception:
         pass
 
@@ -1394,6 +2115,78 @@ def log_step_reward_components(sim_time, components, buffer_size_mb=None, episod
                 "total_hosts_reward": components.get("total_hosts_reward", 0.0),
             }
             f2.write(",".join(str(row2[c]) for c in cols_det) + "\n")
+    except Exception:
+        pass
+
+
+def log_mp_v1_action_episode_stats(episode_num, sim_id, stats, buffer_size_mb=None):
+    """
+    Episode-level aggregate action statistics for MP v1 (lambda, tau, beta, kx, m_relay).
+
+    This is meant for diagnosis when performance seems insensitive to actions
+    (e.g., actions stuck at bounds or m_relay always >= 0).
+    """
+    if not MP_V1_ACTION_LOG_ENABLE:
+        return
+    if not isinstance(stats, dict) or int(stats.get("n", 0) or 0) <= 0:
+        return
+
+    out_dir = os.path.join("reports", "action_logs")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    if MP_V1_ACTION_LOG_PATH:
+        path = MP_V1_ACTION_LOG_PATH
+    else:
+        safe_sim = (sim_id or "sim").replace(os.sep, "_").replace(":", "_")
+        path = os.path.join(out_dir, f"mp_v1_action_episode_stats_{safe_sim}.csv")
+
+    header = (
+        "episode,sim_id,n,"
+        "lam_mean,lam_std,lam_min_obs,lam_max_obs,lam_frac_min,lam_frac_max,"
+        "tau_mean,tau_std,tau_min_obs,tau_max_obs,tau_frac_min,tau_frac_max,"
+        "beta_mean,beta_std,beta_min_obs,beta_max_obs,beta_frac_min,beta_frac_max,"
+        "kx_mean,kx_std,kx_min_obs,kx_max_obs,kx_frac_min,kx_frac_max,"
+        "mr_mean,mr_std,mr_min_obs,mr_max_obs,mr_frac_min,mr_frac_max,mr_frac_ge0,"
+        "buffer_size_mb\n"
+    )
+
+    def _g(k, default=""):
+        v = stats.get(k, None)
+        if v is None:
+            return default
+        try:
+            if isinstance(v, float):
+                if not math.isfinite(v):
+                    return default
+                return f"{v:.6g}"
+            if isinstance(v, int):
+                return str(v)
+            # fall back
+            return str(v)
+        except Exception:
+            return default
+
+    try:
+        need_header = (not os.path.isfile(path)) or os.path.getsize(path) == 0
+    except Exception:
+        need_header = True
+
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            if need_header:
+                f.write(header)
+            f.write(
+                f"{int(episode_num)},{sim_id},{int(stats.get('n', 0) or 0)},"
+                f"{_g('lam_mean')},{_g('lam_std')},{_g('lam_min_obs')},{_g('lam_max_obs')},{_g('lam_frac_min')},{_g('lam_frac_max')},"
+                f"{_g('tau_mean')},{_g('tau_std')},{_g('tau_min_obs')},{_g('tau_max_obs')},{_g('tau_frac_min')},{_g('tau_frac_max')},"
+                f"{_g('beta_mean')},{_g('beta_std')},{_g('beta_min_obs')},{_g('beta_max_obs')},{_g('beta_frac_min')},{_g('beta_frac_max')},"
+                f"{_g('kx_mean')},{_g('kx_std')},{_g('kx_min_obs')},{_g('kx_max_obs')},{_g('kx_frac_min')},{_g('kx_frac_max')},"
+                f"{_g('mr_mean')},{_g('mr_std')},{_g('mr_min_obs')},{_g('mr_max_obs')},{_g('mr_frac_min')},{_g('mr_frac_max')},{_g('mr_frac_ge0')},"
+                f"{'' if buffer_size_mb is None else float(buffer_size_mb)}\n"
+            )
     except Exception:
         pass
 
@@ -1750,13 +2543,15 @@ def main_print(message):
     print(f"{prefix}{message}")
 
 # Training configuration
-EPISODE_SECONDS = int(float(os.environ.get("EPISODE_SECONDS", "57600")))
-TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "1000"))
-SIM_END_SECONDS = int(float(os.environ.get("SIM_END_SECONDS", "57600000")))
+EPISODE_SECONDS = int(float(os.environ.get("EPISODE_SECONDS", "43200")))
+TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "2000"))
+SIM_END_SECONDS = int(float(os.environ.get("SIM_END_SECONDS", "86400000")))
 
 # Checkpoint control
 MODEL_DIR = os.environ.get("MODEL_DIR", "models_rmappo")
 MODEL_PATH = os.environ.get("MODEL_PATH", "")
+MP_V1_MODEL_PATH = os.environ.get("MP_V1_MODEL_PATH", "")
+MP_V1_MODEL_DIR = os.environ.get("MP_V1_MODEL_DIR", "models_masac")
 EVAL_ONLY = os.environ.get("EVAL_ONLY", "false").lower() in ("1", "true", "yes")
 NO_TRAINING_CAP = os.environ.get("NO_TRAINING_CAP", "false").lower() in ("1", "true", "yes")
 
@@ -1765,16 +2560,24 @@ NO_TRAINING_CAP = os.environ.get("NO_TRAINING_CAP", "false").lower() in ("1", "t
 ENTROPY_COEF_START = float(os.environ.get("ENTROPY_COEF_START", "0.01"))
 ENTROPY_COEF_END = float(os.environ.get("ENTROPY_COEF_END", "0.001"))
 ENTROPY_DECAY_START_EP = int(os.environ.get("ENTROPY_DECAY_START_EP", "1"))
-ENTROPY_DECAY_END_EP = int(os.environ.get("ENTROPY_DECAY_END_EP", "100"))
+ENTROPY_DECAY_END_EP = int(os.environ.get("ENTROPY_DECAY_END_EP", "150"))
 ENTROPY_SCHEDULE = _parse_episode_schedule_env(os.environ.get("ENTROPY_SCHEDULE", ""))
 EPISODIC_UPDATES = os.environ.get("EPISODIC_UPDATES", "true").lower() in ("1", "true", "yes")
+EPISODIC_TRAIN_INTERVAL_STEPS = int(float(os.environ.get("EPISODIC_TRAIN_INTERVAL_STEPS", "20") or 0))
+if EPISODIC_TRAIN_INTERVAL_STEPS < 0:
+    EPISODIC_TRAIN_INTERVAL_STEPS = 0
 EPISODIC_MAX_SEQUENCES = int(os.environ.get("EPISODIC_MAX_SEQUENCES", "0"))
 STEP_MAX_SEQUENCES = int(os.environ.get("STEP_MAX_SEQUENCES", "36"))
+MP_V1_STEP_MAX_SEQUENCES = int(os.environ.get("MP_V1_STEP_MAX_SEQUENCES", "0"))
+
+# Hardcode: only train at episode_end (no mid-episode or streaming PPO updates).
+# This avoids fragmented updates and uses "batched" learning per episode.
+FORCE_EPISODE_END_ONLY_UPDATES = True
 # LR: 3e-4 → 1e-5 over ep 1-200 (linear decay for DTN stability)
-LR_SCHED_START = float(os.environ.get("PPO_LR_START", "5e-4"))
+LR_SCHED_START = float(os.environ.get("PPO_LR_START", "1e-3"))
 LR_SCHED_END = float(os.environ.get("PPO_LR_END", "1e-5"))
 LR_DECAY_START_EP = int(os.environ.get("LR_DECAY_START_EP", "1"))
-LR_DECAY_END_EP = int(os.environ.get("LR_DECAY_END_EP", "80"))
+LR_DECAY_END_EP = int(os.environ.get("LR_DECAY_END_EP", "150"))
 # Legacy piecewise schedule (kept for reference, not used with linear decay)
 LR_SCHEDULE = [
     (1, 200, 3e-4),  # placeholder, linear decay is used instead
@@ -2043,7 +2846,7 @@ class SequenceWindow:
             'length': len(self.local_obs),
             'local_obs': torch.stack(self.local_obs),
             'global_obs': torch.stack(self.global_obs),
-            'actions': torch.stack(self.actions).unsqueeze(-1),
+            'actions': torch.stack(self.actions),
             'logprobs': torch.stack(self.logprobs).squeeze(-1),
             'values': torch.stack(self.values),
             'cost_values': torch.stack(self.cost_values),
@@ -2313,7 +3116,7 @@ class RecurrentPPOPolicy:
     - CTDE (Centralized Training, Decentralized Execution)
     """
 
-    def __init__(self, obs_dim=7, global_obs_dim=20, hidden_size=128, num_layers=1):
+    def __init__(self, obs_dim=7, global_obs_dim=20, hidden_size=128, num_layers=1, action_dim=1):
         # Hyperparameters
         self.clip_eps = float(os.environ.get("PPO_CLIP", "0.20"))
         # Stability tuning (hardcoded defaults; still overridable via env)
@@ -2338,7 +3141,9 @@ class RecurrentPPOPolicy:
         self.global_obs_dim = global_obs_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-
+        self.action_dim = int(action_dim) if action_dim is not None else 1
+        if self.action_dim <= 0:
+            self.action_dim = 1
         # ===== Actor Network (Decentralized) =====
         # Input: local observations (7D)
         # GRU processes temporal sequence
@@ -2358,10 +3163,10 @@ class RecurrentPPOPolicy:
             batch_first=True
         ).to(self.device)
         self.action_dist = ACTION_DIST
-        head_dim = 2 if self.action_dist == "beta" else 1
+        head_dim = (2 * self.action_dim) if self.action_dist == "beta" else self.action_dim
         self.actor_head = nn.Linear(hidden_size, head_dim).to(self.device)
         # Gaussian-only exploration parameter (retained for compatibility)
-        self.log_std = nn.Parameter(torch.tensor([LOG_STD_INIT], device=self.device))
+        self.log_std = nn.Parameter(torch.full((self.action_dim,), float(LOG_STD_INIT), device=self.device))
         self.log_std_min = -0.5
 
         # ===== Critic Network (Centralized) =====
@@ -2441,6 +3246,9 @@ class RecurrentPPOPolicy:
         # Require exactly 32 sequences before training (hardcoded batch size)
         self.min_sequences_to_train = 12
         self.episodic_updates = EPISODIC_UPDATES
+        # Cap how many per-step keys (sequences) are ingested into SequenceWindows when episodic updates are enabled.
+        # This is separate from the PPO training batch size (max_sequences_per_update).
+        self.step_max_sequences = int(STEP_MAX_SEQUENCES)
 
         # Last actions cache (for reward assignment)
         # Stores tensors in the policy-training space (pre-tanh u for Gaussian, z for Beta)
@@ -2489,6 +3297,7 @@ class RecurrentPPOPolicy:
         std = std.to(device=mean64.device).expand_as(mean64)
         std = torch.where(torch.isfinite(std), std, torch.full_like(std, 1e-2))
 
+        normal = None
         try:
             normal = torch.distributions.Normal(mean64, std)
             u = normal.rsample()
@@ -2500,13 +3309,17 @@ class RecurrentPPOPolicy:
         a = torch.tanh(u)
         a = torch.where(torch.isfinite(a), a, torch.zeros_like(a))
 
-        logp = normal.log_prob(u) - torch.log(torch.clamp(1 - a.pow(2), min=1e-12))
+        if normal is None:
+            logp = torch.zeros_like(u)
+        else:
+            logp = normal.log_prob(u) - torch.log(torch.clamp(1 - a.pow(2), min=1e-12))
         logp = torch.where(torch.isfinite(logp), logp, torch.zeros_like(logp))
+        logp = logp.sum(dim=-1)
 
         return (
             u.to(mean.dtype),
             a.to(mean.dtype),
-            logp.squeeze(-1).to(mean.dtype),
+            logp.to(mean.dtype),
         )
 
     def _tanh_gaussian_logprob(self, mean, u):
@@ -2535,33 +3348,51 @@ class RecurrentPPOPolicy:
             print(f"[ERROR] logprob calculation failed: {e}")
             logp = torch.zeros_like(u64)
 
-        return logp.squeeze(-1).to(mean.dtype)
+        return logp.sum(dim=-1).to(mean.dtype)
 
     def _beta_sample(self, raw_params):
         """Sample z~Beta(alpha,beta), map to a=2z-1, and compute log_prob(z)."""
         params = torch.nan_to_num(raw_params)
-        alpha_raw = params[..., 0]
-        beta_raw = params[..., 1]
+        if params.shape[-1] != (2 * self.action_dim):
+            raise ValueError(
+                f"Beta raw_params dim mismatch: got {params.shape[-1]} but expected {2 * self.action_dim}"
+            )
+        sh = list(params.shape[:-1]) + [self.action_dim, 2]
+        p2 = params.view(*sh)
+        alpha_raw = p2[..., 0]
+        beta_raw = p2[..., 1]
         alpha = torch.clamp(F.softplus(alpha_raw) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
         beta = torch.clamp(F.softplus(beta_raw) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
         dist = torch.distributions.Beta(alpha.to(dtype=torch.float64), beta.to(dtype=torch.float64))
         z = dist.rsample().to(dtype=raw_params.dtype)
         z = torch.clamp(z, min=BETA_EPS, max=1.0 - BETA_EPS)
         a = z * 2.0 - 1.0
-        logp = dist.log_prob(z.to(dtype=torch.float64)).to(dtype=raw_params.dtype)
-        return z.unsqueeze(-1), a.unsqueeze(-1), logp.unsqueeze(-1), alpha, beta
+        logp = dist.log_prob(z.to(dtype=torch.float64)).to(dtype=raw_params.dtype).sum(dim=-1)
+        return z, a, logp, alpha, beta
 
     def _beta_logprob(self, raw_params, z):
         """Compute log_prob(z) under current Beta(alpha,beta)."""
         params = torch.nan_to_num(raw_params)
-        alpha_raw = params[..., 0]
-        beta_raw = params[..., 1]
+        if params.shape[-1] != (2 * self.action_dim):
+            raise ValueError(
+                f"Beta raw_params dim mismatch: got {params.shape[-1]} but expected {2 * self.action_dim}"
+            )
+        sh = list(params.shape[:-1]) + [self.action_dim, 2]
+        p2 = params.view(*sh)
+        alpha_raw = p2[..., 0]
+        beta_raw = p2[..., 1]
         alpha = torch.clamp(F.softplus(alpha_raw) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
         beta = torch.clamp(F.softplus(beta_raw) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
         dist = torch.distributions.Beta(alpha.to(dtype=torch.float64), beta.to(dtype=torch.float64))
         z64 = torch.nan_to_num(z).to(dtype=torch.float64)
+        if z64.dim() == params.dim() and z64.shape[:-1] == params.shape[:-1]:
+            pass  # (..., action_dim)
+        else:
+            # Allow scalar z shape (...,) when action_dim == 1
+            if self.action_dim == 1 and z64.shape == params.shape[:-1]:
+                z64 = z64.unsqueeze(-1)
         z64 = torch.clamp(z64, min=BETA_EPS, max=1.0 - BETA_EPS)
-        logp = dist.log_prob(z64)
+        logp = dist.log_prob(z64).sum(dim=-1)
         return logp
 
     def act_batch(self, obs_batch, delta_limit, keys, global_features=None):
@@ -2608,7 +3439,7 @@ class RecurrentPPOPolicy:
             global_feat_tensor = torch.nan_to_num(self._to_tensor(global_features))
 
         # Prepare for GRU (batch_size, seq_len=1, features)
-        local_obs_seq = local_obs.unsqueeze(1)  # (batch, 1, 7)
+        local_obs_seq = local_obs.unsqueeze(1)  # (batch, 1, obs_dim)
 
         # ===== Actor Forward (BATCHED GRU) =====
         # OPTIMIZATION: Collect all hidden states first, then process in batch
@@ -2642,12 +3473,10 @@ class RecurrentPPOPolicy:
         raw_params = self.actor_head(gru_out_actor.squeeze(1))
         if self.action_dist == "beta":
             z, actions, logprobs, _, _ = self._beta_sample(raw_params)
-            actions = actions.squeeze(-1)
-            action_train = z.squeeze(-1)
+            action_train = z
         else:
             u_pre, actions, logprobs = self._tanh_gaussian_sample(raw_params)
-            actions = actions.squeeze(-1)
-            action_train = u_pre.squeeze(-1)
+            action_train = u_pre
 
         # Scale actions to [-delta_limit, delta_limit]
         scale = delta_limit if (delta_limit is not None and delta_limit > 0) else 1.0
@@ -2714,6 +3543,11 @@ class RecurrentPPOPolicy:
 
         # Store last actions for reward assignment
         act_list = action_scaled.cpu().tolist()
+        if self.action_dim == 1:
+            try:
+                act_list = [float(v[0]) if isinstance(v, (list, tuple)) else float(v) for v in act_list]
+            except Exception:
+                pass
         for i, k in enumerate(keys):
             self.last_actions[k] = (
                 local_obs[i].detach(),
@@ -2764,11 +3598,13 @@ class RecurrentPPOPolicy:
 
         done_index = done_keys or set()
         selected_keys = None
-        if self.episodic_updates and STEP_MAX_SEQUENCES > 0:
+        step_cap = int(getattr(self, "step_max_sequences", STEP_MAX_SEQUENCES))
+        # When forcing episode-end-only updates, ingest all keys each step (no per-step cap).
+        if (not FORCE_EPISODE_END_ONLY_UPDATES) and self.episodic_updates and step_cap > 0:
             all_keys = list(self.last_actions.keys())
-            if len(all_keys) > STEP_MAX_SEQUENCES:
+            if len(all_keys) > step_cap:
                 random.shuffle(all_keys)
-                selected_keys = set(all_keys[:STEP_MAX_SEQUENCES])
+                selected_keys = set(all_keys[:step_cap])
 
         for host, acted_keys in acted_by_host.items():
             if not acted_keys:
@@ -3437,7 +4273,7 @@ class RecurrentPPOPolicy:
             # Prepare padded tensors
             padded_local = torch.zeros(batch_size, max_len, self.obs_dim, device=self.device)
             padded_global = torch.zeros(batch_size, max_len, self.global_obs_dim, device=self.device)
-            padded_actions = torch.zeros(batch_size, max_len, 1, device=self.device)
+            padded_actions = torch.zeros(batch_size, max_len, self.action_dim, device=self.device)
             padded_old_logp = torch.zeros(batch_size, max_len, device=self.device)
             padded_adv = torch.zeros(batch_size, max_len, device=self.device)
             padded_ret = torch.zeros(batch_size, max_len, device=self.device)
@@ -3532,8 +4368,8 @@ class RecurrentPPOPolicy:
 
             # Compute log probs based on action distribution type
             if self.action_dist == "beta":
-                # padded_actions stores z (raw Beta sample), shape (B, T, 1)
-                new_logp = self._beta_logprob(raw_actor_out, padded_actions.squeeze(-1))
+                # padded_actions stores z (raw Beta sample), shape (B, T, action_dim)
+                new_logp = self._beta_logprob(raw_actor_out, padded_actions)
             else:
                 new_logp = self._tanh_gaussian_logprob(raw_actor_out, padded_actions)
 
@@ -3662,11 +4498,21 @@ class RecurrentPPOPolicy:
             if self.action_dist == "beta":
                 # Beta entropy from current policy parameters (differentiable)
                 params = torch.nan_to_num(raw_actor_out)
-                alpha = torch.clamp(F.softplus(params[..., 0]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
-                beta_p = torch.clamp(F.softplus(params[..., 1]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
-                beta_dist = torch.distributions.Beta(
-                    alpha.to(torch.float64), beta_p.to(torch.float64))
-                ent_per_step = beta_dist.entropy().to(raw_actor_out.dtype)  # (batch, max_len)
+                if self.action_dim == 1:
+                    alpha = torch.clamp(F.softplus(params[..., 0]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
+                    beta_p = torch.clamp(F.softplus(params[..., 1]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
+                    beta_dist = torch.distributions.Beta(
+                        alpha.to(torch.float64), beta_p.to(torch.float64))
+                    ent_per_step = beta_dist.entropy().to(raw_actor_out.dtype)  # (batch, max_len)
+                else:
+                    sh = list(params.shape[:-1]) + [self.action_dim, 2]
+                    p2 = params.view(*sh)
+                    alpha = torch.clamp(F.softplus(p2[..., 0]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
+                    beta_p = torch.clamp(F.softplus(p2[..., 1]) + BETA_MIN_PARAM, min=BETA_MIN_PARAM)
+                    beta_dist = torch.distributions.Beta(
+                        alpha.to(torch.float64), beta_p.to(torch.float64))
+                    ent = beta_dist.entropy().to(raw_actor_out.dtype)  # (batch, max_len, action_dim)
+                    ent_per_step = ent.sum(dim=-1)  # (batch, max_len)
                 ent_valid = torch.masked_select(ent_per_step, mask_bool)
                 entropy = ent_valid.mean() if ent_valid.numel() > 0 else torch.tensor(0.0, device=self.device)
             else:
@@ -3862,6 +4708,647 @@ class RecurrentPPOPolicy:
             return {"ok": False, "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# CTDE SAC (MA-SAC) default hyperparameters
+# ---------------------------------------------------------------------------
+# These are code-level defaults (standard SAC baselines). Env vars can still
+# override them, but leaving env unset yields these values deterministically.
+#
+# Note on replay size: SAC commonly uses 1e6, but MP_v1 observations can be
+# high-dimensional (hundreds of floats), so 200k is a safer default for memory.
+SAC_DEFAULT_GAMMA = 0.99
+SAC_DEFAULT_TAU = 0.005
+SAC_DEFAULT_BATCH_SIZE = 256
+SAC_DEFAULT_REPLAY_SIZE = 200_000
+SAC_DEFAULT_MIN_REPLAY_SIZE = 10_000
+SAC_DEFAULT_UPDATES_PER_TRAIN_CALL = 1
+# Default kept small so `RmappoMaxpropBridgeReport.timeoutMs=3000` won't time out at episode_end.
+# Increase via `SAC_UPDATES_PER_EPISODE_END` (and/or raise timeoutMs) for more training per episode.
+SAC_DEFAULT_UPDATES_PER_EPISODE_END = 32
+SAC_DEFAULT_ACTOR_LR = 3e-4
+SAC_DEFAULT_CRITIC_LR = 3e-4
+SAC_DEFAULT_ALPHA_LR = 3e-4
+SAC_DEFAULT_AUTO_ALPHA = True
+SAC_DEFAULT_ALPHA_INIT = 0.2
+SAC_DEFAULT_TARGET_ENTROPY = None  # None => -action_dim
+SAC_DEFAULT_GRAD_CLIP = 0.0
+SAC_DEFAULT_LOG_STD_MIN = -20.0
+SAC_DEFAULT_LOG_STD_MAX = 2.0
+SAC_DEFAULT_LOGPROB_EPS = 1e-6
+
+
+class SACReplayBuffer:
+    def __init__(self, capacity: int, obs_dim: int, global_obs_dim: int, action_dim: int):
+        self.capacity = max(1, int(capacity))
+        self.obs_dim = int(obs_dim)
+        self.global_obs_dim = int(global_obs_dim)
+        self.action_dim = int(action_dim)
+
+        self._obs = np.zeros((self.capacity, self.obs_dim), dtype=np.float32)
+        self._gobs = np.zeros((self.capacity, self.global_obs_dim), dtype=np.float32)
+        self._act = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
+        self._rew = np.zeros((self.capacity, 1), dtype=np.float32)
+        self._nobs = np.zeros((self.capacity, self.obs_dim), dtype=np.float32)
+        self._ngobs = np.zeros((self.capacity, self.global_obs_dim), dtype=np.float32)
+        self._done = np.zeros((self.capacity, 1), dtype=np.float32)
+
+        self._ptr = 0
+        self._size = 0
+
+    def __len__(self) -> int:
+        return int(self._size)
+
+    def push_batch(
+        self,
+        obs: "np.ndarray",
+        gobs: "np.ndarray",
+        act: "np.ndarray",
+        rew: "np.ndarray",
+        nobs: "np.ndarray",
+        ngobs: "np.ndarray",
+        done: "np.ndarray",
+    ) -> None:
+        if obs is None:
+            return
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim != 2 or obs.shape[1] != self.obs_dim:
+            raise ValueError(f"obs shape mismatch: {obs.shape} (expected (*,{self.obs_dim}))")
+        n = int(obs.shape[0])
+        if n <= 0:
+            return
+
+        gobs = np.asarray(gobs, dtype=np.float32)
+        act = np.asarray(act, dtype=np.float32)
+        rew = np.asarray(rew, dtype=np.float32).reshape(n, 1)
+        nobs = np.asarray(nobs, dtype=np.float32)
+        ngobs = np.asarray(ngobs, dtype=np.float32)
+        done = np.asarray(done, dtype=np.float32).reshape(n, 1)
+
+        if gobs.shape != (n, self.global_obs_dim):
+            raise ValueError(f"gobs shape mismatch: {gobs.shape} (expected ({n},{self.global_obs_dim}))")
+        if act.shape != (n, self.action_dim):
+            raise ValueError(f"act shape mismatch: {act.shape} (expected ({n},{self.action_dim}))")
+        if nobs.shape != (n, self.obs_dim):
+            raise ValueError(f"nobs shape mismatch: {nobs.shape} (expected ({n},{self.obs_dim}))")
+        if ngobs.shape != (n, self.global_obs_dim):
+            raise ValueError(f"ngobs shape mismatch: {ngobs.shape} (expected ({n},{self.global_obs_dim}))")
+
+        start = int(self._ptr)
+        end = start + n
+        if end <= self.capacity:
+            sl = slice(start, end)
+            self._obs[sl] = obs
+            self._gobs[sl] = gobs
+            self._act[sl] = act
+            self._rew[sl] = rew
+            self._nobs[sl] = nobs
+            self._ngobs[sl] = ngobs
+            self._done[sl] = done
+        else:
+            first = self.capacity - start
+            sl1 = slice(start, self.capacity)
+            sl2 = slice(0, end - self.capacity)
+            self._obs[sl1] = obs[:first]
+            self._gobs[sl1] = gobs[:first]
+            self._act[sl1] = act[:first]
+            self._rew[sl1] = rew[:first]
+            self._nobs[sl1] = nobs[:first]
+            self._ngobs[sl1] = ngobs[:first]
+            self._done[sl1] = done[:first]
+
+            self._obs[sl2] = obs[first:]
+            self._gobs[sl2] = gobs[first:]
+            self._act[sl2] = act[first:]
+            self._rew[sl2] = rew[first:]
+            self._nobs[sl2] = nobs[first:]
+            self._ngobs[sl2] = ngobs[first:]
+            self._done[sl2] = done[first:]
+
+        self._ptr = int(end % self.capacity)
+        self._size = int(min(self.capacity, self._size + n))
+
+    def sample(self, batch_size: int, device: "torch.device"):
+        if self._size <= 0:
+            raise ValueError("cannot sample from empty buffer")
+        b = int(batch_size)
+        b = max(1, min(b, self._size))
+        idx = np.random.randint(0, self._size, size=b)
+        obs = torch.as_tensor(self._obs[idx], device=device)
+        gobs = torch.as_tensor(self._gobs[idx], device=device)
+        act = torch.as_tensor(self._act[idx], device=device)
+        rew = torch.as_tensor(self._rew[idx], device=device)
+        nobs = torch.as_tensor(self._nobs[idx], device=device)
+        ngobs = torch.as_tensor(self._ngobs[idx], device=device)
+        done = torch.as_tensor(self._done[idx], device=device)
+        return obs, gobs, act, rew, nobs, ngobs, done
+
+
+class SquashedGaussianActor(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_size = int(hidden_size)
+
+        self.net = nn.Sequential(
+            nn.Linear(self.obs_dim, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+        )
+        self.mean = nn.Linear(self.hidden_size, self.action_dim)
+        self.log_std = nn.Linear(self.hidden_size, self.action_dim)
+
+        self.log_std_min = float(os.environ.get("SAC_LOG_STD_MIN", str(SAC_DEFAULT_LOG_STD_MIN)))
+        self.log_std_max = float(os.environ.get("SAC_LOG_STD_MAX", str(SAC_DEFAULT_LOG_STD_MAX)))
+        self.eps = float(os.environ.get("SAC_LOGPROB_EPS", str(SAC_DEFAULT_LOGPROB_EPS)))
+
+    def forward(self, obs: "torch.Tensor"):
+        h = self.net(obs)
+        mean = self.mean(h)
+        log_std = self.log_std(h)
+        log_std = torch.clamp(log_std, min=self.log_std_min, max=self.log_std_max)
+        return mean, log_std
+
+    def sample(self, obs: "torch.Tensor"):
+        mean, log_std = self.forward(obs)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        u = normal.rsample()
+        a = torch.tanh(u)
+        logp = normal.log_prob(u) - torch.log(torch.clamp(1.0 - a.pow(2), min=self.eps))
+        logp = logp.sum(dim=-1, keepdim=True)
+        mean_a = torch.tanh(mean)
+        return a, logp, mean_a
+
+
+class SACQNetwork(nn.Module):
+    def __init__(self, global_obs_dim: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.global_obs_dim = int(global_obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_size = int(hidden_size)
+        self.net = nn.Sequential(
+            nn.Linear(self.global_obs_dim + self.action_dim, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 1),
+        )
+
+    def forward(self, global_obs: "torch.Tensor", action: "torch.Tensor"):
+        x = torch.cat([global_obs, action], dim=-1)
+        return self.net(x)
+
+
+class CTDESACPolicy:
+    """
+    CTDE Soft Actor-Critic (SAC) for multi-host control.
+
+    - Actor (Decentralized): local obs -> action in [-1,1]^A
+    - Critic (Centralized): global obs (local + global_features) + action -> Q
+
+    NOTE: This is feed-forward SAC (non-recurrent). The HTTP protocol, CTDE split,
+    and host/key batching are kept compatible with the existing server.
+    """
+
+    def __init__(self, obs_dim: int, global_obs_dim: int, hidden_size: int, action_dim: int):
+        device_str = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device_str)
+        print(f"[CTDESACPolicy] Using device: {self.device}")
+
+        self.obs_dim = int(obs_dim)
+        self.global_obs_dim = int(global_obs_dim)
+        self.hidden_size = int(hidden_size)
+        self.action_dim = int(action_dim) if action_dim is not None else 1
+        if self.action_dim <= 0:
+            self.action_dim = 1
+
+        self.gamma = float(os.environ.get("SAC_GAMMA", str(SAC_DEFAULT_GAMMA)))
+        self.tau = float(os.environ.get("SAC_TAU", str(SAC_DEFAULT_TAU)))
+        self.batch_size = int(os.environ.get("SAC_BATCH_SIZE", str(SAC_DEFAULT_BATCH_SIZE)))
+        self.min_replay_size = int(os.environ.get("SAC_MIN_REPLAY_SIZE", str(SAC_DEFAULT_MIN_REPLAY_SIZE)))
+        self.updates_per_train_call = int(os.environ.get("SAC_UPDATES_PER_TRAIN_CALL", str(SAC_DEFAULT_UPDATES_PER_TRAIN_CALL)))
+        self.updates_per_episode_end = int(
+            os.environ.get("SAC_UPDATES_PER_EPISODE_END", str(SAC_DEFAULT_UPDATES_PER_EPISODE_END))
+        )
+        self.grad_clip = float(os.environ.get("SAC_GRAD_CLIP", str(SAC_DEFAULT_GRAD_CLIP)))
+
+        actor_lr = float(os.environ.get("SAC_ACTOR_LR", str(SAC_DEFAULT_ACTOR_LR)))
+        critic_lr = float(os.environ.get("SAC_CRITIC_LR", str(SAC_DEFAULT_CRITIC_LR)))
+        alpha_lr = float(os.environ.get("SAC_ALPHA_LR", str(SAC_DEFAULT_ALPHA_LR)))
+
+        self.actor = SquashedGaussianActor(self.obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q1 = SACQNetwork(self.global_obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q2 = SACQNetwork(self.global_obs_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.q1_target = copy.deepcopy(self.q1).to(self.device)
+        self.q2_target = copy.deepcopy(self.q2).to(self.device)
+
+        for p in self.q1_target.parameters():
+            p.requires_grad_(False)
+        for p in self.q2_target.parameters():
+            p.requires_grad_(False)
+
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=critic_lr)
+
+        self.auto_alpha = os.environ.get(
+            "SAC_AUTO_ALPHA", "true" if SAC_DEFAULT_AUTO_ALPHA else "false"
+        ).lower() in ("1", "true", "yes")
+        init_alpha = float(os.environ.get("SAC_ALPHA_INIT", str(SAC_DEFAULT_ALPHA_INIT)))
+        if self.auto_alpha:
+            self.log_alpha = torch.tensor(math.log(max(1e-8, init_alpha)), device=self.device, requires_grad=True)
+            self.alpha_opt = optim.Adam([self.log_alpha], lr=alpha_lr)
+            default_target_entropy = (
+                -float(self.action_dim) if SAC_DEFAULT_TARGET_ENTROPY is None else float(SAC_DEFAULT_TARGET_ENTROPY)
+            )
+            self.target_entropy = float(os.environ.get("SAC_TARGET_ENTROPY", str(default_target_entropy)))
+        else:
+            self.log_alpha = None
+            self.alpha_opt = None
+            self.target_entropy = None
+            self._alpha = float(os.environ.get("SAC_ALPHA", str(init_alpha)))
+
+        buf_cap = int(os.environ.get("SAC_REPLAY_SIZE", str(SAC_DEFAULT_REPLAY_SIZE)))
+        self.replay_buffer = SACReplayBuffer(
+            capacity=buf_cap,
+            obs_dim=self.obs_dim,
+            global_obs_dim=self.global_obs_dim,
+            action_dim=self.action_dim,
+        )
+        self.ready_sequences = self.replay_buffer  # compatibility
+
+        self.policy_id = "masac_maxprop_v1"
+        self.last_actions = {}  # key -> (local_obs[np], global_obs[np], action[np])
+
+        self.step_max_sequences = 0
+
+        try:
+            te_desc = self.target_entropy if self.auto_alpha else None
+            print(
+                "[CTDESACPolicy] SAC defaults: "
+                f"gamma={self.gamma} tau={self.tau} batch={self.batch_size} "
+                f"replay={len(self.replay_buffer)}/{self.replay_buffer.capacity} min_replay={self.min_replay_size} "
+                f"lr_actor={actor_lr} lr_critic={critic_lr} "
+                f"auto_alpha={self.auto_alpha} alpha_init={init_alpha} target_entropy={te_desc} "
+                f"updates_ep_end={self.updates_per_episode_end}"
+            )
+        except Exception:
+            pass
+
+    @property
+    def alpha(self) -> float:
+        if self.auto_alpha:
+            return float(self.log_alpha.detach().exp().cpu().item())
+        return float(self._alpha)
+
+    def _to_tensor(self, x):
+        return torch.as_tensor(x, dtype=torch.float32, device=self.device)
+
+    def _construct_global_obs(self, local_obs_t: "torch.Tensor", global_feat_t: "torch.Tensor"):
+        return torch.cat([local_obs_t, global_feat_t], dim=-1)
+
+    def act_batch(self, obs_batch, delta_limit, keys, global_features=None):
+        if not obs_batch:
+            return []
+        local_obs = torch.nan_to_num(self._to_tensor(obs_batch))
+        if local_obs.ndim != 2 or local_obs.shape[1] != self.obs_dim:
+            raise ValueError(f"[CTDESACPolicy] obs_dim mismatch: got {tuple(local_obs.shape)} expected (*,{self.obs_dim})")
+        batch_size = int(local_obs.shape[0])
+        if keys is not None and len(keys) != batch_size:
+            raise ValueError(f"[CTDESACPolicy] keys length mismatch: {len(keys)} vs batch {batch_size}")
+
+        if global_features is None or len(global_features) == 0:
+            gf_dim = max(0, self.global_obs_dim - self.obs_dim)
+            global_feat = torch.zeros((batch_size, gf_dim), dtype=torch.float32, device=self.device)
+        else:
+            global_feat = torch.nan_to_num(self._to_tensor(global_features))
+            if global_feat.ndim != 2:
+                raise ValueError(f"[CTDESACPolicy] global_features must be 2D; got {tuple(global_feat.shape)}")
+            if global_feat.shape[0] != batch_size:
+                raise ValueError(f"[CTDESACPolicy] global_features batch mismatch: {global_feat.shape[0]} vs {batch_size}")
+            if global_feat.shape[1] != (self.global_obs_dim - self.obs_dim):
+                raise ValueError(
+                    f"[CTDESACPolicy] global_feat dim mismatch: got {global_feat.shape[1]} expected {self.global_obs_dim - self.obs_dim}"
+                )
+
+        with torch.no_grad():
+            if EVAL_ONLY:
+                mean, _ = self.actor.forward(local_obs)
+                a = torch.tanh(mean)
+            else:
+                a, _, _ = self.actor.sample(local_obs)
+        a = torch.nan_to_num(a)
+
+        scale = float(delta_limit) if (delta_limit is not None and float(delta_limit) > 0) else 1.0
+        a_scaled = torch.clamp(a * scale, min=-abs(scale), max=abs(scale))
+
+        global_obs = self._construct_global_obs(local_obs, global_feat)
+        a_store = a.detach().cpu().numpy().astype(np.float32)
+        local_store = local_obs.detach().cpu().numpy().astype(np.float32)
+        global_store = global_obs.detach().cpu().numpy().astype(np.float32)
+        for i, k in enumerate(keys or []):
+            self.last_actions[str(k)] = (local_store[i], global_store[i], a_store[i])
+
+        out = a_scaled.detach().cpu().numpy().tolist()
+        if self.action_dim == 1:
+            try:
+                out = [float(v[0]) if isinstance(v, (list, tuple)) else float(v) for v in out]
+            except Exception:
+                pass
+        return out
+
+    def update(
+        self,
+        rewards_per_host,
+        rewards_per_key,
+        mapping_host_to_keys,
+        delta_limit,
+        epochs=None,
+        done_keys=None,
+        low_zone_relays=None,
+        delivery_per_key=None,
+        overhead_per_key=None,
+        train_now=True,
+        allow_cleanup=True,
+        allow_trim=True,
+        step_id: int = -1,
+        next_obs_batch=None,
+        next_keys=None,
+        next_global_features=None,
+    ):
+        if not self.last_actions:
+            return {"updated": False, "ready_sequences": len(self.replay_buffer)}
+
+        next_state_local = {}
+        next_state_global = {}
+        if next_obs_batch and next_keys:
+            next_local_t = torch.nan_to_num(self._to_tensor(next_obs_batch))
+            if next_local_t.ndim != 2 or next_local_t.shape[1] != self.obs_dim:
+                raise ValueError(f"[CTDESACPolicy] next_obs_dim mismatch: got {tuple(next_local_t.shape)} expected (*,{self.obs_dim})")
+            batch_n = int(next_local_t.shape[0])
+            if len(next_keys) != batch_n:
+                raise ValueError(f"[CTDESACPolicy] next_keys length mismatch: {len(next_keys)} vs {batch_n}")
+
+            if next_global_features is None or len(next_global_features) == 0:
+                gf_dim = max(0, self.global_obs_dim - self.obs_dim)
+                next_gf_t = torch.zeros((batch_n, gf_dim), dtype=torch.float32, device=self.device)
+            else:
+                next_gf_t = torch.nan_to_num(self._to_tensor(next_global_features))
+                if next_gf_t.ndim != 2 or next_gf_t.shape[0] != batch_n:
+                    raise ValueError("[CTDESACPolicy] next_global_features batch mismatch")
+                if next_gf_t.shape[1] != (self.global_obs_dim - self.obs_dim):
+                    raise ValueError("[CTDESACPolicy] next_global_features dim mismatch")
+
+            next_global_t = self._construct_global_obs(next_local_t, next_gf_t)
+            next_local_np = next_local_t.detach().cpu().numpy().astype(np.float32)
+            next_global_np = next_global_t.detach().cpu().numpy().astype(np.float32)
+            for i, k in enumerate(next_keys):
+                kk = str(k)
+                next_state_local[kk] = next_local_np[i]
+                next_state_global[kk] = next_global_np[i]
+
+        done_index = set(done_keys or [])
+
+        acted_by_host = defaultdict(list)
+        for k in self.last_actions.keys():
+            host = k.split("#", 1)[0] if "#" in k else ""
+            acted_by_host[host].append(k)
+
+        step_cap = int(getattr(self, "step_max_sequences", 0) or 0)
+        selected_keys = None
+        if step_cap > 0:
+            all_keys = list(self.last_actions.keys())
+            if len(all_keys) > step_cap:
+                random.shuffle(all_keys)
+                selected_keys = set(all_keys[:step_cap])
+
+        obs_l = []
+        gobs_l = []
+        act_l = []
+        rew_l = []
+        nobs_l = []
+        ngobs_l = []
+        done_l = []
+
+        for host, acted_keys in acted_by_host.items():
+            if not acted_keys:
+                continue
+            r_host = float(rewards_per_host.get(host, 0.0) or 0.0)
+            r_each = r_host / float(len(acted_keys)) if acted_keys else 0.0
+            for k in acted_keys:
+                if selected_keys is not None and k not in selected_keys:
+                    continue
+                local_obs_np, global_obs_np, action_np = self.last_actions.get(k)
+                r = float(rewards_per_key.get(k, r_each) or 0.0)
+                done = (k in done_index)
+
+                if k in next_state_local:
+                    next_local_np = next_state_local[k]
+                    next_global_np = next_state_global[k]
+                else:
+                    next_local_np = local_obs_np
+                    next_global_np = global_obs_np
+                    done = True
+
+                obs_l.append(local_obs_np)
+                gobs_l.append(global_obs_np)
+                act_l.append(action_np)
+                rew_l.append(r)
+                nobs_l.append(next_local_np)
+                ngobs_l.append(next_global_np)
+                done_l.append(1.0 if done else 0.0)
+
+        if obs_l:
+            self.replay_buffer.push_batch(
+                np.stack(obs_l, axis=0),
+                np.stack(gobs_l, axis=0),
+                np.stack(act_l, axis=0),
+                np.asarray(rew_l, dtype=np.float32),
+                np.stack(nobs_l, axis=0),
+                np.stack(ngobs_l, axis=0),
+                np.asarray(done_l, dtype=np.float32),
+            )
+
+        self.last_actions.clear()
+
+        if not train_now:
+            return {"updated": False, "ready_sequences": len(self.replay_buffer)}
+
+        if len(self.replay_buffer) < max(1, self.min_replay_size):
+            return {"updated": False, "ready_sequences": len(self.replay_buffer), "reason": "warmup"}
+
+        return self._train_steps(int(self.updates_per_train_call))
+
+    def _soft_update(self, src: nn.Module, dst: nn.Module):
+        tau = float(self.tau)
+        with torch.no_grad():
+            for p, tp in zip(src.parameters(), dst.parameters()):
+                tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
+
+    def _train_steps(self, n_updates: int):
+        n_updates = max(1, int(n_updates))
+        if len(self.replay_buffer) < max(1, self.min_replay_size):
+            return {"updated": False, "reason": "warmup", "ready_sequences": len(self.replay_buffer)}
+
+        last_actor_loss = 0.0
+        last_critic_loss = 0.0
+        last_alpha_loss = 0.0
+        last_entropy = 0.0
+        last_alpha = self.alpha
+
+        for _ in range(n_updates):
+            obs, gobs, act, rew, nobs, ngobs, done = self.replay_buffer.sample(self.batch_size, self.device)
+
+            with torch.no_grad():
+                next_a, next_logp, _ = self.actor.sample(nobs)
+                q1_t = self.q1_target(ngobs, next_a)
+                q2_t = self.q2_target(ngobs, next_a)
+                min_q_t = torch.min(q1_t, q2_t)
+                alpha_t = self.alpha
+                target_q = rew + (1.0 - done) * float(self.gamma) * (min_q_t - alpha_t * next_logp)
+
+            q1 = self.q1(gobs, act)
+            q2 = self.q2(gobs, act)
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+
+            self.critic_opt.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            if self.grad_clip and self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), self.grad_clip)
+            self.critic_opt.step()
+
+            a_pi, logp_pi, _ = self.actor.sample(obs)
+            q1_pi = self.q1(gobs, a_pi)
+            q2_pi = self.q2(gobs, a_pi)
+            min_q_pi = torch.min(q1_pi, q2_pi)
+            alpha_val = self.alpha
+            actor_loss = (alpha_val * logp_pi - min_q_pi).mean()
+
+            self.actor_opt.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            if self.grad_clip and self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
+            self.actor_opt.step()
+
+            alpha_loss = torch.tensor(0.0, device=self.device)
+            if self.auto_alpha:
+                alpha_loss = -(self.log_alpha * (logp_pi.detach() + float(self.target_entropy))).mean()
+                self.alpha_opt.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                self.alpha_opt.step()
+
+            self._soft_update(self.q1, self.q1_target)
+            self._soft_update(self.q2, self.q2_target)
+
+            last_actor_loss = float(actor_loss.detach().cpu().item())
+            last_critic_loss = float(critic_loss.detach().cpu().item())
+            last_alpha_loss = float(alpha_loss.detach().cpu().item()) if alpha_loss is not None else 0.0
+            last_entropy = float((-logp_pi).mean().detach().cpu().item())
+            last_alpha = float(self.alpha)
+
+        return {
+            "updated": True,
+            "trained_on": int(n_updates),
+            "policy_loss": last_actor_loss,
+            "value_loss": last_critic_loss,
+            "cost_value_loss": 0.0,
+            "entropy": last_entropy,
+            "alpha": last_alpha,
+            "alpha_loss": last_alpha_loss,
+        }
+
+    def train_ready_sequences(self, force=False, consume_all=False):
+        if len(self.replay_buffer) < max(1, self.min_replay_size):
+            return {"updated": False, "reason": "warmup", "ready_sequences": len(self.replay_buffer)}
+        n = self.updates_per_episode_end if consume_all else self.updates_per_train_call
+        return self._train_steps(int(n))
+
+    def finalize_all_sequences(self, force_terminal=False, allow_trim=False):
+        self.last_actions.clear()
+        return {"ok": True}
+
+    def reset_hidden_states(self, episode_start=False):
+        return
+
+    def save(self, path):
+        ckpt = {
+            "actor": self.actor.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "q1_target": self.q1_target.state_dict(),
+            "q2_target": self.q2_target.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
+            "meta": {
+                "policy_id": self.policy_id,
+                "algo": "sac",
+                "obs_dim": self.obs_dim,
+                "global_obs_dim": self.global_obs_dim,
+                "action_dim": self.action_dim,
+                "hidden_size": self.hidden_size,
+            },
+        }
+        if self.auto_alpha:
+            ckpt["log_alpha"] = self.log_alpha.detach().cpu()
+            ckpt["alpha_opt"] = self.alpha_opt.state_dict()
+            ckpt["target_entropy"] = self.target_entropy
+        else:
+            ckpt["alpha"] = float(self._alpha)
+
+        p = pathlib.Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(ckpt, str(p))
+            return {"ok": True, "path": str(p)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def load(self, path):
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "error": "Missing checkpoint"}
+        try:
+            ckpt = torch.load(path, map_location=self.device)
+            self.actor.load_state_dict(ckpt["actor"])
+            self.q1.load_state_dict(ckpt["q1"])
+            self.q2.load_state_dict(ckpt["q2"])
+            self.q1_target.load_state_dict(ckpt.get("q1_target", ckpt["q1"]))
+            self.q2_target.load_state_dict(ckpt.get("q2_target", ckpt["q2"]))
+            try:
+                self.actor_opt.load_state_dict(ckpt.get("actor_opt", {}))
+                self.critic_opt.load_state_dict(ckpt.get("critic_opt", {}))
+            except Exception:
+                pass
+            if self.auto_alpha:
+                la = ckpt.get("log_alpha")
+                if la is not None:
+                    with torch.no_grad():
+                        self.log_alpha.copy_(la.to(self.device))
+                try:
+                    self.alpha_opt.load_state_dict(ckpt.get("alpha_opt", {}))
+                except Exception:
+                    pass
+                try:
+                    te = ckpt.get("target_entropy")
+                    if te is not None:
+                        self.target_entropy = float(te)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._alpha = float(ckpt.get("alpha", self._alpha))
+                except Exception:
+                    pass
+            meta = ckpt.get("meta", {})
+            pid = meta.get("policy_id")
+            if pid:
+                self.policy_id = pid
+            self.last_actions.clear()
+            return {"ok": True, "meta": meta}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
 class HeuristicPolicy:
     """Fallback heuristic policy when PyTorch is not available."""
     def __init__(self):
@@ -3917,8 +5404,29 @@ class Handler(BaseHTTPRequestHandler):
         BASE_POLICY_ID = "heuristic_v1"
 
     POLICY_ID = BASE_POLICY_ID
+    MP_V1_AGENT = None
+    MP_V1_EP_COUNT = 0
+    MP_V1_TRAINING_ENABLED = not EVAL_ONLY
+    MP_V1_EP_REWARD_ACC = 0.0
+    MP_V1_EP_COMBO_REWARD_SUM = 0.0
+    MP_V1_EP_CREATED_SUM = 0
+    MP_V1_EP_TRANSFERRED_SUM = 0
+    MP_V1_EP_DELIVERED_SUM = 0
+    MP_V1_EP_DROPPED_SUM = 0
+    MP_V1_EP_ENERGY_USED_SUM = 0.0
+    MP_V1_EP_HOST_SAMPLES_SUM = 0
+    MP_V1_EP_STEP_COUNT = 0
+    MP_V1_EP_LOSS_UPDATE_COUNT = 0
+    MP_V1_EP_LOSS_POLICY_SUM = 0.0
+    MP_V1_EP_LOSS_VALUE_SUM = 0.0
+    MP_V1_EP_LOSS_COST_VALUE_SUM = 0.0
+    MP_V1_EP_LOSS_ENTROPY_SUM = 0.0
+    MP_V1_LAST_EPISODIC_TRAIN_STEP_ID = None
     _BOOTSTRAP_MIXER_LOAD = None
     _BOOTSTRAP_MIXER_SAVE = None
+
+    # MP v1 episode-level action stats accumulator (for diagnosis)
+    MP_V1_ACT_STATS = None
 
     # Optional: load initial model if provided
     if MODEL_PATH:
@@ -4070,6 +5578,7 @@ class Handler(BaseHTTPRequestHandler):
     EP_LOSS_COST_VALUE_SUM = 0.0
     EP_LOSS_ENTROPY_SUM = 0.0
     EP_LOSS_UPDATE_COUNT = 0
+    LAST_EPISODIC_TRAIN_STEP_ID = None
     EP_HIGH_PENALTY_SUM = 0.0
     EP_LOW_PENALTY_SUM = 0.0
     LOW_ZONE_RELAY_KEYS = set()
@@ -4196,7 +5705,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # Episodic training: finalize all sequences and update once per episode
             episode_update_result = {}
-            if TORCH_OK and Handler.TRAINING_ENABLED and EPISODIC_UPDATES:
+            if TORCH_OK and Handler.TRAINING_ENABLED and (EPISODIC_UPDATES or FORCE_EPISODE_END_ONLY_UPDATES):
                 try:
                     update_start = time.time()
                     Handler.AGENT.finalize_all_sequences(force_terminal=True, allow_trim=False)
@@ -4268,7 +5777,6 @@ class Handler(BaseHTTPRequestHandler):
                                     continue
                         except Exception as tail_exc:
                             print(f"[WARN] Failed to apply tail hindsight combo rewards: {tail_exc}")
-
                     queued_sequences = len(Handler.AGENT.ready_sequences)
                     episode_update_result = Handler.AGENT.train_ready_sequences(force=True, consume_all=True)
                     update_elapsed = time.time() - update_start
@@ -4389,6 +5897,15 @@ class Handler(BaseHTTPRequestHandler):
                     avg_overhead = (
                         (Handler.EP_RELAYED_SUM - Handler.EP_DELIVERED_SUM) / Handler.EP_DELIVERED_SUM
                     )
+                drop_rate_metric = None
+                try:
+                    created_total_for_drop = float(Handler.EP_CREATED_SUM or 0.0)
+                    if math.isfinite(created_total_for_drop) and created_total_for_drop > 0.0:
+                        drop_rate_metric = float(Handler.EP_DROPPED_SUM or 0.0) / created_total_for_drop
+                        if not math.isfinite(drop_rate_metric):
+                            drop_rate_metric = None
+                except Exception:
+                    drop_rate_metric = None
                 log_episode_reward(
                     episode_num=Handler.EP_COUNT,
                     sim_id=sim_id,
@@ -4400,6 +5917,8 @@ class Handler(BaseHTTPRequestHandler):
                     avg_overhead=avg_overhead,
                     avg_delay=avg_delay_metric,
                     buffer_size_mb=buffer_size,
+                    drop_rate=(None if drop_rate_metric is None else round(float(drop_rate_metric), 6)),
+                    avg_energy_used=None,
                 )
                 update_success_constraint_from_episode(Handler.EP_COUNT)
                 log_episode_core_totals(Handler.EP_COUNT, buffer_size)
@@ -4490,6 +6009,7 @@ class Handler(BaseHTTPRequestHandler):
             Handler.EP_LOSS_COST_VALUE_SUM = 0.0
             Handler.EP_LOSS_ENTROPY_SUM = 0.0
             Handler.EP_LOSS_UPDATE_COUNT = 0
+            Handler.LAST_EPISODIC_TRAIN_STEP_ID = None
 
             # Include total episode reward and optionally avg delivery rate in the response for convenience
             resp_payload = {
@@ -4737,6 +6257,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
             self._safe_write(("Bad Request: %s" % e).encode("utf-8"))
+            return
+
+        # --------------------------------------------------------------------
+        # MaxProp++ parameter-control protocol (rmappo_maxprop_v1)
+        # --------------------------------------------------------------------
+        protocol = str(req.get("protocol", "")).strip()
+        if protocol == "rmappo_maxprop_v1":
+            try:
+                resp_obj = handle_rmappo_maxprop_v1(req)
+            except Exception as exc:
+                resp_obj = {"policy_id": "error", "error": str(exc), "actions": []}
+            body = json.dumps(resp_obj).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self._safe_write(body)
             return
 
         # Extract request data
@@ -6223,6 +7760,7 @@ class Handler(BaseHTTPRequestHandler):
         update_result = {}
         if TORCH_OK and Handler.TRAINING_ENABLED:
             try:
+                intra_train_enabled = bool((not FORCE_EPISODE_END_ONLY_UPDATES) and EPISODIC_UPDATES and EPISODIC_TRAIN_INTERVAL_STEPS > 0)
                 update_result = Handler.AGENT.update(
                     rewards_per_host,
                     rewards_per_key,
@@ -6232,9 +7770,9 @@ class Handler(BaseHTTPRequestHandler):
                     overhead_per_key=overhead_per_key,
                     done_keys=done_keys,
                     low_zone_relays=list(Handler.LOW_ZONE_RELAY_KEYS),
-                    train_now=not EPISODIC_UPDATES,
-                    allow_cleanup=not EPISODIC_UPDATES,
-                    allow_trim=not EPISODIC_UPDATES,
+                    train_now=(False if FORCE_EPISODE_END_ONLY_UPDATES else (not EPISODIC_UPDATES)),
+                    allow_cleanup=True,
+                    allow_trim=True,
                     step_id=step_id,
                 )
             except Exception as exc:
@@ -6248,7 +7786,6 @@ class Handler(BaseHTTPRequestHandler):
                 update_result = {"updated": False}
             finally:
                 Handler.LOW_ZONE_RELAY_KEYS.clear()
-
             # Debug: Log update result
             if update_result.get("updated"):
                 print(f"[DEBUG] t={sim_time:.1f}s: PPO update completed!")
@@ -6282,6 +7819,42 @@ class Handler(BaseHTTPRequestHandler):
                 ready = update_result.get("ready_sequences", 0)
                 need = getattr(Handler.AGENT, "min_sequences_to_train", 0)
                 print(f"[DEBUG] t={sim_time:.1f}s: {ready} sequences ready (need {need} for training)")
+            elif (not FORCE_EPISODE_END_ONLY_UPDATES) and EPISODIC_UPDATES and EPISODIC_TRAIN_INTERVAL_STEPS > 0:
+                # Episodic updates: optionally distribute training inside an episode to avoid stagnation.
+                try:
+                    step_i = int(step_id)
+                except Exception:
+                    step_i = -1
+                if step_i >= 0:
+                    last_i = getattr(Handler, "LAST_EPISODIC_TRAIN_STEP_ID", None)
+                    if last_i is None:
+                        Handler.LAST_EPISODIC_TRAIN_STEP_ID = step_i
+                    else:
+                        try:
+                            due = (step_i - int(last_i)) >= int(EPISODIC_TRAIN_INTERVAL_STEPS)
+                        except Exception:
+                            due = False
+                        if due and getattr(Handler.AGENT, "ready_sequences", None):
+                            try:
+                                mid_res = Handler.AGENT.train_ready_sequences(force=False)
+                            except Exception as mid_exc:
+                                mid_res = {"updated": False, "error": str(mid_exc)}
+                            if isinstance(mid_res, dict) and mid_res.get("updated"):
+                                Handler.LAST_EPISODIC_TRAIN_STEP_ID = step_i
+                                print(f"[DEBUG] t={sim_time:.1f}s: episodic mid-episode PPO update completed!")
+                                try:
+                                    Handler.EP_LOSS_POLICY_SUM += float(mid_res.get('policy_loss', 0.0) or 0.0)
+                                    Handler.EP_LOSS_VALUE_SUM += float(mid_res.get('value_loss', 0.0) or 0.0)
+                                    Handler.EP_LOSS_COST_VALUE_SUM += float(mid_res.get('cost_value_loss', 0.0) or 0.0)
+                                    Handler.EP_LOSS_ENTROPY_SUM += float(mid_res.get('entropy', 0.0) or 0.0)
+                                    Handler.EP_LOSS_UPDATE_COUNT += 1
+                                except Exception:
+                                    pass
+                                try:
+                                    buffer_size = extract_buffer_size_mb(sim_id)
+                                    log_update_metrics(sim_time, mid_res, buffer_size, Handler.EP_COUNT)
+                                except Exception:
+                                    pass
         else:
             Handler.LOW_ZONE_RELAY_KEYS.clear()
 
@@ -6352,14 +7925,754 @@ if META_AGENT_ENABLED and TORCH_OK:
         print(f"[META_AGENT] Failed to initialize controller: {meta_init_exc}")
 
 
+def handle_rmappo_maxprop_v1(req):
+    """
+    MA-SAC controller for the rmappo_maxprop_v1 protocol (MaxProp++ parameter control).
+    - Per-step inference: returns 5D action vector per host.
+    - Per-step transition ingestion: consumes prev_transition to build rewards.
+    - Episode-end update: Java calls mode=episode_end; this triggers training.
+    """
+
+    def _to_float(val, default=0.0):
+        try:
+            f = float(val)
+        except Exception:
+            return default
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+
+    def _clamp(x, lo, hi):
+        if not math.isfinite(x):
+            x = lo
+        if not math.isfinite(lo):
+            lo = x
+        if not math.isfinite(hi):
+            hi = x
+        if lo > hi:
+            lo, hi = hi, lo
+        if x < lo:
+            return lo
+        if x > hi:
+            return hi
+        return x
+
+    def _clamp01(x):
+        try:
+            x = float(x)
+        except Exception:
+            return 0.0
+        if not math.isfinite(x):
+            return 0.0
+        if x < 0.0:
+            return 0.0
+        if x > 1.0:
+            return 1.0
+        return x
+
+    def _affine01(a, lo, hi):
+        """Map a in [-1,1] to [lo,hi]."""
+        try:
+            a = float(a)
+        except Exception:
+            a = 0.0
+        if not math.isfinite(a):
+            a = 0.0
+        a = max(-1.0, min(1.0, a))
+        t = 0.5 * (a + 1.0)
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            return float(lo if math.isfinite(lo) else 0.0)
+        return float(lo + t * (hi - lo))
+
+    action_spec = req.get("action_spec") or {}
+    lam_min = _to_float(action_spec.get("lambda_cost_min", 0.0), 0.0)
+    lam_max = _to_float(action_spec.get("lambda_cost_max", 2.0), 2.0)
+    tau_min = _to_float(action_spec.get("tau_age_min", 0.0), 0.0)
+    tau_max = _to_float(action_spec.get("tau_age_max", 3600.0), 3600.0)
+    beta_min = _to_float(action_spec.get("beta_x_min", 0.0), 0.0)
+    beta_max = _to_float(action_spec.get("beta_x_max", 1.0), 1.0)
+    kx_min = _to_float(action_spec.get("k_x_min", 0.1), 0.1)
+    kx_max = _to_float(action_spec.get("k_x_max", 2.0), 2.0)
+    mr_min = _to_float(action_spec.get("m_relay_min", -1e9), -1e9)
+    mr_max = _to_float(action_spec.get("m_relay_max", 5.0), 5.0)
+
+    state_batch = req.get("state_batch", []) or []
+    prev_transition = req.get("prev_transition", []) or []
+    actions = []
+
+    # Episode-end: train on accumulated sequences (episodic update mode).
+    mode = str(req.get("mode", "") or "").strip().lower()
+    if mode == "episode_end":
+        sim_id = str(req.get("sim_id", "") or "")
+        try:
+            sim_time_end = int(float(req.get("time", 0) or 0))
+        except Exception:
+            sim_time_end = 0
+        buffer_size_mb = None
+        try:
+            bsm = req.get("buffer_size_mb", None)
+            if bsm is not None and math.isfinite(float(bsm)):
+                buffer_size_mb = float(bsm)
+        except Exception:
+            buffer_size_mb = None
+        if buffer_size_mb is None:
+            buffer_size_mb = extract_buffer_size_mb(sim_id)
+
+        train_result = None
+        if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None and Handler.MP_V1_TRAINING_ENABLED:
+            try:
+                Handler.MP_V1_AGENT.finalize_all_sequences(force_terminal=True, allow_trim=False)
+                train_result = Handler.MP_V1_AGENT.train_ready_sequences(force=True, consume_all=True)
+            except Exception as exc:
+                train_result = {"updated": False, "error": str(exc)}
+
+        # Episode accounting + logs (match existing *_rmappo.csv formats)
+        Handler.MP_V1_EP_COUNT += 1
+        try:
+            created = int(Handler.MP_V1_EP_CREATED_SUM or 0)
+            delivered = int(Handler.MP_V1_EP_DELIVERED_SUM or 0)
+            transferred = int(Handler.MP_V1_EP_TRANSFERRED_SUM or 0)
+            dropped = int(Handler.MP_V1_EP_DROPPED_SUM or 0)
+            total_reward_ep = float(Handler.MP_V1_EP_REWARD_ACC or 0.0)
+        except Exception:
+            created = delivered = transferred = dropped = 0
+            total_reward_ep = 0.0
+
+        avg_delivery_rate = None
+        if created > 0:
+            avg_delivery_rate = float(delivered) / float(created)
+
+        avg_overhead = None
+        if delivered > 0:
+            avg_overhead = (float(transferred) - float(delivered)) / float(delivered)
+
+        try:
+            drop_rate_metric = None
+            if created > 0:
+                try:
+                    drop_rate_metric = float(dropped) / float(created)
+                except Exception:
+                    drop_rate_metric = None
+            avg_energy_used_metric = None
+            try:
+                denom_samples = int(Handler.MP_V1_EP_HOST_SAMPLES_SUM or 0)
+                if denom_samples > 0:
+                    avg_energy_used_metric = float(Handler.MP_V1_EP_ENERGY_USED_SUM or 0.0) / float(denom_samples)
+                    if not math.isfinite(avg_energy_used_metric):
+                        avg_energy_used_metric = None
+            except Exception:
+                avg_energy_used_metric = None
+            log_episode_reward(
+                episode_num=Handler.MP_V1_EP_COUNT,
+                sim_id=sim_id,
+                total_reward=round(total_reward_ep, 6),
+                combo_reward=round(float(Handler.MP_V1_EP_COMBO_REWARD_SUM or 0.0), 6),
+                avg_delivery_rate=avg_delivery_rate,
+                delivered=delivered,
+                created=created,
+                avg_overhead=avg_overhead,
+                avg_delay=None,
+                buffer_size_mb=buffer_size_mb,
+                drop_rate=(None if drop_rate_metric is None else round(float(drop_rate_metric), 6)),
+                avg_energy_used=(None if avg_energy_used_metric is None else round(float(avg_energy_used_metric), 6)),
+                algo_tag="masac",
+            )
+        except Exception:
+            pass
+        try:
+            log_mp_v1_reward_parameters(
+                episode_num=Handler.MP_V1_EP_COUNT,
+                sim_time=sim_time_end,
+                sim_id=sim_id,
+                buffer_size_mb=buffer_size_mb,
+                algo_tag="masac",
+            )
+        except Exception:
+            pass
+
+        # Action diagnostics (episode-level aggregates)
+        try:
+            if MP_V1_ACTION_LOG_ENABLE and isinstance(getattr(Handler, "MP_V1_ACT_STATS", None), dict):
+                st = Handler.MP_V1_ACT_STATS
+                if int(st.get("n", 0) or 0) > 0:
+                    # Ensure derived fields exist (means/stds/fracs) even if running in heuristic fallback.
+                    if "lam_mean" not in st:
+                        n = float(int(st.get("n", 0) or 0))
+                        if n > 0:
+                            def _final(prefix):
+                                s = float(st.get(prefix + "_sum", 0.0) or 0.0)
+                                ss = float(st.get(prefix + "_sumsq", 0.0) or 0.0)
+                                mean = s / n
+                                var = max(0.0, (ss / n) - mean * mean)
+                                st[prefix + "_mean"] = mean
+                                st[prefix + "_std"] = math.sqrt(var)
+                                st[prefix + "_frac_min"] = float(st.get(prefix + "_min_cnt", 0) or 0) / n
+                                st[prefix + "_frac_max"] = float(st.get(prefix + "_max_cnt", 0) or 0) / n
+                            _final("lam")
+                            _final("tau")
+                            _final("beta")
+                            _final("kx")
+                            _final("mr")
+                            st["mr_frac_ge0"] = float(st.get("mr_ge0_cnt", 0) or 0) / n
+                    log_mp_v1_action_episode_stats(
+                        episode_num=Handler.MP_V1_EP_COUNT,
+                        sim_id=sim_id,
+                        stats=st,
+                        buffer_size_mb=buffer_size_mb,
+                    )
+        except Exception:
+            pass
+
+        if train_result is not None and isinstance(train_result, dict) and train_result.get("updated"):
+            try:
+                Handler.MP_V1_EP_LOSS_POLICY_SUM += float(train_result.get("policy_loss", 0.0) or 0.0)
+                Handler.MP_V1_EP_LOSS_VALUE_SUM += float(train_result.get("value_loss", 0.0) or 0.0)
+                Handler.MP_V1_EP_LOSS_COST_VALUE_SUM += float(train_result.get("cost_value_loss", 0.0) or 0.0)
+                Handler.MP_V1_EP_LOSS_ENTROPY_SUM += float(train_result.get("entropy", 0.0) or 0.0)
+                Handler.MP_V1_EP_LOSS_UPDATE_COUNT += 1
+            except Exception:
+                pass
+            try:
+                metrics_with_sim = dict(train_result)
+                metrics_with_sim["sim_id"] = sim_id
+                log_update_metrics(sim_time_end, metrics_with_sim, buffer_size_mb, Handler.MP_V1_EP_COUNT, algo_tag="masac")
+            except Exception:
+                pass
+
+        try:
+            upd = max(1, int(Handler.MP_V1_EP_LOSS_UPDATE_COUNT or 0))
+            actor_loss_avg = (Handler.MP_V1_EP_LOSS_POLICY_SUM / upd) if Handler.MP_V1_EP_LOSS_UPDATE_COUNT > 0 else None
+            critic_loss_avg = (Handler.MP_V1_EP_LOSS_VALUE_SUM / upd) if Handler.MP_V1_EP_LOSS_UPDATE_COUNT > 0 else None
+            cost_critic_loss_avg = (Handler.MP_V1_EP_LOSS_COST_VALUE_SUM / upd) if Handler.MP_V1_EP_LOSS_UPDATE_COUNT > 0 else None
+            entropy_avg = (Handler.MP_V1_EP_LOSS_ENTROPY_SUM / upd) if Handler.MP_V1_EP_LOSS_UPDATE_COUNT > 0 else None
+        except Exception:
+            actor_loss_avg = critic_loss_avg = cost_critic_loss_avg = entropy_avg = None
+
+        try:
+            log_episode_losses(
+                episode_num=Handler.MP_V1_EP_COUNT,
+                sim_id=sim_id,
+                actor_loss_avg=actor_loss_avg,
+                critic_loss_avg=critic_loss_avg,
+                cost_critic_loss_avg=cost_critic_loss_avg,
+                updates=int(Handler.MP_V1_EP_LOSS_UPDATE_COUNT or 0),
+                entropy_avg=entropy_avg,
+                buffer_size_mb=buffer_size_mb,
+                algo_tag="masac",
+            )
+        except Exception:
+            pass
+
+        # Save MP v1 checkpoint (per-episode).
+        if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None and Handler.MP_V1_EP_COUNT > 0:
+            try:
+                os.makedirs(MP_V1_MODEL_DIR, exist_ok=True)
+                if buffer_size_mb:
+                    model_name = f"masac_maxprop_buf{int(buffer_size_mb)}_ep{Handler.MP_V1_EP_COUNT}.pt"
+                else:
+                    model_name = f"masac_maxprop_{sim_id or 'sim'}_ep{Handler.MP_V1_EP_COUNT}.pt"
+                path = MP_V1_MODEL_PATH or os.path.join(MP_V1_MODEL_DIR, model_name)
+                res = Handler.MP_V1_AGENT.save(path)
+                print(f"[EPISODE_END] Saved MA-SAC MaxProp++ model ep{Handler.MP_V1_EP_COUNT}: {res.get('path')}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save MP_V1 model: {e}")
+
+        # Reset episode accumulators
+        Handler.MP_V1_EP_REWARD_ACC = 0.0
+        Handler.MP_V1_EP_COMBO_REWARD_SUM = 0.0
+        Handler.MP_V1_EP_CREATED_SUM = 0
+        Handler.MP_V1_EP_TRANSFERRED_SUM = 0
+        Handler.MP_V1_EP_DELIVERED_SUM = 0
+        Handler.MP_V1_EP_DROPPED_SUM = 0
+        Handler.MP_V1_EP_ENERGY_USED_SUM = 0.0
+        Handler.MP_V1_EP_HOST_SAMPLES_SUM = 0
+        Handler.MP_V1_EP_STEP_COUNT = 0
+        Handler.MP_V1_EP_LOSS_UPDATE_COUNT = 0
+        Handler.MP_V1_EP_LOSS_POLICY_SUM = 0.0
+        Handler.MP_V1_EP_LOSS_VALUE_SUM = 0.0
+        Handler.MP_V1_EP_LOSS_COST_VALUE_SUM = 0.0
+        Handler.MP_V1_EP_LOSS_ENTROPY_SUM = 0.0
+        Handler.MP_V1_LAST_EPISODIC_TRAIN_STEP_ID = None
+        Handler.MP_V1_ACT_STATS = None
+
+        if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None:
+            try:
+                Handler.MP_V1_AGENT.reset_hidden_states(episode_start=True)
+            except Exception:
+                pass
+
+        out = {
+            "policy_id": getattr(getattr(Handler, "MP_V1_AGENT", None), "policy_id", "masac_maxprop_v1"),
+            "status": "episode_end_ack",
+            "actions": [],
+        }
+        if train_result is not None:
+            out["train"] = train_result
+        return out
+
+    # Compute combo reward from prev_transition totals
+    reward_debug = None
+    total_reward = 0.0
+    created = transferred = delivered = dropped = 0
+    energy_used = 0.0
+    n_hosts = 0
+    if MP_V1_REWARD_ENABLE:
+        try:
+            dt = _to_float(req.get("dt", 1.0), 1.0)
+            if not math.isfinite(dt) or dt <= 1e-9:
+                dt = 1.0
+            created = 0
+            transferred = 0
+            delivered = 0
+            dropped = 0
+            energy_used = 0.0
+            n_hosts = 0
+            for tr in prev_transition:
+                if not isinstance(tr, dict):
+                    continue
+                try:
+                    created += int(float(tr.get("created_cnt", 0) or 0))
+                except Exception:
+                    pass
+                try:
+                    transferred += int(float(tr.get("transferred_cnt", 0) or 0))
+                except Exception:
+                    pass
+                try:
+                    delivered += int(float(tr.get("delivered_cnt", 0) or 0))
+                except Exception:
+                    pass
+                try:
+                    dropped += int(float(tr.get("dropped", 0) or 0))
+                except Exception:
+                    pass
+                energy_used += _to_float(tr.get("energy_used", 0.0), 0.0)
+                n_hosts += 1
+
+            S = 0.0
+            if created > 0:
+                S = _clamp01(float(delivered) / float(created))
+            extra = max(0.0, float(transferred) - float(delivered))
+            O = _clamp01(extra / max(1.0, float(transferred)))
+            D = 0.0
+            if created > 0:
+                D = _clamp01(float(dropped) / float(created))
+            e_rate_total = max(0.0, float(energy_used)) / float(dt)
+            denom_hosts = float(max(1, int(n_hosts)))
+            e_rate_avg = e_rate_total / denom_hosts
+            e_rate_used = e_rate_total if MP_V1_ENERGY_RATE_MODE == "total" else e_rate_avg
+            E = _clamp01(e_rate_used / max(1e-12, MP_V1_ENERGY_RATE_NORM))
+
+            if MP_V1_REWARD_FORM == "log":
+                import math as _m
+                term_s = _m.log(max(MP_V1_REWARD_EPS, S))
+                term_o = _m.log(max(MP_V1_REWARD_EPS, O))
+                term_e = _m.log(max(MP_V1_REWARD_EPS, 1.0 - E))
+                term_d = _m.log(max(MP_V1_REWARD_EPS, 1.0 - D))
+                total = MP_V1_REWARD_SCALE * (
+                    MP_V1_ALPHA_SUCCESS * term_s
+                    + MP_V1_BETA_OVERHEAD * term_o
+                    + MP_V1_GAMMA_ENERGY * term_e
+                    + MP_V1_DELTA_DROP * term_d
+                )
+            else:
+                total = MP_V1_REWARD_SCALE * (
+                    (max(MP_V1_REWARD_EPS, S) ** MP_V1_ALPHA_SUCCESS)
+                    * (max(MP_V1_REWARD_EPS, O) ** MP_V1_BETA_OVERHEAD)
+                    * (max(MP_V1_REWARD_EPS, 1.0 - E) ** MP_V1_GAMMA_ENERGY)
+                    * (max(MP_V1_REWARD_EPS, 1.0 - D) ** MP_V1_DELTA_DROP)
+                )
+            total_reward = float(total) if math.isfinite(float(total)) else 0.0
+            reward_debug = {
+                "total": float(total_reward),
+                "S": float(S),
+                "O": float(O),
+                "E": float(E),
+                "D": float(D),
+                "form": str(MP_V1_REWARD_FORM),
+                "scale": float(MP_V1_REWARD_SCALE),
+                "energy_rate_total": float(e_rate_total),
+                "energy_rate_avg": float(e_rate_avg),
+                "energy_rate_mode": str(MP_V1_ENERGY_RATE_MODE),
+                "energy_rate_norm": float(MP_V1_ENERGY_RATE_NORM),
+                "created": int(created),
+                "transferred": int(transferred),
+                "delivered": int(delivered),
+                "dropped": int(dropped),
+                "energy_used": float(energy_used),
+                "n_hosts": int(n_hosts),
+            }
+            if MP_V1_REWARD_DEBUG_PRINT:
+                try:
+                    step_id_dbg = int(float(req.get("step_id", -1) or -1))
+                except Exception:
+                    step_id_dbg = -1
+                print(
+                    "[MP_V1_REWARD] "
+                    f"step={step_id_dbg} total={total_reward:.6f} "
+                    f"S={S:.3f} O={O:.3f} E={E:.3f} D={D:.3f} "
+                    f"e_rate_total={e_rate_total:.6f} e_rate_avg={e_rate_avg:.6f} "
+                    f"e_mode={MP_V1_ENERGY_RATE_MODE} e_norm={MP_V1_ENERGY_RATE_NORM:.6f}"
+                )
+        except Exception:
+            reward_debug = None
+            total_reward = 0.0
+
+    # Accumulate per-episode totals for logging
+    try:
+        Handler.MP_V1_EP_REWARD_ACC = float(Handler.MP_V1_EP_REWARD_ACC or 0.0) + float(total_reward or 0.0)
+        Handler.MP_V1_EP_COMBO_REWARD_SUM = float(Handler.MP_V1_EP_COMBO_REWARD_SUM or 0.0) + float(total_reward or 0.0)
+        Handler.MP_V1_EP_CREATED_SUM = int(Handler.MP_V1_EP_CREATED_SUM or 0) + int(created or 0)
+        Handler.MP_V1_EP_TRANSFERRED_SUM = int(Handler.MP_V1_EP_TRANSFERRED_SUM or 0) + int(transferred or 0)
+        Handler.MP_V1_EP_DELIVERED_SUM = int(Handler.MP_V1_EP_DELIVERED_SUM or 0) + int(delivered or 0)
+        Handler.MP_V1_EP_DROPPED_SUM = int(Handler.MP_V1_EP_DROPPED_SUM or 0) + int(dropped or 0)
+        Handler.MP_V1_EP_ENERGY_USED_SUM = float(Handler.MP_V1_EP_ENERGY_USED_SUM or 0.0) + float(energy_used or 0.0)
+        Handler.MP_V1_EP_HOST_SAMPLES_SUM = int(Handler.MP_V1_EP_HOST_SAMPLES_SUM or 0) + int(max(0, int(n_hosts or 0)))
+        Handler.MP_V1_EP_STEP_COUNT = int(Handler.MP_V1_EP_STEP_COUNT or 0) + 1
+    except Exception:
+        pass
+
+    # Build obs/key batches
+    obs_batch = []
+    keys = []
+    hosts = []
+    for item in state_batch:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("host", "") or "")
+        obs = item.get("obs") or []
+        if not host or not isinstance(obs, list) or len(obs) == 0:
+            continue
+        hosts.append(host)
+        obs_batch.append(obs)
+        keys.append(f"{host}#v1")
+
+    # Global features (shared across hosts) - used by centralized critic / transition storage
+    global_features = req.get("global_features", []) or []
+    global_features_batch = []
+    if isinstance(global_features, list) and len(global_features) > 0:
+        global_features_batch = [global_features for _ in range(len(obs_batch))]
+
+    # Lazy-init MP v1 agent (separate from the legacy delta agent)
+    if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is None:
+        try:
+            obs_dim = int(len(obs_batch[0])) if obs_batch else 371
+            gf_dim = int(len(global_features)) if isinstance(global_features, list) else 0
+            if gf_dim <= 0:
+                gf_dim = 5
+            Handler.MP_V1_AGENT = CTDESACPolicy(
+                obs_dim=obs_dim,
+                global_obs_dim=obs_dim + gf_dim,
+                hidden_size=LSTM_HIDDEN_SIZE,
+                action_dim=5,
+            )
+            Handler.MP_V1_AGENT.policy_id = "masac_maxprop_v1"
+            # For host-level MaxProp++ control, ingest all hosts each step by default.
+            try:
+                Handler.MP_V1_AGENT.step_max_sequences = int(MP_V1_STEP_MAX_SEQUENCES)
+            except Exception:
+                Handler.MP_V1_AGENT.step_max_sequences = 0
+        except Exception as exc:
+            print(f"[BOOT] Failed to init MP_V1_AGENT: {exc}")
+            Handler.MP_V1_AGENT = None
+
+    # Ingest previous step transitions (reward for last action)
+    if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None and Handler.TRAINING_ENABLED:
+        try:
+            map_host_to_keys = {h: [f"{h}#v1"] for h in hosts}
+            per_host = total_reward / max(1, len(hosts))
+            rewards_per_host = {h: per_host for h in hosts}
+            rewards_per_key = {f"{h}#v1": per_host for h in hosts}
+            step_id = int(float(req.get("step_id", -1) or -1))
+            Handler.MP_V1_AGENT.update(
+                rewards_per_host,
+                rewards_per_key,
+                map_host_to_keys,
+                delta_limit=1.0,
+                epochs=None,
+                done_keys=set(),
+                low_zone_relays=set(),
+                delivery_per_key=None,
+                overhead_per_key=None,
+                train_now=(False if FORCE_EPISODE_END_ONLY_UPDATES else (not EPISODIC_UPDATES)),
+                allow_cleanup=True,
+                allow_trim=True,
+                step_id=step_id,
+                next_obs_batch=obs_batch,
+                next_keys=keys,
+                next_global_features=global_features_batch,
+            )
+            # Optional: distribute episodic training inside an episode (instead of only at episode_end).
+            if (not FORCE_EPISODE_END_ONLY_UPDATES) and EPISODIC_UPDATES and EPISODIC_TRAIN_INTERVAL_STEPS > 0 and step_id >= 0:
+                last_i = getattr(Handler, "MP_V1_LAST_EPISODIC_TRAIN_STEP_ID", None)
+                if last_i is None:
+                    Handler.MP_V1_LAST_EPISODIC_TRAIN_STEP_ID = step_id
+                else:
+                    try:
+                        due = (int(step_id) - int(last_i)) >= int(EPISODIC_TRAIN_INTERVAL_STEPS)
+                    except Exception:
+                        due = False
+                    if due and getattr(Handler.MP_V1_AGENT, "ready_sequences", None):
+                        try:
+                            mid_res = Handler.MP_V1_AGENT.train_ready_sequences(force=False)
+                        except Exception as mid_exc:
+                            mid_res = {"updated": False, "error": str(mid_exc)}
+                        if isinstance(mid_res, dict) and mid_res.get("updated"):
+                            Handler.MP_V1_LAST_EPISODIC_TRAIN_STEP_ID = step_id
+                            try:
+                                Handler.MP_V1_EP_LOSS_POLICY_SUM += float(mid_res.get('policy_loss', 0.0) or 0.0)
+                                Handler.MP_V1_EP_LOSS_VALUE_SUM += float(mid_res.get('value_loss', 0.0) or 0.0)
+                                Handler.MP_V1_EP_LOSS_COST_VALUE_SUM += float(mid_res.get('cost_value_loss', 0.0) or 0.0)
+                                Handler.MP_V1_EP_LOSS_ENTROPY_SUM += float(mid_res.get('entropy', 0.0) or 0.0)
+                                Handler.MP_V1_EP_LOSS_UPDATE_COUNT += 1
+                            except Exception:
+                                pass
+                            try:
+                                sim_time_now = int(float(req.get("time", 0) or 0))
+                            except Exception:
+                                sim_time_now = 0
+                            try:
+                                metrics_with_sim = dict(mid_res)
+                                sim_id_mid = str(req.get("sim_id", "") or "")
+                                metrics_with_sim["sim_id"] = sim_id_mid
+                                # Episode number not incremented until episode_end; log under current+1.
+                                ep_num = max(1, int(Handler.MP_V1_EP_COUNT or 0) + 1)
+                                buf_mid = extract_buffer_size_mb(sim_id_mid)
+                                log_update_metrics(sim_time_now, metrics_with_sim, buf_mid, ep_num)
+                            except Exception:
+                                pass
+        except Exception as exc:
+            print(f"[MP_V1] update failed: {exc}")
+
+    # Produce actions for current state (uses global_features_batch prepared above)
+
+    actions_raw = None
+    if TORCH_OK and getattr(Handler, "MP_V1_AGENT", None) is not None:
+        try:
+            actions_raw = Handler.MP_V1_AGENT.act_batch(obs_batch, 1.0, keys, global_features_batch)
+        except Exception as exc:
+            print(f"[MP_V1] act_batch failed: {exc}")
+            actions_raw = None
+
+    # Fallback: heuristic if agent not available
+    if actions_raw is None:
+        tau_default = 600.0
+        beta_default = 0.2
+        kx_default = 1.0
+        for i, host in enumerate(hosts):
+            obs = obs_batch[i] if i < len(obs_batch) else []
+            e_norm = _to_float(obs[0], 0.5) if len(obs) > 0 else 0.5
+            buf_occ = _to_float(obs[3], 0.0) if len(obs) > 3 else 0.0
+            lam = lam_min
+            tau = _clamp(tau_default, tau_min, tau_max)
+            beta = _clamp(beta_default, beta_min, beta_max)
+            kx = _clamp(kx_default, kx_min, kx_max)
+            mr = mr_min  # large negative disables relay-margin gating
+            if buf_occ >= 0.85 or e_norm <= 0.20:
+                lam = _clamp(lam_min + 0.5 * (lam_max - lam_min), lam_min, lam_max)
+                kx = _clamp(0.7, kx_min, kx_max)
+                mr = _clamp(0.2, mr_min, mr_max)
+            actions.append({
+                "host": host,
+                "lambda_cost": float(lam),
+                "tau_age": float(tau),
+                "beta_x": float(beta),
+                "k_x": float(kx),
+                "m_relay": float(mr),
+            })
+            if MP_V1_ACTION_LOG_ENABLE:
+                try:
+                    st = Handler.MP_V1_ACT_STATS
+                    if not isinstance(st, dict):
+                        st = {
+                            "n": 0,
+                            "lam_sum": 0.0, "lam_sumsq": 0.0, "lam_min_obs": float("inf"), "lam_max_obs": float("-inf"),
+                            "lam_min_cnt": 0, "lam_max_cnt": 0,
+                            "tau_sum": 0.0, "tau_sumsq": 0.0, "tau_min_obs": float("inf"), "tau_max_obs": float("-inf"),
+                            "tau_min_cnt": 0, "tau_max_cnt": 0,
+                            "beta_sum": 0.0, "beta_sumsq": 0.0, "beta_min_obs": float("inf"), "beta_max_obs": float("-inf"),
+                            "beta_min_cnt": 0, "beta_max_cnt": 0,
+                            "kx_sum": 0.0, "kx_sumsq": 0.0, "kx_min_obs": float("inf"), "kx_max_obs": float("-inf"),
+                            "kx_min_cnt": 0, "kx_max_cnt": 0,
+                            "mr_sum": 0.0, "mr_sumsq": 0.0, "mr_min_obs": float("inf"), "mr_max_obs": float("-inf"),
+                            "mr_min_cnt": 0, "mr_max_cnt": 0, "mr_ge0_cnt": 0,
+                            "lam_min": float(lam_min), "lam_max": float(lam_max),
+                            "tau_min": float(tau_min), "tau_max": float(tau_max),
+                            "beta_min": float(beta_min), "beta_max": float(beta_max),
+                            "kx_min": float(kx_min), "kx_max": float(kx_max),
+                            "mr_min": float(mr_min), "mr_max": float(mr_max),
+                        }
+                        Handler.MP_V1_ACT_STATS = st
+
+                    eps = 1e-12
+                    st["n"] = int(st.get("n", 0) or 0) + 1
+
+                    def _upd(prefix, v, lo, hi):
+                        st[prefix + "_sum"] += float(v)
+                        st[prefix + "_sumsq"] += float(v) * float(v)
+                        st[prefix + "_min_obs"] = min(float(st[prefix + "_min_obs"]), float(v))
+                        st[prefix + "_max_obs"] = max(float(st[prefix + "_max_obs"]), float(v))
+                        if float(v) <= float(lo) + eps:
+                            st[prefix + "_min_cnt"] = int(st.get(prefix + "_min_cnt", 0) or 0) + 1
+                        if float(v) >= float(hi) - eps:
+                            st[prefix + "_max_cnt"] = int(st.get(prefix + "_max_cnt", 0) or 0) + 1
+
+                    _upd("lam", lam, lam_min, lam_max)
+                    _upd("tau", tau, tau_min, tau_max)
+                    _upd("beta", beta, beta_min, beta_max)
+                    _upd("kx", kx, kx_min, kx_max)
+                    _upd("mr", mr, mr_min, mr_max)
+                    if float(mr) >= 0.0:
+                        st["mr_ge0_cnt"] = int(st.get("mr_ge0_cnt", 0) or 0) + 1
+                except Exception:
+                    pass
+        resp = {"policy_id": "heuristic_v1", "actions": actions}
+        if reward_debug is not None:
+            resp["reward_debug"] = reward_debug
+        return resp
+
+    # Map normalized actions to parameter ranges
+    for i, host in enumerate(hosts):
+        a = actions_raw[i] if i < len(actions_raw) else None
+        if not isinstance(a, (list, tuple)) or len(a) < 5:
+            a = [0.0, 0.0, 0.0, 0.0, 0.0]
+        lam = _clamp(_affine01(a[0], lam_min, lam_max), lam_min, lam_max)
+        tau = _clamp(_affine01(a[1], tau_min, tau_max), tau_min, tau_max)
+        beta = _clamp(_affine01(a[2], beta_min, beta_max), beta_min, beta_max)
+        kx = _clamp(_affine01(a[3], kx_min, kx_max), kx_min, kx_max)
+        mr = _clamp(_affine01(a[4], mr_min, mr_max), mr_min, mr_max)
+        actions.append({
+            "host": host,
+            "lambda_cost": float(lam),
+            "tau_age": float(tau),
+            "beta_x": float(beta),
+            "k_x": float(kx),
+            "m_relay": float(mr),
+        })
+
+        # Accumulate episode-level action stats (after clamping).
+        if MP_V1_ACTION_LOG_ENABLE:
+            try:
+                st = Handler.MP_V1_ACT_STATS
+                if not isinstance(st, dict):
+                    st = {
+                        "n": 0,
+                        "lam_sum": 0.0, "lam_sumsq": 0.0, "lam_min_obs": float("inf"), "lam_max_obs": float("-inf"),
+                        "lam_min_cnt": 0, "lam_max_cnt": 0,
+                        "tau_sum": 0.0, "tau_sumsq": 0.0, "tau_min_obs": float("inf"), "tau_max_obs": float("-inf"),
+                        "tau_min_cnt": 0, "tau_max_cnt": 0,
+                        "beta_sum": 0.0, "beta_sumsq": 0.0, "beta_min_obs": float("inf"), "beta_max_obs": float("-inf"),
+                        "beta_min_cnt": 0, "beta_max_cnt": 0,
+                        "kx_sum": 0.0, "kx_sumsq": 0.0, "kx_min_obs": float("inf"), "kx_max_obs": float("-inf"),
+                        "kx_min_cnt": 0, "kx_max_cnt": 0,
+                        "mr_sum": 0.0, "mr_sumsq": 0.0, "mr_min_obs": float("inf"), "mr_max_obs": float("-inf"),
+                        "mr_min_cnt": 0, "mr_max_cnt": 0, "mr_ge0_cnt": 0,
+                        "lam_min": float(lam_min), "lam_max": float(lam_max),
+                        "tau_min": float(tau_min), "tau_max": float(tau_max),
+                        "beta_min": float(beta_min), "beta_max": float(beta_max),
+                        "kx_min": float(kx_min), "kx_max": float(kx_max),
+                        "mr_min": float(mr_min), "mr_max": float(mr_max),
+                    }
+                    Handler.MP_V1_ACT_STATS = st
+
+                # Use a tight epsilon since values are clamped and often exactly equal at bounds.
+                eps = 1e-12
+                st["n"] = int(st.get("n", 0) or 0) + 1
+
+                def _upd(prefix, v, lo, hi):
+                    st[prefix + "_sum"] += float(v)
+                    st[prefix + "_sumsq"] += float(v) * float(v)
+                    st[prefix + "_min_obs"] = min(float(st[prefix + "_min_obs"]), float(v))
+                    st[prefix + "_max_obs"] = max(float(st[prefix + "_max_obs"]), float(v))
+                    if float(v) <= float(lo) + eps:
+                        st[prefix + "_min_cnt"] = int(st.get(prefix + "_min_cnt", 0) or 0) + 1
+                    if float(v) >= float(hi) - eps:
+                        st[prefix + "_max_cnt"] = int(st.get(prefix + "_max_cnt", 0) or 0) + 1
+
+                _upd("lam", lam, lam_min, lam_max)
+                _upd("tau", tau, tau_min, tau_max)
+                _upd("beta", beta, beta_min, beta_max)
+                _upd("kx", kx, kx_min, kx_max)
+                _upd("mr", mr, mr_min, mr_max)
+                if float(mr) >= 0.0:
+                    st["mr_ge0_cnt"] = int(st.get("mr_ge0_cnt", 0) or 0) + 1
+            except Exception:
+                pass
+
+    resp = {"policy_id": getattr(getattr(Handler, "MP_V1_AGENT", None), "policy_id", "masac_maxprop_v1"),
+            "actions": actions}
+    if reward_debug is not None:
+        resp["reward_debug"] = reward_debug
+
+    # Finalize derived action stats for the current episode (keep running aggregates; output at episode_end).
+    if MP_V1_ACTION_LOG_ENABLE:
+        try:
+            st = Handler.MP_V1_ACT_STATS
+            n = int(st.get("n", 0) or 0) if isinstance(st, dict) else 0
+            if isinstance(st, dict) and n > 0:
+                def _final(prefix):
+                    s = float(st.get(prefix + "_sum", 0.0) or 0.0)
+                    ss = float(st.get(prefix + "_sumsq", 0.0) or 0.0)
+                    mean = s / float(n)
+                    var = max(0.0, (ss / float(n)) - mean * mean)
+                    st[prefix + "_mean"] = mean
+                    st[prefix + "_std"] = math.sqrt(var)
+                    st[prefix + "_frac_min"] = float(st.get(prefix + "_min_cnt", 0) or 0) / float(n)
+                    st[prefix + "_frac_max"] = float(st.get(prefix + "_max_cnt", 0) or 0) / float(n)
+                _final("lam")
+                _final("tau")
+                _final("beta")
+                _final("kx")
+                _final("mr")
+                st["mr_frac_ge0"] = float(st.get("mr_ge0_cnt", 0) or 0) / float(n)
+        except Exception:
+            pass
+    return resp
+
+
 def main():
-    main_print(f"Starting R-MAPPO server at http://{HOST}:{PORT}/infer_and_update")
+    main_print(f"Starting DRL server at http://{HOST}:{PORT}/infer_and_update")
+    main_print("  - Legacy (non-mp_v1): R-MAPPO (PPO)")
+    main_print("  - MaxProp++ (rmappo_maxprop_v1): CTDE SAC (MA-SAC)")
     main_print(f"  - PyTorch: {'enabled' if TORCH_OK else 'disabled'}")
     main_print(f"  - GRU hidden size: {LSTM_HIDDEN_SIZE}")
     main_print(f"  - GRU layers: {LSTM_NUM_LAYERS}")
     main_print(f"  - Truncated BPTT: {TRUNCATED_BPTT_LEN} steps")
     main_print(f"  - Mode: {'EVAL_ONLY' if EVAL_ONLY else 'TRAINING'}")
-    main_print(f"  - Updates: {'EPISODIC' if EPISODIC_UPDATES else 'STREAMING'}")
+    if FORCE_EPISODE_END_ONLY_UPDATES:
+        main_print("  - Updates: EPISODE_END_ONLY (hardcoded)")
+    else:
+        main_print(f"  - Updates: {'EPISODIC' if EPISODIC_UPDATES else 'STREAMING'}")
+    if (not FORCE_EPISODE_END_ONLY_UPDATES) and EPISODIC_UPDATES and EPISODIC_TRAIN_INTERVAL_STEPS > 0:
+        main_print(f"  - Episodic mid-episode train interval: {EPISODIC_TRAIN_INTERVAL_STEPS} steps")
+    main_print(f"  - STEP_MAX_SEQUENCES={STEP_MAX_SEQUENCES} (legacy); MP_V1_STEP_MAX_SEQUENCES={MP_V1_STEP_MAX_SEQUENCES} (mp_v1)")
+    main_print(
+        "  - MP_v1 reward: enable={en} form={form} scale={scale} "
+        "alpha={a} beta={b} gamma={g} delta={d} e_norm={enorm}"
+        .format(
+            en=MP_V1_REWARD_ENABLE,
+            form=MP_V1_REWARD_FORM,
+            scale=MP_V1_REWARD_SCALE,
+            a=MP_V1_ALPHA_SUCCESS,
+            b=MP_V1_BETA_OVERHEAD,
+            g=MP_V1_GAMMA_ENERGY,
+            d=MP_V1_DELTA_DROP,
+            enorm=MP_V1_ENERGY_RATE_NORM,
+        )
+    )
+    main_print(f"    * MP_V1_ENERGY_RATE_MODE={MP_V1_ENERGY_RATE_MODE} (avg_per_host recommended for all-host control)")
+    if TORCH_OK:
+        try:
+            main_print(
+                "  - MP_v1 SAC defaults: "
+                f"gamma={SAC_DEFAULT_GAMMA} tau={SAC_DEFAULT_TAU} "
+                f"actor_lr={SAC_DEFAULT_ACTOR_LR} critic_lr={SAC_DEFAULT_CRITIC_LR} alpha_lr={SAC_DEFAULT_ALPHA_LR} "
+                f"batch={SAC_DEFAULT_BATCH_SIZE} replay={SAC_DEFAULT_REPLAY_SIZE} min_replay={SAC_DEFAULT_MIN_REPLAY_SIZE} "
+                f"auto_alpha={SAC_DEFAULT_AUTO_ALPHA} alpha_init={SAC_DEFAULT_ALPHA_INIT} "
+                f"updates_ep_end={SAC_DEFAULT_UPDATES_PER_EPISODE_END}"
+            )
+        except Exception:
+            pass
     if SPARSE_SUCCESS_REWARD and SR_COMBINE_WITH_STEP:
         main_print("  - Success-Rate Reward: SPARSE+STEP (combined)")
         main_print(f"    * SR_SPARSE_WEIGHT={SR_SPARSE_WEIGHT} (per-delivery), normalize={SR_SPARSE_NORMALIZE}")

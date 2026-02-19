@@ -1,0 +1,438 @@
+MaxProp (Burgess et al.) - 이 프로젝트 구현 상세 정리
+==================================================
+
+이 문서는 본 프로젝트(ONE 기반 DTN 시뮬레이터)에 구현된 MaxProp 라우팅 알고리즘을,
+코드 동작(상태/이벤트/정렬/삭제/확률 갱신/비용 계산) 관점에서 "그대로" 풀어 쓴 문서입니다.
+
+대상 구현(핵심 파일)
+- src/routing/MaxPropRouter.java
+- src/routing/maxprop/MeetingProbabilitySet.java
+- src/routing/maxprop/MaxPropDijkstra.java
+
+추가 구현(변형: timescale 기반 alpha 추정)
+- src/routing/MaxPropRouterWithEstimation.java
+
+ONE 시뮬레이터 공통 동작(전송 프레임워크)
+- src/routing/ActiveRouter.java  (update(), exchangeDeliverableMessages(), tryMessagesForConnected() 등)
+
+
+------------------------------------------------------------
+1. MaxPropRouter가 유지하는 상태(메모리)
+------------------------------------------------------------
+
+1) MeetingProbabilitySet probs
+  - "이 노드가 다음에 만날 노드가 X일 확률" P(next = X)를 저장하는 맵.
+  - key: 상대 노드의 network address(Integer)
+  - value: 확률(Double), 구현상 0~1 범위를 가정.
+
+2) Map<Integer, MeetingProbabilitySet> allProbs
+  - 이 노드 관점에서 알고 있는 "다른 노드들의 MeetingProbabilitySet"을 저장.
+  - key: 어떤 노드 A의 address
+  - value: "A가 다음에 만날 노드 분포"를 나타내는 MPS (MeetingProbabilitySet)
+  - 즉, (A -> B)의 확률을 이 노드가 간접적으로 추정/전파받아 저장해 두는 구조.
+
+3) MaxPropDijkstra dijkstra
+  - allProbs를 그래프로 보고, 특정 source에서 destination까지의 "비용(cost)"을 구함.
+
+4) Set<String> ackedMessageIds
+  - "최종 목적지에 도착했다고(ACK) 알려진 메시지 ID"를 보관.
+  - MaxProp는 연결 시 ACK 정보도 교환하여 네트워크적으로 삭제를 전파한다.
+
+5) 비용 캐시: Map<Integer, Double> costsForMessages + DTNHost lastCostFrom
+  - getCost(from,to) 호출이 잦아서, from 기준 Dijkstra 결과를 캐시.
+  - 다음 이벤트에서 캐시를 무효화(null)한다:
+    - 새 연결이 올라올 때(changedConnection에서 con.isUp())
+    - 새 메시지를 수신할 때(messageTransferred)
+
+6) Map<DTNHost, Set<String>> sentMessages
+  - "이 노드가 특정 상대(host)에게 특정 메시지ID를 과거에 보냈는지" 기록.
+  - 목적: HISTORY에 언급된 버그픽스 동작.
+    - 상대가 메시지를 버퍼에서 삭제했더라도, 이미 한 번 보냈던 메시지는 다시 보내지 않음.
+  - 실제 필터링은 tryOtherMessages()에서 수행.
+
+7) 평균 전송 바이트 추정: avgSamples[], avgTransferredBytes
+  - "전송 기회(transfer opportunity)당 평균 전송 바이트" x 를 추정하기 위한 이동평균.
+  - 연결이 내려갈 때(con down) 해당 연결에서 실제 전송된 바이트를 샘플로 넣어 업데이트.
+  - 샘플 개수: BYTES_TRANSFERRED_AVG_SAMPLES(기본 10)
+  - 0인 샘플은 평균 계산에서 제외(실제 전송이 없었던 기회는 무시).
+
+
+------------------------------------------------------------
+2. 설정 파라미터(프로젝트 구현 기준)
+------------------------------------------------------------
+
+MaxPropRouter 설정 네임스페이스: "MaxPropRouter"
+
+1) alpha (설정키: MaxPropRouter.alpha)
+  - 기본값: 1.0 (DEFAULT_ALPHA)
+  - MeetingProbabilitySet.updateMeetingProbFor()에서 "방금 만난 노드의 확률을 alpha만큼 증가"
+    시킨 뒤, 전체를 (1+alpha)로 정규화하는 형태로 반영됨.
+  - alpha=1이면 원 논문/기본 구현과 같은 형태로 동작.
+
+2) probSetMaxSize (설정키: MaxPropRouter.probSetMaxSize)
+  - 기본값: 50 (DEFAULT_PROB_SET_MAX_SIZE)
+  - MeetingProbabilitySet이 저장할 확률 항목(만난 노드 목록)의 최대 크기.
+  - 구현상, updateMeetingProbFor() 수행 후 크기가 maxSetSize 이상이면
+    "가장 작은 확률 항목 1개"를 제거한다(성능 목적).
+
+주의(구현 디테일)
+  - 코드 조건이 ">= maxSetSize" 이라서, size가 정확히 maxSetSize가 되었을 때도 1개를 제거한다.
+    결과적으로 유지되는 항목 수가 (maxSetSize-1)처럼 보일 수 있다(설계 의도와 다를 수 있음).
+
+
+------------------------------------------------------------
+3. 만남(연결) 이벤트에서의 알고리즘 동작 (changedConnection)
+------------------------------------------------------------
+
+MaxPropRouter.changedConnection(Connection con) 의 핵심은 "연결 UP 시 학습/교환, 연결 DOWN 시 통계 업데이트"이다.
+
+A) 연결이 새로 올라옴(con.isUp() == true)
+  1) costsForMessages = null 로 비용 캐시 무효화
+     - 연결로 인해 확률/그래프가 바뀌므로, 이후 getCost()는 재계산해야 함.
+
+  2) Initiator만 동작(con.isInitiator(getHost()) == true)
+     - initiator가 "양쪽 라우터"에 대해 필요한 처리까지 한 번에 수행한다.
+     - 상대 라우터 타입이 동일해야 한다(다르면 assert 실패).
+
+  3) ACK 정보 교환 + 삭제 전파
+     - this.ackedMessageIds U other.ackedMessageIds 를 양쪽 모두에 반영
+     - 그 다음 deleteAckedMessages()로 버퍼에서 ACK된 메시지를 삭제(전송 중이면 제외)
+
+  4) 만남 확률 업데이트(직접 만남 1회 반영)
+     - this.probs.updateMeetingProbFor(otherHost.getAddress())
+     - otherRouter.probs.updateMeetingProbFor(thisHost.getAddress())
+
+  5) 전이(Transitive) 확률 정보 교환
+     - updateTransitiveProbs(otherRouter.allProbs)
+       * 상대가 들고 있는 allProbs 항목 중, lastUpdateTime이 더 최신이면 내 allProbs를 교체
+     - 반대 방향도 동일하게 수행.
+
+  6) "상대의 probs"와 "내 probs"를 allProbs에 서로 저장(복제본)
+     - this.allProbs.put(otherAddr, otherRouter.probs.replicate())
+     - otherRouter.allProbs.put(myAddr, this.probs.replicate())
+     - replicate()는 deep copy + lastUpdateTime 포함.
+
+B) 연결이 내려감(con.isUp() == false)
+  - updateTransferredBytesAvg(con.getTotalBytesTransferred()) 호출
+  - 이 값으로 avgTransferredBytes(x)가 업데이트되고, 이후 calcThreshold()에 영향을 준다.
+
+
+------------------------------------------------------------
+4. MeetingProbabilitySet 갱신 규칙(핵심 수식)
+------------------------------------------------------------
+
+MeetingProbabilitySet.updateMeetingProbFor(index)의 구현을 수식으로 적으면 다음과 같다.
+
+현재 probs 맵이 P_old(.)를 나타낸다고 할 때, 방금 만난 노드 b=index에 대해:
+
+1) P_old(b)가 없으면 0으로 간주한다.
+2) b의 값을 alpha만큼 증가:
+     P_tmp(b) = P_old(b) + alpha
+     (다른 항목은 P_tmp(j) = P_old(j))
+3) 전체를 (1+alpha)로 정규화:
+     P_new(k) = P_tmp(k) / (1 + alpha)   for all k in probs
+   => 결과적으로 합(sum)은 1이 되도록 유지되는 형태.
+
+특수 케이스
+  - probs가 비어있던 첫 만남이면:
+      probs.put(index, 1.0) 하고 종료(정규화 루프 없음)
+
+최대 크기 제한(maxSetSize)
+  - 정규화 과정에서 가장 작은 value를 추적(smallestEntry)
+  - 정규화 후 probs.size() >= maxSetSize 이면 smallestEntry를 제거
+
+부가 메서드: updateMeetingProbFor(index, iet)
+  - 해당 key에 값을 그대로 put(index, iet)
+  - 정규화도 없고 lastUpdateTime 갱신도 없다(= 사용 시 주의 필요).
+
+
+------------------------------------------------------------
+5. 비용(cost) 그래프 정의와 Dijkstra 계산 (MaxPropDijkstra)
+------------------------------------------------------------
+
+MaxProp은 "다음 만남 확률"을 링크 가중치로 바꿔, 목적지까지의 최소 비용 경로를 구한다.
+
+그래프 구성(이 구현 기준)
+  - 노드: DTNHost의 address(Integer)
+  - 방향 간선: u -> v 가 존재하려면, allProbs[u] 안에 v가 키로 존재해야 함
+  - 간선 비용(distance):
+      w(u,v) = 1 - P_u(v)
+    (P_u(v)는 "u가 다음에 v를 만날 확률")
+
+경로 비용
+  - 어떤 경로 u=a0, a1, ..., ak=v에 대해:
+      cost = sum_{i=0..k-1} (1 - P_{ai}(a{i+1}))
+  - MaxPropDijkstra.getCosts(from, toSet)는 "from에서 각 dest까지의 최소 cost"를 구한다.
+
+검색 최적화(중요)
+  - MaxPropRouter.getCost(from,to)는 Dijkstra를 "모든 노드"로 돌리지 않는다.
+  - 버퍼에 존재하는 메시지들의 목적지 주소들만 모아(Set<Integer> toSet),
+    그 목적지들에 대해서만 비용을 계산한다.
+  - 비용 캐싱:
+      - costsForMessages에 destination->cost 저장
+      - lastCostFrom이 from과 다르거나 costsForMessages가 null이면 재계산
+
+추가 구현 디테일
+  - relax(node)는 allProbs에 node의 MPS가 없으면 이웃을 모른다고 보고 종료(return).
+  - getDistance(from,to)에서 probs.containsKey(from)를 assert로 강하게 가정한다.
+
+
+------------------------------------------------------------
+6. 전송(Forwarding) 의사결정 흐름 (update)
+------------------------------------------------------------
+
+MaxPropRouter.update()의 큰 흐름은:
+  1) 지금 전송 시작 가능한 상태인지 확인
+  2) 가능하면 "직접 목적지에게 줄 수 있는 메시지"부터 우선 전송
+  3) 그 다음 MaxProp 정렬 규칙에 따라 나머지 메시지들을 후보로 전송 시도
+
+1) 전송 가능 조건
+  - ActiveRouter.canStartTransfer() && !isTransferring() 를 만족해야 한다.
+  - isTransferring()은 "내가 보내는 중"이거나 "연결이 새 전송을 받을 준비가 안됨"이면 true.
+
+2) 1차 우선: exchangeDeliverableMessages()
+  - 현재 연결된 이웃 중, 메시지의 최종 목적지(to)와 동일한 노드가 있으면 그걸 먼저 시도.
+  - 이 단계는 ActiveRouter 공통 로직이며, MaxProp 고유 정렬은 여기엔 거의 개입하지 않는다
+    (큐 모드에 따라 정렬).
+
+3) 2차: tryOtherMessages()
+  - "그 외 전송"을 위해, (메시지, 연결) 튜플 후보를 만들고 정렬하여 순서대로 시도한다.
+
+
+------------------------------------------------------------
+7. tryOtherMessages() 후보 생성 규칙(프로젝트 구현의 핵심 필터)
+------------------------------------------------------------
+
+tryOtherMessages()는 다음 과정을 수행한다.
+
+A) 후보 튜플 생성
+  - 모든 연결 con에 대해:
+      other = con.getOtherNode(getHost())
+      othRouter = (MaxPropRouter) other.getRouter()
+
+  - 다음 조건이면 그 연결(other)은 이번 후보에서 제외:
+      othRouter.isTransferring() == true
+
+  - 남은 연결에 대해, 내 버퍼의 모든 메시지 m에 대해 다음 조건을 검사:
+    1) 상대(other)가 이미 m을 가지고 있으면 제외:
+         othRouter.hasMessage(m.getId()) == true
+    2) m이 이미 other를 경유한 적이 있으면 제외:
+         m.getHops().contains(other) == true
+    3) (중요) 과거에 이미 이 other에게 m을 보낸 적이 있으면 제외:
+         sentMessages.get(other) 에 m.getId()가 있으면 제외
+       - 즉, 상대가 메시지를 버퍼에서 삭제해도 "재전송"을 하지 않는다.
+
+  - 위 조건을 통과하면 후보로 추가:
+      tuples.add( (m, con) )
+
+B) 후보가 비어있으면 null 반환(전송 시도 종료)
+
+C) 후보 정렬: MaxPropTupleComparator(calcThreshold())
+  - 아래의 "정렬 규칙" 섹션에서 상세 설명.
+
+D) 정렬된 순서대로 tryMessagesForConnected(tuples)로 전송 시작 시도
+  - ActiveRouter.tryMessagesForConnected()는 리스트 순서대로 startTransfer(m,con)을 호출하며,
+    첫 번째로 수락(RCV_OK)되는 항목에서 멈춘다.
+
+
+------------------------------------------------------------
+8. 메시지 전송/드롭 우선순위: Threshold 기반 2단 정렬
+------------------------------------------------------------
+
+MaxProp 구현에서 핵심은 "버퍼를 두 영역으로 나누고(priority vs non-priority),
+priority 영역은 hop count 중심, 나머지는 cost 중심으로 정렬"하는 것이다.
+
+8.1 Threshold 계산 (calcThreshold)
+  - 변수:
+      b = buffer size (bytes)  : this.getBufferSize()
+      x = avg transferred bytes: this.avgTransferredBytes
+  - x == 0이면 임계값 계산 불가로 threshold=0 반환
+
+  - priority portion p (bytes) 계산:
+      if x < b/2:
+          p = x
+      else if b/2 <= x && x < b:
+          p = min(x, b-x)
+      else:
+          threshold = 0 (no need)
+
+  - 메시지 목록을 hop count 오름차순으로 정렬한 뒤,
+    앞에서부터 메시지 size를 p에서 차감해가며, p를 처음으로 0 이하로 만드는 "그 메시지"를 찾는다.
+  - 그 메시지의 hopCount + 1 을 threshold로 사용:
+      threshold = hopCount(exceeding_msg) + 1
+
+  - 해석:
+    - hopCount가 threshold보다 작은 메시지들이 "priority 영역"
+    - 나머지는 "cost 기반 영역"
+
+8.2 메시지 비교(정렬) 규칙: MaxPropComparator
+  입력: msg1, msg2 (그리고 threshold, 그리고 cost 계산의 from 호스트)
+
+  1) hopCount < threshold 인 메시지가 항상 우선.
+     - 한 쪽만 priority 영역이면 그쪽이 먼저.
+
+  2) 둘 다 priority 영역이면 hopCount가 작은 것이 우선.
+
+  3) 둘 다 non-priority 영역이면 getCost(from, msg.to)가 작은 것이 우선.
+     - cost tie면:
+       a) hopCount로 타이브레이크
+       b) hopCount도 같으면 MessageRouter의 queue mode(compareByQueueMode)로 타이브레이크
+
+8.3 (메시지,연결) 튜플 정렬: MaxPropTupleComparator
+  - 튜플 비교 시, cost를 계산하는 from을 "해당 연결의 상대 노드"로 둔다:
+      from1 = tuple1.connection.getOtherNode(getHost())
+      from2 = tuple2.connection.getOtherNode(getHost())
+  - 즉 "내가 other에게 한 번 전달한 다음, other가 dest로 보내는 비용"을 기준으로
+    메시지의 우선순위를 정한다는 뜻이다.
+
+  - 구현상:
+      comp = new MaxPropComparator(threshold, from1, from2)
+      return comp.compare(msg1, msg2)
+
+
+------------------------------------------------------------
+9. 드롭(버퍼 제거) 정책: getNextMessageToRemove()
+------------------------------------------------------------
+
+버퍼가 꽉 차서 메시지를 제거해야 하는 순간(ActiveRouter 공통 흐름에서 호출됨),
+MaxPropRouter는 아래 방식으로 "가장 덜 중요한 메시지"를 고른다.
+
+1) 메시지 목록을 모으되, excludeMsgBeingSent=true 이면 전송 중인 메시지는 후보에서 제외
+2) 메시지 후보를 MaxPropComparator(calcThreshold())로 정렬
+3) 정렬된 리스트의 "마지막" 메시지를 반환
+   - compare()가 "우선순위가 높은 것이 앞"이므로, 마지막이 최우선순위가 가장 낮은 메시지.
+
+
+------------------------------------------------------------
+10. ACK(Delivered) 전파/삭제 규칙
+------------------------------------------------------------
+
+MaxProp 구현은 delivered(최종 목적지 도착) 메시지를 네트워크적으로 삭제시키기 위한 ACK 집합을 유지한다.
+
+A) delivered 감지
+  - messageTransferred(id, from):
+      - super.messageTransferred 후, isDeliveredMessage(m)이면 ackedMessageIds에 id 추가
+
+  - transferDone(Connection con):
+      - con.getMessage()가 "최종 목적지 recipient에게 전달"되었다면 ackedMessageIds에 추가
+      - 그리고 내 버퍼에서 해당 메시지를 즉시 deleteMessage(id,false)
+
+B) ACK 교환
+  - 연결이 올라온 순간(initiator일 때) 양쪽의 ackedMessageIds를 union 하여 동기화
+  - 그 직후 deleteAckedMessages()로 내 버퍼에서 ACK된 메시지를 삭제
+
+C) deleteAckedMessages()의 안전장치
+  - 전송 중인 메시지(isSending(id))는 삭제하지 않는다.
+
+
+------------------------------------------------------------
+11. "이미 보낸 메시지 재전송 방지" 동작(sentMessages)
+------------------------------------------------------------
+
+이 프로젝트의 MaxPropRouter는 sentMessages 맵을 통해 다음을 보장한다.
+
+정책:
+  - "특정 이웃에게 특정 메시지를 과거에 보낸 적이 있으면, 그 이웃에게 다시 보내지 않는다."
+  - 상대가 버퍼에서 삭제했는지는 고려하지 않는다(재전송 안 함).
+
+구현 위치:
+  - 후보 생성 tryOtherMessages()에서 sentMessages.get(other)에 id가 있으면 continue로 제외.
+
+기록 업데이트:
+  - transferDone(Connection con)에서:
+      recipient = con.getOtherNode(getHost())
+      sentMessages[recipient].add(msgId)
+
+주의:
+  - 이 기록은 "전송이 완료된" 경우에만 추가된다(transferDone 시점).
+    즉, 전송 시도만 하고 실패한 경우는 기록되지 않는다.
+
+
+------------------------------------------------------------
+12. 변형 구현: MaxPropRouterWithEstimation (timescale 기반 alpha 추정)
+------------------------------------------------------------
+
+이 프로젝트에는 MaxPropRouter의 변형인 MaxPropRouterWithEstimation도 포함되어 있다.
+핵심 차이는 alpha를 고정 설정값으로 쓰지 않고, timescale과 관측된 만남 통계로 추정한다는 점이다.
+
+설정 네임스페이스: "MaxPropRouterWithEstimation"
+- timeScale (설정키: MaxPropRouterWithEstimation.timeScale)
+
+추정에 쓰는 통계
+1) 평균 Inter-Encounter Time(meanIET)
+  - 특정 호스트와 다시 만날 때까지 걸린 시간 차(timeDiff)를 샘플로 갱신
+
+2) 평균 Encounter Count(meanENC)
+  - "몇 번의 encounter 이후 다시 만났는지"를 샘플로 갱신
+
+파라미터 업데이트 트리거
+  - changedConnection에서 initiator일 때, updateEstimators(otherHost) 결과가 true면 updateParam() 수행
+  - updateParam()이 계산한 alpha는 probs.setAlpha(alpha)로 MeetingProbabilitySet에 반영됨
+
+주의/차이점
+  - MaxPropRouterWithEstimation에는 MaxPropRouter의 sentMessages 재전송 방지 맵이 없다.
+    따라서 "상대가 삭제했어도 재전송하지 않음" 같은 동작은 기본형(MaxPropRouter)에만 존재한다.
+
+
+------------------------------------------------------------
+13. 구현을 이해할 때 유용한 간단 의사코드(pseudocode)
+------------------------------------------------------------
+
+[changedConnection(con)]
+if con.isUp():
+    costsForMessages = null
+    if con.isInitiator(me):
+        other = con.getOtherNode(me)
+        assert other.router is MaxPropRouter
+
+        // ACK sync + delete
+        union ackedMessageIds
+        deleteAckedMessages() on both
+
+        // direct encounter learning
+        probs.updateMeetingProbFor(other.addr)
+        other.probs.updateMeetingProbFor(me.addr)
+
+        // transitive exchange (newer lastUpdateTime wins)
+        updateTransitiveProbs(other.allProbs)
+        other.updateTransitiveProbs(this.allProbs)
+
+        // store each other's probs snapshot
+        allProbs[other.addr] = other.probs.replicate()
+        other.allProbs[me.addr] = probs.replicate()
+else:
+    updateTransferredBytesAvg(con.totalBytesTransferred)
+
+
+[update()]
+super.update()
+if !canStartTransfer() or isTransferring(): return
+if exchangeDeliverableMessages() started: return
+tryOtherMessages()
+
+
+[tryOtherMessages()]
+tuples = []
+for each connection con:
+    other = con.otherNode(me)
+    if other.router.isTransferring(): continue
+    for each message m in myBuffer:
+        if other.hasMessage(m.id): continue
+        if m.hops contains other: continue
+        if sentMessages[other] contains m.id: continue
+        tuples.add( (m,con) )
+sort tuples by MaxPropTupleComparator(calcThreshold())
+tryMessagesForConnected(tuples)
+
+
+------------------------------------------------------------
+14. 참고: 테스트 코드
+------------------------------------------------------------
+
+프로젝트에는 MaxPropRouter 동작을 검증하는 테스트가 포함되어 있다.
+- src/test/MaxPropRouterTest.java
+- src/test/MaxPropDijkstraTest.java
+
+예: testCostValues()는 alpha=1일 때 meeting probability 업데이트/정규화가
+비용(1-P)로 어떻게 반영되는지를 단계적으로 확인한다.
+

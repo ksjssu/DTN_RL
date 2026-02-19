@@ -1,0 +1,10 @@
+## Override: disable DRL server communication entirely
+## Use with:
+##   ./one.sh -b 1 realistic_event_heavy_energy_43200_rmappo_maxprop_settings.txt \
+##       realistic_event_heavy_energy_43200_rmappo_maxprop_nodrl_override.txt
+##
+## Keeps the same scenario/router/traffic, but removes the bridge report so
+## the simulation can run without Python/HTTP overhead.
+
+Report.nrofReports = 8
+

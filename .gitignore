@@ -30,6 +30,9 @@ venv/
 *.log
 *.out
 
+# Local-only assistant configs
+.claude/settings.local.json
+
 # Windows/WSL artifacts
 NUL
 
@@ -49,6 +52,8 @@ backup_reports/
 
 # Model files (large binaries)
 models_rmappo/
+models_masac/
+models_rmappo_export/
 models/
 
 # LaTeX files

@@ -676,15 +676,58 @@ public class MaxPropRouterWithEstimation extends ActiveRouter {
 		/**
 		 * Compares two message-connection tuples using the
 		 * {@link MaxPropComparator#compare(Message, Message)}.
+		 *
+		 * Note: We must provide a comparator that obeys the general contract
+		 * (transitivity/antisymmetry). Some JVMs' TimSort will throw
+		 * IllegalArgumentException if the comparator is inconsistent under load.
 		 */
 		public int compare(Tuple<Message, Connection> tuple1,
 				Tuple<Message, Connection> tuple2) {
-			MaxPropComparator comp;
+			Message m1 = tuple1.getKey();
+			Message m2 = tuple2.getKey();
 			DTNHost from1 = tuple1.getValue().getOtherNode(getHost());
 			DTNHost from2 = tuple2.getValue().getOtherNode(getHost());
 
-			comp = new MaxPropComparator(threshold, from1, from2);
-			return comp.compare(tuple1.getKey(), tuple2.getKey());
+			if (m1 == m2 && from1 == from2) {
+				return 0;
+			}
+
+			int hopc1 = m1.getHopCount();
+			int hopc2 = m2.getHopCount();
+			boolean prio1 = (hopc1 < threshold);
+			boolean prio2 = (hopc2 < threshold);
+
+			if (prio1 && !prio2) {
+				return -1;
+			}
+			if (prio2 && !prio1) {
+				return 1;
+			}
+			if (prio1 && prio2) {
+				int d = hopc1 - hopc2;
+				if (d != 0) {
+					return d;
+				}
+			}
+
+			if (!prio1 && !prio2) {
+				double c1 = getCost(from1, m1.getTo());
+				double c2 = getCost(from2, m2.getTo());
+				int d = Double.compare(c1, c2);
+				if (d != 0) {
+					return d;
+				}
+				d = hopc1 - hopc2;
+				if (d != 0) {
+					return d;
+				}
+			}
+
+			int idCmp = m1.getId().compareTo(m2.getId());
+			if (idCmp != 0) {
+				return idCmp;
+			}
+			return Integer.compare(from1.getAddress(), from2.getAddress());
 		}
 	}
 

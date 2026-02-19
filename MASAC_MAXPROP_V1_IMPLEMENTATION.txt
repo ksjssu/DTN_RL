@@ -1,0 +1,197 @@
+MA-SAC (CTDE SAC) for MaxProp++ v1 — Implementation Notes
+==========================================================
+
+File implemented in:
+  - DTN_RL/toolkit/drl_server_rmappo_maxprop.py
+
+This document describes the SAC implementation that currently powers the
+MaxProp++ parameter-control protocol:
+  protocol = "rmappo_maxprop_v1"
+
+
+1) Where SAC is used (important)
+-------------------------------
+- Only the MaxProp++ v1 bridge path uses SAC:
+    Java:  report.RmappoMaxpropBridgeReport
+    Python: handle_rmappo_maxprop_v1(req)
+
+- Legacy (non-mp_v1) path is still PPO/R-MAPPO. Do not confuse the two.
+
+
+2) Protocol / data flow (server-side view)
+------------------------------------------
+Per sampling step (Java -> Python):
+  - state_batch:  per-host obs vectors (local observation)
+  - global_features: shared global feature vector (critic-only globals)
+  - prev_transition: per-host counters since previous sample
+      (created/transferred/delivered/dropped/energy_used, etc.)
+
+Python does:
+  A) Compute MP v1 scalar reward from prev_transition totals (global reward).
+  B) Ingest a transition for the *previous* action:
+       (s, a, r, s') for each host key
+     where:
+       - s, a were stored at the previous act_batch() call
+       - s' is the current step's state_batch (passed as next_obs_batch)
+  C) Produce current step actions for each host:
+       returns 5D normalized action per host, then maps into parameter ranges.
+
+Episode end (Java -> Python):
+  - mode="episode_end" is POSTed by RmappoMaxpropBridgeReport.done()
+  - Python performs training updates and saves a checkpoint.
+
+
+3) CTDE structure (Decentralized Actor, Centralized Critic)
+----------------------------------------------------------
+Actor (decentralized execution):
+  - Input: local obs (per-host)
+  - Network: SquashedGaussianActor (MLP -> mean/log_std -> tanh)
+  - Output: action in [-1, 1]^A (A=5 for MaxProp++ v1)
+
+Critic (centralized training):
+  - Input: global_obs + action
+  - global_obs is constructed as:
+      global_obs = concat(local_obs, global_features)
+  - Networks: twin Q (q1, q2) + targets (q1_target, q2_target)
+
+Note:
+  - This is feed-forward SAC (non-recurrent). No GRU/LSTM in SAC.
+
+
+4) Action meaning (A=5) and parameter mapping
+---------------------------------------------
+The action is interpreted as 5 normalized scalars, each mapped into the
+action_spec ranges supplied by Java:
+  a[0] -> lambda_cost  in [lambda_cost_min, lambda_cost_max]
+  a[1] -> tau_age      in [tau_age_min, tau_age_max]
+  a[2] -> beta_x       in [beta_x_min, beta_x_max]
+  a[3] -> k_x          in [k_x_min, k_x_max]
+  a[4] -> m_relay      in [m_relay_min, m_relay_max]
+
+Mapping:
+  - Each component a[i] in [-1,1] is affined into [min,max], then clamped.
+
+
+5) Reward (MP v1)
+-----------------
+Reward is computed from prev_transition totals using MP v1 reward config:
+  - S: success rate (delivered / created)
+  - O: overhead ratio ((transferred - delivered) / transferred)
+  - E: energy usage normalized by MP_V1_ENERGY_RATE_NORM
+  - D: drop rate (dropped / created)
+
+Then:
+  if form == "prod":
+    total = scale * (S^alpha) * (O^beta) * ((1-E)^gamma) * ((1-D)^delta)
+  if form == "log":
+    total = scale * (alpha*log(S) + beta*log(O) + gamma*log(1-E) + delta*log(1-D))
+
+Current defaults (unless env overrides):
+  MP_V1_REWARD_ENABLE = true
+  MP_V1_REWARD_FORM   = prod
+  MP_V1_REWARD_SCALE  = 10.0
+  MP_V1_REWARD_EPS    = 1e-6
+  MP_V1_ALPHA_SUCCESS = 4.0
+  MP_V1_BETA_OVERHEAD = 0.1
+  MP_V1_GAMMA_ENERGY  = 0.5
+  MP_V1_DELTA_DROP    = 0.0   (drop term effectively disabled)
+  MP_V1_ENERGY_RATE_NORM = 2.5
+  MP_V1_ENERGY_RATE_MODE = avg_per_host
+
+Important note:
+  - The current formula uses O^beta, so beta>0 rewards larger O.
+    If you intended overhead penalty, you usually want (1 - O)^beta.
+
+Credit assignment:
+  - total_reward is divided equally per active host per step and used as r.
+
+
+6) Replay buffer (exists)
+-------------------------
+Class:
+  - SACReplayBuffer (ring buffer, uniform random sampling)
+
+Stored tuples (per host key):
+  - obs, global_obs, action, reward, next_obs, next_global_obs, done
+
+How transitions are formed:
+  - act_batch() stores last_actions[key] = (obs, global_obs, action)
+  - update() consumes last_actions and the next_obs_batch/next_global_features
+    passed in by handle_rmappo_maxprop_v1() to build s' and push transitions.
+
+Persistence:
+  - Replay buffer is NOT saved in checkpoints. Restarting the server resets it.
+
+
+7) SAC update equations (what is implemented)
+---------------------------------------------
+Target Q:
+  target_q = r + (1-done)*gamma*(min(q1_t, q2_t) - alpha*logp(next_a))
+
+Critic loss:
+  Lq = MSE(q1(s,a), target_q) + MSE(q2(s,a), target_q)
+
+Actor loss:
+  Lpi = E[ alpha*logp(a|s) - min(q1(s,a), q2(s,a)) ]
+
+Entropy temperature alpha:
+  - Default: auto-alpha enabled
+  - target_entropy default: -action_dim (e.g., -5)
+  - alpha optimized via log_alpha
+
+Target networks:
+  - soft update with tau
+
+
+8) Default SAC hyperparameters (code-level defaults)
+----------------------------------------------------
+These are in SAC_DEFAULT_* constants (env can still override):
+  gamma              = 0.99
+  tau                = 0.005
+  batch_size         = 256
+  replay_size        = 200000
+  min_replay_size    = 10000
+  actor_lr           = 3e-4
+  critic_lr          = 3e-4
+  alpha_lr           = 3e-4
+  auto_alpha         = true
+  alpha_init         = 0.2
+  target_entropy     = -action_dim (if auto-alpha)
+  updates_per_episode_end = 32
+
+Note on updates_per_episode_end:
+  - Kept small to avoid Java bridge timeoutMs (default 3000ms) at episode_end.
+  - Increase with SAC_UPDATES_PER_EPISODE_END and/or raise timeoutMs.
+
+
+9) Training schedule in this server
+-----------------------------------
+- This server hardcodes FORCE_EPISODE_END_ONLY_UPDATES=True, so:
+  - transitions are collected during the episode
+  - training updates happen at episode_end only
+- A checkpoint is saved at episode_end:
+    models_masac/masac_maxprop_<sim_id>_epN.pt
+
+
+10) How to run (training)
+-------------------------
+Terminal 1 (server):
+  cd DTN_RL
+  PYTHONUNBUFFERED=1 .venv/bin/python -u toolkit/drl_server_rmappo_maxprop.py
+
+Terminal 2 (simulation):
+  cd DTN_RL
+  ./compile.sh
+  ./one.sh -b 2000 realistic_event_heavy_energy_43200_masac_maxprop_settings.txt
+
+Check:
+  - reports/*_RmappoMaxpropBridgeReport.txt contains policy=masac_maxprop_v1 lines
+  - models_masac contains masac_maxprop_*_ep*.pt
+
+
+11) Known limitations (current implementation)
+----------------------------------------------
+- SAC is feed-forward (no recurrent memory).
+- Global reward is equally distributed per host (no per-host counterfactual credit).
+- Replay buffer is not checkpointed.
+- MP v1 overhead term is currently O^beta (rewarding overhead if beta>0).

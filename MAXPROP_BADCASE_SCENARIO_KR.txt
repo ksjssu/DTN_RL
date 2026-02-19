@@ -1,0 +1,434 @@
+MaxProp가 감당하기 힘든 “현실적” 시나리오 탐색/검증 보고서 (한글)
+=========================================================
+
+작성 목적
+---------
+본 문서는 “MaxProp가 견디기 어려운(성능 개선 한계가 드러나는) 상황”을 현실적으로 구성하고,
+현재 프로젝트의 R-MAPPO(RMAPPO)로 그 한계를 해결(또는 최소 완화)하는 논문 실험을 위해:
+
+1) 관련 문헌/근거를 서칭(요약)
+2) The ONE 기반 설정 파일(시나리오)로 구현
+3) 실제 시뮬레이션을 돌려 MaxProp가 “어디서 왜” 무너지는지 정량 확인
+
+까지 완료한 결과를 한 번에 정리한 문서입니다.
+
+
+0. 결론(추천 시나리오 한 줄 요약)
+---------------------------------
+추천 “MaxProp 불리(현실적)” 시나리오는 아래 3개 설정 파일 세트입니다.
+
+- `realistic_event_heavy_energy_43200_maxprop_settings.txt`
+- `realistic_event_heavy_energy_43200_prophet_settings.txt`
+- `realistic_event_heavy_energy_43200_spraywait_settings.txt`
+
+핵심 현상:
+- **사건(Incident) 구간(14400~18000s) 대용량/고빈도 트래픽 + 차량(고대역폭 캐리어)의 제한된 배터리**가 결합되면,
+  MaxProp의 **높은 전송/복제(오버헤드)**가 차량 에너지 소모를 가속하고,
+  결국 **t=18000~23400s 사이 차량 20대가 모두 꺼지면서(비활성화)** 그래프가 붕괴 → 이후 구간의 전달 성공률이 크게 떨어집니다.
+- 같은 에너지 제약에서 Spray-and-Wait는 전송량이 작아 차량이 살아남아, **MaxProp 대비 delivery가 크게 높음**.
+
+
+1. “왜 MaxProp가 어려워하는가” (문헌 기반 관점)
+-------------------------------------------------
+MaxProp는 (i) 만남 확률 기반의 cost 계산(Dijkstra), (ii) 큐/드롭 우선순위, (iii) ACK 교환으로 성능을 끌어올리는
+강한 휴리스틱/최적화 결합 프로토콜입니다.
+
+하지만 현실적인 재난/이벤트 DTN에서는 아래 요소들이 결합되어 MaxProp가 구조적으로 불리해질 수 있습니다.
+
+1) **비정상(Non-stationary) 접촉 그래프**
+   - 사건 발생/교통 통제/가용 노드 변화(예: 차량/드론 duty-cycle, 배터리 소진)로 “과거 만남 확률”이 빠르게 낡음.
+
+2) **자원 제약(특히 에너지)**
+   - MaxProp는 목표(전달)를 위해 전송을 많이 수행할 수 있는데,
+     “전송 1회”가 아니라 “전송 시간(초)”에 비례해 에너지가 소모되는 모델에서는
+     오버헤드가 곧 **가용 노드 감소(그래프 붕괴)**로 이어질 수 있음.
+
+3) **링크 용량/접촉 시간의 이질성**
+   - 실제 환경에서는 BLE/와이파이/거리 기반 용량 저하/간섭으로 effective bitrate와 접촉 지속시간이 크게 달라짐.
+   - 확률만으로 경로/우선순위를 잡으면 “실제로는 못 보내는(짧은 접촉·저속 링크)” 케이스가 누적될 수 있음.
+
+참고 문헌(핵심만):
+- MaxProp 원 논문: Burgess et al., “MaxProp: Routing for Vehicle-Based Disruption-Tolerant Networks”, IEEE INFOCOM 2006. DOI: 10.1109/INFOCOM.2006.228
+- Prophet 스펙: RFC 6693 (Probabilistic Routing Protocol for Intermittently Connected Networks)
+- The ONE 시뮬레이터: Keränen, Ott, Kärkkäinen, “The ONE Simulator for DTN Protocol Evaluation”, SIMUTools 2009.
+- (최근) 재난/도시 환경에서 기존 DTN 라우팅의 한계와 ML 기반 개선을 다루는 연구 예시:
+  “ML-MaxProp: Machine Learning Enabled Routing for Post-Disaster DTNs” (2025, arXiv/논문 공개본)
+
+링크(접근 가능한 공개 페이지 기준):
+- MaxProp(DBLP, DOI 포함): https://dblp.org/rec/conf/infocom/BurgessGJL06
+- Prophet(RFC Editor): https://www.rfc-editor.org/info/rfc6693
+- Spray-and-Wait(DOI/ACM 링크 포함, CiNii): https://cir.nii.ac.jp/crid/1362825894372775936
+- The ONE 공식 페이지(참조/다운로드 안내): https://www.netlab.tkk.fi/tutkimus/dtn/theone/
+- The ONE 논문 DOI 페이지(EUDL): https://eudl.eu/doi/10.4108/ICST.SIMUTOOLS2009.5674
+- ML-MaxProp(arXiv): https://arxiv.org/abs/2508.20077
+
+
+2. 시나리오 설계 원칙 (요구사항 반영)
+------------------------------------
+요구사항(사용자 요청):
+- “에너지가 초반에 다 소비되어 손쓸 도리가 없는” 시나리오는 제외.
+- 목표는 **RMAPPO로 MaxProp의 취약 구간을 ‘완화/해결’**하는 것.
+
+이에 따라 다음을 강제했습니다.
+1) 스캔 소모가 배터리를 압도하지 않도록 `Group.net.scanInterval`을 사용해 배터리 절약형 스캔(현실적).
+2) “모두 초반 소진”이 아니라, **사건 구간을 거치며 정책(전송량)에 따라** 배터리 소진 시점이 달라지도록 설계.
+3) 결과적으로 “누가 언제 꺼지느냐”가 라우팅/정책의 성패를 가르는 구조를 만들었음.
+
+
+3. 최종 추천 시나리오: realistic_event_heavy_energy_43200 (구성)
+---------------------------------------------------------------
+공통 시간축
+- 시뮬레이션: 0 .. 43200s (12시간)
+- Phase A (0..14400): 배경 트래픽(낮음)
+- Phase B (14400..18000): 사건(Incident) 스파이크(높음, 대용량 포함)
+- Phase C (18000..43200): 사후/여진(aftershock) + backhaul 지속
+
+공통 이동/그래프(현실적 요소)
+- Helsinki 맵 기반 이동(ShortestPathMapBasedMovement) + 일부 MapRouteMovement(backhaul 버스)
+- 링크 이질성:
+  - BLE 저속/근거리
+  - Wi-Fi(간섭으로 유효속도 하락)
+  - 드론 링크(거리 증가 시 속도 급락)
+- 일부 노드 duty-cycle(드론, backhaul 버스)
+
+“MaxProp 불리”를 만드는 핵심: 차량 에너지 예산을 ‘빡빡하게’
+- 차량(그룹 c)의 에너지:
+  - `Group2.initialEnergy = 2500, 4000`
+  - `Group2.transmitEnergy = 3.5`
+  - (스캔은 interval=2로 과도하지 않게)
+- 결과적으로 전송량이 많은 프로토콜(MaxProp/Prophet)이 차량을 더 빨리 소진시키고,
+  전송이 적은 프로토콜(SprayWait)은 차량을 살려서 후반 delivery가 유지됩니다.
+
+
+4. 실행/재현 방법
+----------------
+컴파일:
+  `./compile.sh`
+
+실행(각 1회):
+  `./one.sh -b 1 realistic_event_heavy_energy_43200_maxprop_settings.txt`
+  `./one.sh -b 1 realistic_event_heavy_energy_43200_prophet_settings.txt`
+  `./one.sh -b 1 realistic_event_heavy_energy_43200_spraywait_settings.txt`
+
+결과 위치:
+- `reports/` 아래에 시나리오명 prefix로 리포트 생성
+  - 예: `reports/realistic_event_heavy_energy_43200_maxprop_MessageStatsReport.txt`
+
+
+5. 테스트 결과(핵심 수치)
+-----------------------
+본 저장소에서 실제 실행해 얻은 MessageStatsReport 기준 결과입니다.
+
+[A] 전체 기간(0..43200s) 최종 성능 요약
+-------------------------------------
+1) MaxProp (에너지-타이트 + heavy traffic)
+- scenario: realistic_event_heavy_energy_43200_maxprop
+- created=11606, delivered=6049
+- delivery_prob=0.5212
+- overhead_ratio=48.5341
+- dropped=155408, aborted=8087, relayed=299632
+
+2) Spray-and-Wait (동일 시나리오)
+- scenario: realistic_event_heavy_energy_43200_spraywait
+- created=11606, delivered=8621
+- delivery_prob=0.7428
+- overhead_ratio=7.7868
+- dropped=71801, aborted=3062, relayed=75751
+
+3) Prophet (동일 시나리오)
+- scenario: realistic_event_heavy_energy_43200_prophet
+- created=11606, delivered=3733
+- delivery_prob=0.3216
+- overhead_ratio=121.7281
+- dropped=451706, aborted=8464, relayed=458144
+
+해석:
+- 이 시나리오에서는 **MaxProp가 delivery에서 SprayWait보다 크게 낮음(0.52 vs 0.74)**.
+- 즉 “MaxProp가 감당하기 힘든(현실적) 구간”이 명확히 존재하며, 개선 여지가 큼.
+
+
+[B] 에너지로 인한 ‘그래프 붕괴’(누가 언제 꺼지나)
+-----------------------------------------------
+EnergyLevelReport(1800s 간격)로 “에너지 0 이하 첫 관측 시각”을 집계했습니다.
+
+1) MaxProp
+- 차량(c): 20대 모두 0 도달, 시간 범위 = 18000 .. 23400s
+- 드론(d): 5대 0 도달, 시간 범위 = 30600 .. 43200s
+
+2) Spray-and-Wait
+- 드론(d): 5대 0 도달, 시간 범위 = 30600 .. 43200s
+- 차량(c): 0 도달 없음 (즉, 차량이 살아남음)
+
+3) Prophet
+- 차량(c): 20대 모두 0 도달, 시간 범위 = 16200 .. 23400s
+- 드론(d): 4대 0 도달, 시간 범위 = 32400 .. 41400s
+
+핵심:
+- “에너지가 너무 작아서 그냥 다 죽는” 게 아니라,
+  **프로토콜이 얼마나 공격적으로 전송하느냐에 따라 차량 생존이 갈림** → 현실적이면서도 연구적으로 의미 있는 bad case.
+
+
+[C] Phase별 성공률(Delivered/Created)
+-----------------------------------
+DeliveryRatePerIntervalReport(bin=1800s)로 구간 합산했습니다.
+
+MaxProp:
+- Phase A(0..14400): 683/687 = 0.9942
+- Phase B(14400..18000): 2311/3663 = 0.6309
+- Phase C(18000..43200): 3055/7253 = 0.4212
+
+Spray-and-Wait:
+- Phase A(0..14400): 656/687 = 0.9549
+- Phase B(14400..18000): 2040/3663 = 0.5569
+- Phase C(18000..43200): 5925/7253 = 0.8169
+
+해석:
+- 사건(Phase B) 이후(Phase C)에서 MaxProp는 성공률이 0.42까지 떨어지는데,
+  SprayWait는 0.82로 회복/유지함.
+- 이는 “차량(고대역폭 캐리어)이 꺼져서” 후반 그래프가 나빠지는 효과와 정합적입니다.
+
+
+6. 이 시나리오가 RMAPPO 논문에 좋은 이유(연구 포인트)
+-----------------------------------------------------
+이 설정은 단순히 MaxProp를 ‘망가뜨리는’ 게 아니라,
+**현실 제약(에너지·간섭·이동성·대용량 이벤트 트래픽)** 하에서
+“전달률 vs 오버헤드 vs 에너지” 트레이드오프가 뚜렷하게 드러납니다.
+
+즉, RMAPPO가 할 수 있는 이야기:
+1) MaxProp처럼 고정 휴리스틱은 사건 구간에서 “과도한 전송 → 에너지 소진 → 그래프 붕괴”로 이어질 수 있다.
+2) 반면 RMAPPO는 전역 혼잡/버퍼/전송 실패 징후를 학습해
+   - (a) 사건 구간에서는 ‘선별적’ 전달로 오버헤드/에너지 소모를 억제하고
+   - (b) 사후 구간에서는 ‘핵심 캐리어(차량) 생존’을 통해 장기 전달률을 확보
+   하는 전략을 학습할 수 있다.
+
+실제로 RMAPPO를 “진짜로” 이 시나리오에서 성공시키려면(권장):
+- 관측(state)에 에너지/가용성 정보를 넣는 것이 매우 중요
+  - 예: host의 `Energy.value`(정규화), 최근 전송시간 비율, 인터페이스 활성 여부
+- 보상(reward)에 “delivery 뿐 아니라 energy-aware cost”를 명시적으로 포함
+  - 예: relay 1회당 패널티가 아니라 “전송 시간(초)” 기반 비용을 근사해 패널티
+
+추가로, MaxProp 자체를 RL로 보강하려면(향후 확장):
+- MaxProp의 cost/threshold/드롭 스케줄링에 residual(delta)을 주는 형태가 논문 스토리로 깔끔합니다.
+
+
+7. 부록: 생성/수정된 설정 파일 목록
+---------------------------------
+추천(최종):
+- `realistic_event_heavy_energy_43200_maxprop_settings.txt`
+- `realistic_event_heavy_energy_43200_prophet_settings.txt`
+- `realistic_event_heavy_energy_43200_spraywait_settings.txt`
+
+참고(중간 단계, 비교용):
+- `realistic_event_43200_*_settings.txt` : 기본(덜 빡센) 현실 시나리오
+- `realistic_event_heavy_43200_*_settings.txt` : heavy traffic 버전(에너지 느슨)
+
+
+8. 구현/실행 안정성 메모(중요)
+-----------------------------
+heavy 트래픽에서 MaxProp가 버퍼 드롭 처리 중 크래시할 수 있어,
+다음 버그를 수정했습니다(문서화 목적):
+- `src/routing/MaxPropRouter.java`의 `getNextMessageToRemove()`가 빈 리스트일 때 null 처리 누락
+  → 빈 리스트면 null 리턴하도록 가드 추가
+
+이 수정은 문서에 있는 시나리오(heavy/heavy_energy)를 안정적으로 재현하기 위해 필요합니다.
+
+
+9. (추가 정리) “에너지-인지(Energy-aware) MaxProp” 아이디어: Dijkstra cost에 에너지 요소를 넣기
+--------------------------------------------------------------------------------
+사용자 제안 요약(핵심):
+1) MaxProp의 Dijkstra 기반 경로 cost(만남 확률 기반) 계산에 “노드 에너지 레벨”을 반영한다.
+2) 노드 접촉 시 서로의 최신 에너지 정보(에너지 레벨, 에너지 소모 속도)를 테이블로 교환/갱신한다.
+3) 정보는 시간 경과에 따라 낡으므로(Non-stationary), 시간감쇠(aging/decay)를 적용한다.
+4) 노드마다 에너지 소모 속도가 다르므로, 각 노드가 자신의 평균 소모 속도를 추정하고 이를 공유한다.
+
+아래는 위 아이디어를 논문화/구현 관점에서 “조금 더 보강”한 제안입니다.
+
+9.1 공유/테이블 항목(접촉 시 교환)
+---------------------------------
+노드 i가 자신에 대해 광고(advertise)할 항목(예시):
+- `E_i(t)`: 현재 잔여 에너지(정규화 전/후 모두 가능)
+- `r_i(t)`: 최근 평균 에너지 소모 속도(단위: energy/sec). 예: 최근 W초(또는 최근 K개 샘플)의 이동평균
+- `sigma_i(t)`: 소모 속도 추정의 불확실성(옵션). 노이즈/부하 변동이 큰 환경에서 유용
+- `t_last`: 위 값들을 측정/송신한 시각
+- `alive_flag`: 인터페이스/노드가 현재 활성 상태인지(옵션; duty-cycle 모델과 결합 시 유용)
+
+주의(현실성/실용성):
+- 에너지 공유 오버헤드는 “작은 비콘/제어 메시지”로 근사 가능하나,
+  공격/오류를 고려하면 신뢰도/유효기간을 함께 두는 것이 깔끔합니다(9.2 참조).
+
+9.2 시간감쇠(aging) 설계: 값 자체가 아니라 “신뢰도”를 감쇠시키기
+------------------------------------------------------------
+현장에서는 “그 노드가 지금도 같은 소비 패턴일지”가 불확실하므로,
+값을 직접 감소시키기보다, cost에 반영되는 영향도를 시간으로 감쇠시키는 방식이 보통 안전합니다.
+
+예: 노드 i에 대해 마지막 관측/공유 이후 경과시간을 `Δt = t_now - t_last`라 하면,
+신뢰도 가중치 `w_i(Δt) = exp(-Δt / τ_i)` 또는 `w_i = 1 / (1 + Δt/τ_i)` 형태로 둡니다.
+- `τ_i`(또는 `τ`): 정보 유효기간(half-life). 사건(incident) 구간은 더 짧게, 평시는 더 길게 두는 적응형도 가능
+
+RMAPPO로 최적화할 예정이라면:
+- `τ` 또는 `w` 자체를 “학습 가능한 파라미터(또는 상태 기반 가중치)”로 둬서
+  비정상성이 클수록 더 빨리 잊도록 정책이 학습하게 만들 수 있습니다.
+
+9.3 “잔여 수명” 관점의 에너지 리스크(추천): E만 보지 말고 E / r도 본다
+-----------------------------------------------------------
+단순히 `E_i`만 쓰면 “소모 속도가 큰 노드”를 과대평가할 수 있습니다.
+그래서 예측 잔여 수명(rough lifetime) 형태가 유용합니다.
+
+- `T_i = E_i / max(r_i, ε)`  (i가 현재 속도로 소모된다면 몇 초 버틸지)
+- 메시지 m를 i를 통해 더 전달하려면 필요한 전송 시간(근사) `t_tx(m, link)`를 계산해
+  `T_i - t_tx` 마진을 리스크로 사용 가능
+
+추가로 현실성을 올리는 항목(가능하면):
+- 링크별 전송률/접촉시간 예측(최근 평균): “에너지 충분 vs 실제로 보낼 시간 없음”을 구분
+
+9.4 Dijkstra cost에 어떻게 넣을지(한 가지 구체안)
+----------------------------------------------
+MaxProp의 기존 cost(접촉 기반) = `C_base(from -> to)`가 있을 때,
+에너지 리스크 패널티를 추가한 형태(예):
+
+- `C_energy(i) = λ * g(E_i, r_i, Δt)`  (노드 i를 경유할 때 드는 “에너지-불안정 비용”)
+- 전체 경로 cost: `C_total(path) = Σ(C_base(edge)) + Σ(C_energy(node))`
+
+여기서 g는 예를 들어:
+- `g = w_i(Δt) * [ 1 / (E_i + ε) ]` (단순형)
+- 또는 `g = w_i(Δt) * softplus( t_need - T_i )` (잔여 수명 마진 기반; 임계 이하에서 급격히 페널티)
+
+이렇게 하면 “후반에 꺼질 확률이 높은 캐리어(차량)”를 무의식적으로 과사용하는 경향을 줄이고,
+특히 본 문서의 bad-case(heavy_energy)처럼 “오버헤드가 에너지 소진으로 번역되는 환경”에서
+후반 연결성 붕괴를 완화할 수 있습니다.
+
+9.5 (중요) 정보 교환은 ‘글로벌 테이블’이 아니라 ‘로컬+최근성’으로 제한하는 게 안전
+----------------------------------------------------------------
+에너지/소모속도 테이블을 모든 노드에 대해 유지/전파하면(그리고 이를 자주 전파하면) 오버헤드가 커집니다.
+그래서 다음 제약이 현실적입니다.
+- 최근에 만난 노드/이웃에 대해서만 유지(LRU)
+- 일정 시간 이상 오래된 항목은 폐기(aging으로 영향도 0에 수렴)
+- 값 자체는 공유하되, 경로 계산에는 “신뢰도 가중치”로 제한(9.2)
+
+9.6 RMAPPO로 최적화할 때의 포인트(논문 스토리)
+---------------------------------------------
+에너지-인지 MaxProp를 “규칙 기반”으로 끝내지 말고,
+RMAPPO가 아래 파라미터/정책을 학습해 조절하는 스토리가 깔끔합니다.
+
+- 학습 대상 후보
+  - `λ`(에너지 페널티 강도), `τ`(시간감쇠 강도), 임계 마진(`t_need` 대비 `T_i` 마진) 등
+  - 또는 “상태(state)에 따라 λ를 조절하는 gating 정책”(incident 구간/혼잡/차량 생존성에 따라 다르게)
+- 관측(state) 후보
+  - (로컬) 자신의 `E`, `r`, 최근 전송중 비율, 버퍼점유/드롭률, 최근 접촉 빈도
+  - (이웃) 공유받은 `E_neighbor`, `r_neighbor`, 정보 신뢰도 `w`
+- 보상(reward) 후보
+  - delivery(장기) + (전송시간 기반) 에너지 비용/오버헤드 패널티 + “차량 생존(가용성)” 보너스(옵션)
+
+요약:
+사용자 아이디어는 본 bad-case를 직접 겨냥한 타당한 개선 방향이며,
+핵심은 “E만 추가”가 아니라 **(i) 잔여 수명(E/r), (ii) 정보 신뢰도(aging), (iii) 링크/접촉 제약**
+까지 포함해 cost를 구성하면 논문에서 설득력이 더 커집니다.
+
+
+9.7 (추가 정리) RMAPPO 액션 설계안: “Dijkstra 비용 + threshold” 파라미터를 학습으로 조절
+--------------------------------------------------------------------------------
+목표(heavy_energy bad-case의 핵심 실패 모드):
+- 사건(Incident) 구간에서 무분별한 릴레이/복제로 오버헤드가 커지면,
+  (전송중 시간 기반) 에너지 소진이 빨라져 차량 캐리어가 꺼지고,
+  이후 구간의 그래프가 붕괴하여 장기 전달률이 떨어진다.
+
+따라서 정책이 해야 할 일은:
+- (a) 사건 구간/혼잡/저에너지 상황에서는 “선별적 전달”로 에너지/오버헤드를 억제하고
+- (b) 사후 구간에는 “핵심 캐리어 생존”을 통해 장기 delivery를 유지하는 것
+
+아래는 “MaxProp 구조는 유지 + 일부 스칼라 파라미터만 RMAPPO가 제어”하는 최소 액션셋 제안입니다.
+
+(A) Dijkstra 경로 비용(cost) 쪽 학습 파라미터(직접 에너지-인지)
+- `λ_cost(t)`: 경로 cost에 들어가는 에너지 패널티 강도(클수록 저에너지/고소모 노드를 회피)
+- `τ_age(t)`: 에너지/소모속도 정보의 시간감쇠 강도(비정상성이 클수록 더 빨리 잊기)
+  - aging은 값(E, r)을 인위적으로 깎기보다 “신뢰도 가중치 w(Δt)”를 감쇠시키는 형태를 권장
+
+(B) 버퍼 threshold(우선영역 분할) 쪽 학습 파라미터(혼잡/버스트 적응 + 에너지 보호)
+- `β_x(t)`: `avgTransferredBytes`(x) 추정의 EWMA 계수(버스트에 빠르게/느리게 반응)
+- `k_x(t)`: `x_eff = x * k_x` 스케일(에너지 낮음/abort 높음/접촉 짧음 상황에서 threshold를 자동 축소)
+
+(C) 전송 선별성(오버헤드 직접 제어; 본 bad-case에서 효과 큼)
+- `m_relay(t)`: 릴레이 실행 마진(Δcost가 충분히 좋아질 때만 전송). 오버헤드/에너지 폭주를 직접 제어
+
+액션 형태(권장):
+- 연속 제어(continuous): 위 파라미터들을 매 의사결정 시점에 출력하되 `clamp()`로 범위를 제한
+  - 예: `λ_cost ∈ [0, λ_max]`, `τ_age ∈ [τ_min, τ_max]`, `β_x ∈ [β_min, β_max]`, `k_x ∈ [k_min, k_max]`, `m_relay ∈ [0, m_max]`
+- 또는 이산 모드(mode): `{aggressive, balanced, conservative}` 중 선택하고 각 모드별 파라미터 세트를 고정
+  - 논문 서술/재현성/학습 안정성은 모드 방식이 더 쉬운 편
+
+Reward(논문용 요지):
+- 장기 delivery를 최우선으로 두되,
+  사건 구간의 과도한 relaying이 “후반 그래프 붕괴”로 이어지는 것을 막기 위해
+  (전송중 시간 기반) 에너지 비용/오버헤드 비용을 함께 포함하는 것이 핵심.
+- 특히 본 bad-case는 Phase C(사건 이후)에서 성능 차가 커지므로,
+  보상이 사건 이후 구간 성능까지 반영되도록(에피소드 누적/지연 보상) 설계하는 것이 중요.
+
+요약:
+- “Dijkstra cost에 에너지 리스크” + “threshold 계산에 에너지/abort/접촉품질 반영”의 2축만으로도
+  RMAPPO가 오버헤드↔생존성 트레이드오프를 충분히 컨트롤할 여지가 크며,
+  여기에 `m_relay`(선별성)를 더하면 오버헤드 직접 제어력이 크게 올라가 bad-case에서 특히 유리합니다.
+
+
+9.8 (추가 정리) Reward를 “곱셈”으로 구성하는 아이디어(Delivery × Overhead × Energy)
+--------------------------------------------------------------------------------
+사용자 설계 방향:
+- 전달성공(delivery)은 sparse해서 단독으로는 학습이 어렵다.
+- 그래서 reward를 곱셈으로 묶어 “전달이 크게 떨어지지 않는 한” 오버헤드/에너지 절감을 최적화하도록 유도한다.
+
+논문 서술 관점에서의 안전한 구성(예시):
+- `R = R_del * R_oh * R_energy`
+  - `R_del`  : 전달 성과 항(예: step 구간 delivered 증가량, delivered bytes 증가량, 또는 episode delivery rate)
+  - `R_oh`   : 오버헤드/릴레이 비용 항(예: `exp(-k1 * relayed_bytes)` 또는 `1 / (1 + k1 * relayed)`)
+  - `R_energy`: 에너지 소모 항(예: `exp(-k2 * energy_used)` 또는 `1 / (1 + k2 * Δenergy)`)
+
+곱셈형의 장점(이 시나리오와 정합):
+- incident 구간에서 “무분별한 릴레이”는 `R_oh`와 `R_energy`를 동시에 악화시키므로,
+  차량 캐리어 과소모(후반 그래프 붕괴)를 강하게 억제하는 방향으로 학습이 유도됨.
+
+곱셈형에서 주의할 점(실험 설계 체크리스트):
+- 어떤 항이 0에 가까워지면 전체 reward가 0으로 붕괴하므로,
+  각 항은 `exp(-k*cost)` 또는 `1/(1+k*cost)`처럼 항상 양수(>0)로 유지하는 형태가 안정적입니다.
+- `R_del`이 너무 sparse하면 초기에 “전부 0”이 되어 학습이 멈출 수 있으니,
+  step 단위에서 관측 가능한 프록시(예: delivered 증가량, delivered bytes, 혹은 목표 노드 근접/큐 감소 등)를
+  최소한으로 섞거나, episode 누적 delivery를 사용해 0-plateau를 줄이는 것이 실용적입니다.
+
+
+9.9 (추가 정리) State 설계안: “메시지 단위 시퀀스(32개)” + “파라미터 조절 액션”
+--------------------------------------------------------------------------------
+사용자 전제:
+- 액션은 “어떤 메시지를 보낼지 선택”이 아니라, MaxProp++의 파라미터(`λ_cost`, `τ_age`, `β_x`, `k_x`, `m_relay`)를 조절하는 형태
+- 한 step에서 메시지 토큰 32개를 관측(시퀀스 길이 32)
+
+권장 입력 구조(토큰 구성):
+1) `[SELF]` (1개): 현재 호스트의 전역 상태
+2) `[CONTACT]` (1개): 현재 연결된 상대(또는 대표 연결) 상태
+3) `[MSG_i]` (32개): 현재 버퍼에서 상위 32개 메시지의 feature (정렬 기준은 아래 “메시지 선택/정렬” 참조)
+
+필수 feature(최소 세트; bad-case heavy_energy를 겨냥):
+- `[SELF]`
+  - `E_self`(정규화), `T_self = E_self / max(r_self, ε)`(잔여수명), `r_self`(최근 평균 소모속도)
+  - `buf_occ = used_bytes / buffer_size`, `n_msgs_norm = n_msgs / Nmax`
+  - `abort_ewma`, `drop_ewma` (최근 전송 실패/드롭 반응 신호)
+  - `x_ewma`(avgTransferredBytes 또는 EWMA), `threshold_cur`(현재 계산된 threshold)
+  - `t_norm`(0~1), `phase_onehot`(A/B/C)
+- `[CONTACT]`
+  - `E_nb`, `T_nb`, `r_nb`(가능하면), 정보 최신도 `Δt_info`(aging용)
+  - 링크 유효속도(정규화), 직전 접촉 지속시간/최근 평균 접촉시간(가능하면), `abort_rate_to_nb`(옵션)
+- `[MSG_i]` (각 메시지마다)
+  - `size_norm`, `ttl_rem_norm`, `age_norm`, `hop_norm`, `is_priority(hop<threshold_cur)`
+  - `cost_cur_to_dst_norm`, `cost_via_nb_to_dst_norm`, `Δcost_norm = cost_cur - cost_via_nb`
+  - `already_sent_to_nb`(0/1)
+  - `t_tx_est = size / link_rate`(근사; 짧은 접촉에서 낭비 방지용)
+
+메시지 선택/정렬(32개를 어떤 순서로 가져올지; 재현성 중요):
+- 권장 1안(기존 MaxProp 정렬과 정합): 현재 `MaxPropTupleComparator(calcThreshold())` 또는 메시지 기준 `MaxPropComparator` 우선순위로 정렬 후 상위 32개
+- 권장 2안(학습 안정): “전송 가치가 큰 것” 위주로 정렬해 정보 밀도를 올림
+  - 예: `is_priority` 먼저, 그 다음 `Δcost` 큰 순(개선 폭 큰 메시지), TTL 임박 순 tie-break
+
+패딩/마스킹:
+- 버퍼 메시지가 32개 미만이면 0 패딩 + mask(학습에서 무시) 권장
+
+요약:
+- 이 state는 “에너지(SELF/CONTACT) + 혼잡(SELF) + 전송 가치(Δcost, TTL, t_tx_est)”를 동시에 제공해,
+  RMAPPO가 파라미터만 조절해도 incident 구간에서 과도 릴레이를 억제하고(차량 생존),
+  후반 구간 delivery를 유지하는 방향으로 학습하기 쉽습니다.

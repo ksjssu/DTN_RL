@@ -1,0 +1,239 @@
+## Realistic urban-event / partial-outage scenario (43200s)
+## Router: ProphetRouter
+##
+## Same as realistic_event_43200_maxprop_settings.txt except Group.router.
+
+Scenario.name = realistic_event_heavy_energy_43200_prophet
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+Scenario.endTime = 43200
+
+ble.type = SimpleBroadcastInterface
+ble.transmitSpeed = 200k
+ble.transmitRange = 10
+
+wifi.type = InterferenceLimitedInterface
+wifi.transmitSpeed = 12M
+wifi.transmitRange = 120
+
+droneWifi.type = DistanceCapacityInterface
+droneWifi.transmitSpeed = 12M
+droneWifi.transmitRange = 250
+droneWifi.transmitSpeeds = 12M, 6M, 2M, 500k, 80k
+
+Scenario.nrofHostGroups = 6
+
+Group.router = ProphetRouter
+Group.waitTime = 0, 60
+Group.msgTtl = 300
+Group.deleteDelivered = false
+
+Group.initialEnergy = 15000, 25000
+Group.scanEnergy = 0.25
+Group.scanResponseEnergy = 0.10
+Group.transmitEnergy = 1.0
+Group.energyWarmup = 0
+Group.net.scanInterval = 5
+
+Group.nrofInterfaces = 1
+Group.interface1 = ble
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.nrofHosts = 80
+Group.bufferSize = 8M
+Group.speed = 0.5, 1.8
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.nrofHosts = 20
+Group2.okMaps = 1
+Group2.speed = 4, 18
+Group2.bufferSize = 20M
+Group2.nrofInterfaces = 1
+Group2.interface1 = wifi
+Group2.initialEnergy = 2500, 4000
+Group2.scanEnergy = 0.6
+Group2.scanResponseEnergy = 0.25
+Group2.transmitEnergy = 3.5
+Group2.net.scanInterval = 2
+
+Group3.groupID = r
+Group3.nrofHosts = 8
+Group3.okMaps = 1
+Group3.speed = 6, 22
+Group3.bufferSize = 50M
+Group3.nrofInterfaces = 2
+Group3.interface1 = ble
+Group3.interface2 = wifi
+Group3.msgTtl = 60
+Group3.initialEnergy = 20000, 30000
+Group3.scanEnergy = 0.35
+Group3.scanResponseEnergy = 0.15
+Group3.transmitEnergy = 1.4
+Group3.net.scanInterval = 1
+
+Group4.groupID = d
+Group4.nrofHosts = 6
+Group4.movementModel = ShortestPathMapBasedMovement
+Group4.speed = 25, 60
+Group4.bufferSize = 20M
+Group4.nrofInterfaces = 1
+Group4.interface1 = droneWifi
+Group4.msgTtl = 15
+Group4.initialEnergy = 2500, 4500
+Group4.scanEnergy = 1.0
+Group4.scanResponseEnergy = 0.5
+Group4.transmitEnergy = 3.0
+Group4.net.scanInterval = 1
+Group4.activeTimes = 0,7200, 9000,14400, 16200,21600, 23400,28800, 30600,36000, 37800,43200
+
+Group5.groupID = s
+Group5.nrofHosts = 4
+Group5.movementModel = GridLocation
+Group5.bufferSize = 200M
+Group5.speed = 0, 0
+Group5.waitTime = 0, 0
+Group5.nrofInterfaces = 1
+Group5.interface1 = wifi
+Group5.initialEnergy = 1e9
+Group5.scanEnergy = 0.0
+Group5.scanResponseEnergy = 0.0
+Group5.transmitEnergy = 0.0
+Group5.net.scanInterval = 0
+Group5.GridLocation.rows = 2
+Group5.GridLocation.spacing = 300
+Group5.GridLocation.location = 1800,1400
+
+Group6.groupID = b
+Group6.nrofHosts = 6
+Group6.bufferSize = 200M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram4.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 12
+Group6.nrofInterfaces = 2
+Group6.interface1 = ble
+Group6.interface2 = wifi
+Group6.initialEnergy = 40000, 60000
+Group6.scanEnergy = 0.3
+Group6.scanResponseEnergy = 0.1
+Group6.transmitEnergy = 1.2
+Group6.net.scanInterval = 0
+Group6.activeTimes = 14400,43200
+
+Events.nrof = 12
+
+Events1.class = MessageEventGenerator
+Events1.prefix = bg
+Events1.interval = 30,60
+Events1.size = 5k,40k
+Events1.hosts = 0,100
+Events1.time = 0,14400
+
+Events2.class = MessageEventGenerator
+Events2.prefix = inc_media
+Events2.interval = 5,15
+Events2.size = 500k,5M
+Events2.hosts = 0,100
+Events2.tohosts = 114,118
+Events2.time = 14400,18000
+
+Events3.class = MessageEventGenerator
+Events3.prefix = inc_status
+Events3.interval = 2,4
+Events3.size = 2k,20k
+Events3.hosts = 100,108
+Events3.tohosts = 114,118
+Events3.time = 14400,18000
+
+Events4.class = MessageEventGenerator
+Events4.prefix = inc_drone
+Events4.interval = 3,6
+Events4.size = 2k,15k
+Events4.hosts = 108,114
+Events4.tohosts = 114,118
+Events4.time = 14400,18000
+
+Events5.class = MessageEventGenerator
+Events5.prefix = a1
+Events5.interval = 2,6
+Events5.size = 20k,200k
+Events5.hosts = 0,100
+Events5.tohosts = 114,116
+Events5.time = 18000,18600
+
+Events6.class = MessageEventGenerator
+Events6.prefix = a2
+Events6.interval = 2,6
+Events6.size = 20k,200k
+Events6.hosts = 0,100
+Events6.tohosts = 116,118
+Events6.time = 25200,25800
+
+Events7.class = MessageEventGenerator
+Events7.prefix = a3
+Events7.interval = 2,6
+Events7.size = 20k,200k
+Events7.hosts = 0,100
+Events7.tohosts = 114,118
+Events7.time = 32400,33000
+
+Events8.class = MessageEventGenerator
+Events8.prefix = post_low
+Events8.interval = 120,240
+Events8.size = 5k,60k
+Events8.hosts = 0,124
+Events8.time = 18000,43200
+
+Events9.class = MessageEventGenerator
+Events9.prefix = backhaul
+Events9.interval = 5,15
+Events9.size = 200k,2M
+Events9.hosts = 114,118
+Events9.tohosts = 80,100
+Events9.time = 14400,43200
+
+Events10.class = MessageEventGenerator
+Events10.prefix = rr
+Events10.interval = 5,15
+Events10.size = 2k,30k
+Events10.hosts = 100,108
+Events10.tohosts = 100,108
+Events10.time = 14400,43200
+
+Events11.class = MessageEventGenerator
+Events11.prefix = dr
+Events11.interval = 20,60
+Events11.size = 1k,10k
+Events11.hosts = 108,114
+Events11.tohosts = 100,108
+Events11.time = 14400,43200
+
+Events12.class = MessageEventGenerator
+Events12.prefix = crowd
+Events12.interval = 20,60
+Events12.size = 5k,80k
+Events12.hosts = 80,100
+Events12.tohosts = 114,118
+Events12.time = 0,43200
+
+Report.nrofReports = 8
+Report.warmup = 0
+Report.reportDir = reports/
+Report.report1 = MessageStatsReport
+Report.report2 = DeliveryRatePerIntervalReport
+DeliveryRatePerIntervalReport.binSize = 1800
+Report.report3 = OverheadPerIntervalReport
+OverheadPerIntervalReport.binSize = 1800
+Report.report4 = BufferOccupancyReport
+Report.report5 = EnergyLevelReport
+EnergyLevelReport.granularity = 1800
+Report.report6 = ContactTimesReport
+Report.report7 = MessageCopyCountReport
+MessageCopyCountReport.granularity = 1800
+Report.report8 = StepBinMetricsReport
+
+ProphetRouter.secondsInTimeUnit = 30
+
+Optimization.cellSizeMult = 5

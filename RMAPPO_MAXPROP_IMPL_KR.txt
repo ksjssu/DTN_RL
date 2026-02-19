@@ -1,0 +1,206 @@
+RMAPPO 구현 작업 메모 (MAXPROP_BADCASE_SCENARIO_KR.txt에서 “RMAPPO로 구현할 부분”만 발췌/정리)
+================================================================================
+
+목적
+----
+본 문서는 `MAXPROP_BADCASE_SCENARIO_KR.txt`의 내용 중,
+향후 RMAPPO로 “MaxProp++(파라미터 제어)”를 구현/실험하기 위해 필요한 설계 요소만
+따로 모아 작업용 체크리스트/명세 형태로 정리한 문서입니다.
+
+대상 시나리오(고정)
+-----------------
+bad-case 실험 환경(재현용):
+- `realistic_event_heavy_energy_43200_maxprop_settings.txt`
+- 비교군:
+  - `realistic_event_heavy_energy_43200_spraywait_settings.txt`
+  - `realistic_event_heavy_energy_43200_prophet_settings.txt`
+
+핵심 실패 모드(학습이 해결해야 하는 것)
+-------------------------------------
+- incident 구간의 대용량/고빈도 트래픽에서 과도한 릴레이/복제(오버헤드)가 증가
+- (전송중 시간 기반) 에너지 소모가 빨라져 차량 캐리어가 중후반에 꺼짐
+- 이후 그래프 붕괴 → Phase C 장기 delivery 급락
+
+따라서 RMAPPO 정책 목표:
+- incident/혼잡/저에너지에서는 “선별적 전달”로 오버헤드·에너지 소모 억제
+- 사후 구간에는 “캐리어 생존”을 통해 장기 delivery 유지
+
+
+1) RMAPPO가 제어할 액션(=파라미터)
+-------------------------------
+전제:
+- 액션은 “메시지 선택”이 아니라, MaxProp++의 스칼라 파라미터를 조절하는 방식
+- 액션 수는 너무 많으면 학습 불안정 → 4~5개 내외 권장
+
+권장 최소 액션셋(연속 제어 또는 이산 모드 모두 가능):
+
+(A) Dijkstra 경로 비용(cost) 관련
+- `λ_cost(t)`: cost에 들어가는 에너지 리스크 패널티 강도
+- `τ_age(t)`: 에너지/소모속도(또는 확률/통계) 정보의 시간감쇠(신뢰도) 강도
+
+(B) threshold(버퍼 priority/non-priority 분할) 관련
+- `β_x(t)`: avgTransferredBytes(x) 추정의 EWMA 계수(버스트 적응 속도)
+- `k_x(t)`: `x_eff = x * k_x` 스케일(에너지/abort/접촉품질에 따른 threshold 자동 축소/확대)
+
+(C) 전송 선별성(오버헤드 직접 제어; bad-case에서 효과 큼)
+- `m_relay(t)`: 릴레이 마진. `Δcost`가 `m_relay` 이상 좋아질 때만 릴레이 허용
+
+실무 팁:
+- 연속 제어 시 반드시 `clamp()`로 범위를 제한(학습 폭주 방지)
+- 또는 `{aggressive, balanced, conservative}` 같은 모드 선택(재현성/안정성↑)
+
+
+2) Reward 설계(곱셈형: Delivery × Overhead × Energy)
+---------------------------------------------------
+사용자 목표:
+- delivery가 sparse하여 단독 보상은 학습이 어렵다.
+- 곱셈형으로 묶으면 “전달 성과가 크게 떨어지지 않는 한” 나머지(오버헤드/에너지)를 최적화하는 경향을 기대.
+
+권장 형태(항은 항상 양수로 유지):
+- `R = R_del * R_oh * R_energy`
+  - `R_del`    : 전달 성과(예: step 구간 delivered 증가량, delivered bytes 증가량, 또는 episode delivery rate)
+  - `R_oh`     : 오버헤드 비용(예: `exp(-k1*relayed)` 또는 `1/(1+k1*relayed)` )
+  - `R_energy` : 에너지 비용(예: `exp(-k2*energy_used)` 또는 `1/(1+k2*Δenergy)` )
+
+주의(학습 정지 방지):
+- `R_del`이 초기 전부 0이면 전체 reward가 0으로 붕괴할 수 있음
+  - step 단위 프록시(예: delivered bytes, TTL 가중 delivery, 또는 hindsight credit) 최소한으로 활용 권장
+
+
+3) State 설계(“메시지 단위 시퀀스 32개”)
+---------------------------------------
+사용자 전제:
+- 한 step에서 메시지 토큰 32개를 관측(시퀀스 길이 32)
+- 액션은 파라미터 조절만 수행
+
+권장 입력 토큰 구조:
+- `[SELF]` 1개: 현재 호스트 전역 상태
+- `[CONTACT]` 1개: 현재 연결된 상대(또는 대표 연결) 상태
+- `[MSG_i]` 32개: 버퍼에서 선택된 32개 메시지 feature
+
+필수 feature(최소 세트; heavy_energy 타겟):
+
+[SELF]
+- 에너지: `E_self`, `r_self`, `T_self=E_self/max(r_self,ε)`
+- 혼잡: `buf_occ(used/max)`, `n_msgs_norm`, `abort_ewma`, `drop_ewma`
+- threshold 관련: `x_ewma`, `threshold_cur`
+- 시간: `t_norm`, `phase_onehot(A/B/C)`
+
+[CONTACT]
+- `E_nb`, `r_nb`, `T_nb`(가능하면), `Δt_info`(aging용)
+- 링크 품질: 유효속도(norm), 최근 접촉시간 통계(가능하면)
+
+[MSG_i]
+- `size_norm`, `ttl_rem_norm`, `age_norm`, `hop_norm`, `is_priority(hop<threshold_cur)`
+- `cost_cur_to_dst`, `cost_via_nb_to_dst`, `Δcost`
+- `already_sent_to_nb`(0/1)
+- `t_tx_est = size/link_rate`(근사; 짧은 접촉에서 낭비 방지)
+
+메시지 32개 선택/정렬(재현성 중요):
+- 1안: 기존 MaxProp 정렬(우선순위/비용 정렬) 상위 32개
+- 2안: 정보 밀도 중심 정렬(예: priority 먼저, 그 다음 Δcost 큰 순, TTL 임박 tie-break)
+
+패딩/마스크:
+- 32개 미만이면 0 패딩 + mask 권장
+
+
+3.1 로컬 피처를 위한 “이웃 정보 공유” 최소 확장(에너지-인지 + aging)
+-------------------------------------------------------------
+현 상태:
+- 현재는 (프로토콜/브릿지 관점에서) 이웃의 전이 예측도/버퍼 점유율을 공유하는 형태가 존재함.
+
+본 연구(에너지-인지 MaxProp++ + RMAPPO)에서 추가로 공유할 최소 3가지(권장):
+1) `E_nb`: 이웃 잔여 에너지(정규화 가능)
+2) `r_nb`: 이웃 평균 에너지 소모 속도(energy/sec; 최근 W초 이동평균 등)
+3) `t_last`: 위 값들이 측정/송신된 시각(정보 최신도 계산/시간감쇠(aging)용)
+
+이유:
+- `E`만 있으면 “소모 속도가 큰 노드”를 과대평가할 수 있음 → `r`(또는 `T=E/r`)이 필요
+- 비정상 환경에서는 값 자체보다 “얼마나 최신인가”가 중요 → `t_last`로 `Δt_info`를 계산해 `w(Δt)` 감쇠 적용
+
+오버헤드/현실성:
+- 위 3개는 스칼라 3개라 제어 메시지로 교환하기에 부담이 비교적 작고,
+  본 bad-case(heavy_energy)에서 핵심인 “캐리어(차량) 생존성”을 직접 다루는 데 효과적임.
+
+
+4) 서버/브릿지 통신 관점 메모(현 코드 베이스 기준)
+-----------------------------------------------
+현재 프로젝트에 존재하는 RMAPPO 서버(참고):
+- `toolkit/drl_server_rmappo_maxprop.py`  (현재는 `drl_server_rmappo.py`와 동일 복사본)
+
+중요:
+- 현 `RLBridgeReport` ↔ `drl_server_rmappo` 통신은 기본적으로 “host#dest 요약” + “delta(스칼라)” 중심이다.
+- 이번 목표(“메시지 시퀀스(32개) + 파라미터 벡터 액션”)는 스키마가 다르므로,
+  구현 단계에서는 (i) 브릿지에서 새 state/prev_transition 필드 정의, (ii) 서버에서 액션 벡터 파싱/리워드 계산
+  을 맞춰야 한다.
+
+
+5) 구현 체크리스트(코드 작업 전 합의 포인트)
+------------------------------------------
+아래는 코드 변경을 하기 전, 실험 설계로 확정해야 할 항목들:
+- 액션 범위(클램프) 확정: `λ_cost`, `τ_age`, `β_x`, `k_x`, `m_relay`의 최소/최대
+- step 정의: 샘플링 간격(초), “CONTACT 토큰”을 어떤 이웃으로 잡을지(대표 1개 vs 다중)
+- 에너지 항 측정: `energy_used`를 어떤 방식으로 집계할지(SELF만 vs 전체 vs 차량만 등)
+- 오버헤드 항 정의: `relayed` 기반인지, 전송시간/전송바이트 기반인지
+- 전달 성과 항: step delivered 증가량/episode delivery/TTL 가중 등 어떤 조합을 사용할지
+
+
+5.1 (합의) CTDE critic 글로벌 피처 확장안(추가)
+---------------------------------------------
+사용자 합의(요구):
+- 차량 그룹 분리 없이, “전체 노드 관점”의 생존/에너지 상태를 critic이 알 수 있게 한다.
+- 혼잡/실패 신호로 drop/abort/relay rate를 global 피처로 추가한다.
+
+추가 글로벌 피처(critic 전용) 제안:
+1) `global_alive_frac`
+   - 현재 “활성/생존” 노드 비율(예: radioActive && Energy>0 인 노드 비율)
+2) `global_energy_frac`
+   - 에너지 상태 요약(예: 평균 `E/E_init` 또는 중앙값; 구현 난이도에 따라 선택)
+3) `global_drop_rate_ema`
+   - 최근 구간 drop rate(초당 또는 step당) EMA
+4) `global_abort_rate_ema`
+   - 최근 구간 abort rate EMA
+5) `global_relay_rate_ema`
+   - 최근 구간 relay rate(또는 relayed bytes/sec) EMA
+
+메모:
+- 위 값들은 actor 입력에는 넣지 않고 critic 입력으로만 사용(CTDE 원칙 유지).
+- 구현 단계에서는 “rate의 분모(초당/step당)”를 명확히 고정해 재현 가능하게 해야 함.
+
+6) 평가(논문용) 최소 보고 지표
+----------------------------
+반드시 보고:
+- delivery_prob (전체, phase별)
+- overhead_ratio (전체, phase별)
+- 차량 그룹 생존(에너지 0 도달 시각 분포; EnergyLevelReport 기반)
+- aborted/dropped/relayed 추이(phase별)
+
+추가 권장:
+- Phase C(사건 이후) delivery 유지 여부(본 bad-case의 핵심)
+- “오버헤드 감소 vs delivery 유지” trade-off 곡선(파라미터/정책별)
+
+
+7) 구현 체크박스(진행 상황)
+------------------------
+아래 항목은 실제 코드 구현/실험 진행을 위해 “완료/미완료”를 체크하는 용도입니다.
+
+[x] 브릿지 리포트 추가: `RmappoMaxpropBridgeReport` 구현/연동
+[x] Step 단위 호스트 적용 범위: 샘플링 비활성화(`maxHostsPerStep=0`)로 모든 호스트에 적용
+[x] 액션 스코프 지원: `actionScope=per_host` / `actionScope=global`(옵션)
+[x] Host-Dest 해상도(v2): `host#dest` 키로 `m_relay`(릴레이 마진)만 제어하고, 노드 레벨 파라미터는 settings 값 유지
+[x] 액션 범위 클램프: `action_spec`(min/max) 기반으로 브릿지에서 안전 범위로 clamp
+[x] prev_transition 카운터 전송: `created_cnt`, `transferred_cnt`, `delivered_cnt`, `dropped`, `energy_used` 포함
+[x] 서버 엔드포인트: `/infer_and_update`에서 `rmappo_maxprop_v1` 처리
+[x] 학습 업데이트 타이밍: episode 끝(`mode=episode_end`)에 몰아서 update (원본 RMAPPO 흐름)
+[x] Reward(콤보, 음수 금지): `S*(1-O)*(1-E)*(1-D)` (clamp/eps 적용) + 가중치 지수(기본 1)
+[x] 에너지 정규화 상수 고정: `MP_V1_ENERGY_RATE_NORM`(기본 2.5; 환경변수로 고정값 조절)
+[x] 학습/평가 모드: `EVAL_ONLY=true`면 inference만 수행(학습/체크포인트 저장 비활성)
+[x] 에피소드 로그: `reports/reward_logs/episode_rewards_buf{N}M_rmappo.csv`
+[x] 학습 로그: `reports/train_logs/episode_losses_buf{N}M_rmappo.csv`, `reports/train_logs/update_metrics_buf{N}M_rmappo.csv`
+[x] 체크포인트 저장(에피소드 단위): torch 사용 시 `rmappo_maxprop_buf{N}_ep{K}.pt` 저장
+
+[ ] State(토큰 32개)에서 메시지 단위 피처 완성(현재는 성능 이슈로 cost 피처 비활성 권장)
+[ ] CONTACT 토큰 정의 확정(대표 이웃 1개 vs 다중 요약)
+[ ] 글로벌 critic 피처(CTDE) 확장 최종 확정 및 실험(Alive/Energy/Drop/Abort/Relay rate 등)
+[ ] Reward 항 정의 튜닝(오버헤드/드랍/에너지의 분모 및 정규화 상수 확정)
+[ ] 장기 학습 안정성 점검(클립/엔트로피 스케줄/업데이트 배치 크기/시퀀스 길이 등)

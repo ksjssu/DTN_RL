@@ -33,6 +33,8 @@ public class MaxPropDijkstra {
 	private Map<Integer, Integer> prevNodes;
 	/** Mapping of to other nodes' (whom this node has met) probability sets */
 	private Map<Integer, MeetingProbabilitySet> probs;
+	/** Optional per-node penalty function (e.g., energy risk). */
+	private NodePenaltyFunction nodePenalty;
 
 	/**
 	 * Constructor.
@@ -40,7 +42,25 @@ public class MaxPropDijkstra {
 	 * probability sets
 	 */
 	public MaxPropDijkstra(Map<Integer, MeetingProbabilitySet> probs) {
+		this(probs, null);
+	}
+
+	/**
+	 * Constructor with optional node penalty callback.
+	 * @param probs A reference to the mapping of the known hosts meeting probability sets
+	 * @param nodePenalty Optional penalty function (may be null)
+	 */
+	public MaxPropDijkstra(Map<Integer, MeetingProbabilitySet> probs, NodePenaltyFunction nodePenalty) {
 		this.probs = probs;
+		this.nodePenalty = nodePenalty;
+	}
+
+	/**
+	 * Sets the node penalty function used when computing edge distances.
+	 * @param nodePenalty Optional penalty function (may be null)
+	 */
+	public void setNodePenaltyFunction(NodePenaltyFunction nodePenalty) {
+		this.nodePenalty = nodePenalty;
 	}
 
 	/**
@@ -144,7 +164,14 @@ public class MaxPropDijkstra {
 	private double getDistance(Integer from, Integer to) {
 		assert probs.containsKey(from) : "Node " + from + " has not met " + to +
 			" (it has met nodes " + probs.keySet() + ")";
-		return ( 1 - probs.get(from).getProbFor(to) );
+		double dist = (1 - probs.get(from).getProbFor(to));
+		if (this.nodePenalty != null) {
+			double pen = this.nodePenalty.getPenalty(to);
+			if (Double.isFinite(pen) && pen > 0.0) {
+				dist += pen;
+			}
+		}
+		return dist;
 	}
 
 	/**

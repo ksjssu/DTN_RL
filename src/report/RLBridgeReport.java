@@ -25,6 +25,8 @@ import java.util.*;
 public class RLBridgeReport extends SamplingReport implements UpdateListener, core.MessageListener {
     private static final double RELAY_CRIT_UTIL = 0.85;
     private static final double HIGH_UTIL_FLAG_THRESHOLD = 0.6;
+    // Message property key for hindsight credit assignment: creation step id (per RLBridge sample interval).
+    private static final String MSG_CREATION_STEP_ID_PROP = "rlbridge.creation_step_id";
 
     // Settings
     public static final String URL_S = "url";
@@ -65,6 +67,10 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final double episodeSeconds;
     private final double messageTtlMinutes;
     private boolean activationNotified = false;
+    // Step counter for remote-mode sample intervals within an episode.
+    private int stepIdCounter = 0;
+    // Previous sample time (used to help server define step interval boundaries robustly).
+    private double prevSampleTime = Double.NaN;
     private LocalPpoPolicy localPolicy = null; // feed-forward local policy
     private LocalRmappoPolicy localRmappoPolicy = null; // recurrent local policy
     private final BufferOccupancyTracker bufOccTracker = new BufferOccupancyTracker();
@@ -89,6 +95,20 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     private final Map<String, Double> totalDelayByKey = new HashMap<String, Double>();  // total delay for delivered messages
     private final Map<String, Double> ttlRatioSumByKey = new HashMap<String, Double>();
     private final Map<String, Double> hopCountSumByKey = new HashMap<String, Double>();
+
+    // Delivery events (final delivery only) since last sample, used for hindsight credit assignment on the DRL server.
+    // Each entry records the message creation time (sim-seconds) plus TTL ratio at delivery time.
+    private static class DeliveryEvent {
+        final double creationTime;
+        final double ttlRatio;
+        final int creationStepId;
+        DeliveryEvent(double creationTime, double ttlRatio, int creationStepId) {
+            this.creationTime = creationTime;
+            this.ttlRatio = ttlRatio;
+            this.creationStepId = creationStepId;
+        }
+    }
+    private final List<DeliveryEvent> deliveryEventsSinceLastSample = new ArrayList<DeliveryEvent>();
     private static final Map<String, RewardRecord> LAST_DRL_REWARD_BY_HOST = new HashMap<String, RewardRecord>();
     private static int LAST_REWARD_TIMESTAMP = -1;
     private static class RewardRecord {
@@ -253,6 +273,8 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             String simId = escape(getScenarioName());
             req.append("{\"sim_id\":\"").append(simId).append("\",\"time\":").append(now)
                .append(",\"delta_limit\":").append(effDeltaLimit)
+               .append(",\"step_id\":").append(this.stepIdCounter)
+               .append(",\"prev_time\":").append(format(Double.isFinite(this.prevSampleTime) ? this.prevSampleTime : now))
                .append(",\"created_since_last\":").append(createdThisStep)
                .append(",\"prev_transition\":[");
             stateBatch.append("\"state_batch\":[");
@@ -543,6 +565,23 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             // Local mode already applied actions inside the loop
             write("# RLBridge LOCAL t=" + now + " policy=(local) states=" + stateCount + " recv_actions=" + stateCount + " applied_actions=" + stateCount);
         } else if (remoteMode) {
+            // Append delivery events captured since last sample (for server-side hindsight credit assignment).
+            java.util.List<DeliveryEvent> deliveryCopy;
+            synchronized (deliveryEventsSinceLastSample) {
+                deliveryCopy = new java.util.ArrayList<DeliveryEvent>(deliveryEventsSinceLastSample);
+                deliveryEventsSinceLastSample.clear();
+            }
+
+            req.append("],\"delivery_events\":[");
+            boolean firstEv = true;
+            for (DeliveryEvent ev : deliveryCopy) {
+                if (ev == null) { continue; }
+                if (!firstEv) { req.append(","); } firstEv = false;
+                req.append("{\"creation_time\":").append(format(ev.creationTime))
+                        .append(",\"ttl_ratio\":").append(format(ev.ttlRatio))
+                        .append(",\"creation_step_id\":").append(ev.creationStepId)
+                        .append("}");
+            }
             req.append("],");
             req.append(stateBatch.toString()).append("]}");
 
@@ -630,6 +669,17 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             }
             else {
                 write("# RLBridge: no endpoint/failed request; policy=(none) states=" + stateCount + " recv_actions=0 applied_actions=0");
+            }
+
+            // Advance step counter for the next sample interval (even if request failed).
+            this.prevSampleTime = now;
+            this.stepIdCounter++;
+        }
+        // If we're not in remote mode, make sure we don't accumulate delivery events forever.
+        // (When controller is inactive or local policy is used, the Python server isn't consuming them.)
+        if (!remoteMode) {
+            synchronized (deliveryEventsSinceLastSample) {
+                deliveryEventsSinceLastSample.clear();
             }
         }
     }
@@ -828,7 +878,31 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
     }
 
     // MessageListener-like hooks to collect rewards at host-dest granularity
-    public void newMessage(Message m) { this.createdSinceLastSample++; }
+    public void newMessage(Message m) {
+        this.createdSinceLastSample++;
+        if (m == null) {
+            return;
+        }
+        // Tag messages with the creation step id so the DRL server can attribute final delivery
+        // back to the step when the message was created without expensive time-range searches.
+        try {
+            final double now = SimClock.getTime();
+            final boolean controllerActive = (this.activationTime <= 0.0) || (now >= this.activationTime);
+            final boolean baseLocalMode = (this.localRmappoPolicy != null) || (this.localPolicy != null) || this.heuristicMode;
+            final boolean remoteMode = controllerActive && !baseLocalMode;
+            if (!remoteMode) {
+                return;
+            }
+            try {
+                m.addProperty(MSG_CREATION_STEP_ID_PROP, Integer.valueOf(this.stepIdCounter));
+            } catch (Exception alreadyHas) {
+                // Best-effort: if property already exists, overwrite.
+                try {
+                    m.updateProperty(MSG_CREATION_STEP_ID_PROP, Integer.valueOf(this.stepIdCounter));
+                } catch (Exception ignore2) { /* ignore */ }
+            }
+        } catch (Exception ignore) { /* best effort */ }
+    }
     public void messageTransferStarted(Message m, DTNHost from, DTNHost to) {}
     public void messageDeleted(Message m, DTNHost where, boolean dropped) {
         if (dropped) {
@@ -883,6 +957,22 @@ public class RLBridgeReport extends SamplingReport implements UpdateListener, co
             double hopCount = m.getHopCount();
             Double hopSum = hopCountSumByKey.get(key);
             hopCountSumByKey.put(key, hopSum == null ? hopCount : hopSum + hopCount);
+
+            // Hindsight: report this final delivery with the original creation time (for origin-step attribution).
+            try {
+                double ct = m.getCreationTime();
+                if (!Double.isFinite(ct) || ct < 0.0) { ct = 0.0; }
+                int creationStepId = -1;
+                try {
+                    Object prop = m.getProperty(MSG_CREATION_STEP_ID_PROP);
+                    if (prop instanceof Number) {
+                        creationStepId = ((Number) prop).intValue();
+                    }
+                } catch (Exception ignoreProp) { /* ignore */ }
+                synchronized (deliveryEventsSinceLastSample) {
+                    deliveryEventsSinceLastSample.add(new DeliveryEvent(ct, ttlRatio, creationStepId));
+                }
+            } catch (Exception ignore) { /* best effort */ }
         }
         markUpdated(hostStr, destStr);
     }

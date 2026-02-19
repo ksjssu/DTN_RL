@@ -1,0 +1,570 @@
+RMAPPO로 MaxProp를 "더" 개선하기 위한 설계 아이디어(코드 변경 없이 컨셉 정리)
+====================================================================
+
+목표
+- 현재 프로젝트의 DRL(RMAPPO) 적용은 "PRoPHET의 예측도(predictability)에 delta를 가감"하는 형태로,
+  결과적으로 RL의 행동 공간이 '포워딩(릴레이/억제)' 중심으로 제한되어 있다.
+- 반면 MaxProp는 포워딩 결정뿐 아니라 (1) 큐 스케줄링, (2) 드롭 스케줄링, (3) Dijkstra 기반 비용(cost) 경로
+  등 "전송 시스템 전체"를 최적화해서, delivery/overhead/delay에서 강한 성능을 낸다.
+- 따라서 "RMAPPO로 MaxProp를 더 개선"하려면, RL이 MaxProp의 핵심 강점(스케줄링/드롭/경로비용)을
+  보완/동적화하는 방향으로 설계를 재구성해야 한다.
+- 또한 RMAPPO 전에, 사람이 수동으로 조절 가능한 "휴리스틱 MaxProp++"를 먼저 설계/튜닝해
+  MaxProp를 넘는 baseline을 만들고, 이를 RMAPPO의 teacher/safe-fallback으로 활용하는 접근을 포함한다.
+
+주의
+- 본 문서는 설계/연구 방향을 정리한 텍스트이며, 실제 구현을 위해서는 Java 라우터/브리지/상태-액션 정의 확장이 필요하다.
+- 이 문서 작성 시점에서는 코드를 수정하지 않는다(요청사항).
+
+
+------------------------------------------------------------
+1) 왜 현재 RMAPPO(Prophet 기반)가 MaxProp에 밀리는가
+------------------------------------------------------------
+
+현재 RMAPPO(Prophet delta 기반) 구조의 본질적 한계
+1. 행동(action)이 사실상 "이 메시지를 지금 릴레이할지/억제할지"에 수렴
+   - 네트워크 혼잡/버퍼 포화가 심해질수록, 포워딩만 잘해도 한계가 있다.
+   - 특히 동적 트래픽(메시지 생성률 변동)에서는 "언제 버퍼를 비우고 무엇을 남길지"가 성능을 좌우한다.
+
+2. 큐 스케줄링(무엇을 먼저 보내는가)을 직접 다루지 못함
+   - 실제로는 동일한 연결 기회에서 "어떤 메시지를 먼저" 전송하느냐가 delivery/delay에 큰 영향을 준다.
+   - Prophet+delta는 예측도 기반 next-hop 판단만 개선할 뿐, 전송 순서 최적화는 상대적으로 약하다.
+
+3. 드롭 정책(무엇을 버릴 것인가)을 직접 다루지 못함
+   - 버퍼가 차면 어떤 메시지를 버리는지가 성능을 결정한다.
+   - MaxProp는 메시지 중요도/전달가능성/홉 등을 반영해 drop을 정교하게 한다.
+   - RL이 drop을 통제하지 못하면, "좋은 메시지를 버리고 나쁜 메시지를 남기는" 손실이 누적된다.
+
+4. 경로 관점의 비용(cost)/그래프 최적화가 부족
+   - MaxProp는 meeting probability를 그래프로 보고 Dijkstra로 "목적지까지의 비용"을 계산한다.
+   - Prophet는 기본적으로 (직접+전이) 예측도 기반으로 다음 hop을 고르는 경향이 강하고,
+     '경로 전체의 비용'이라는 구조적 bias가 약하다.
+
+5. 동적 트래픽에서의 "모드 전환"이 어려움
+   - 저부하에서는 공격적 복제가 delay를 낮추고,
+     고부하에서는 보수적 억제가 overhead/drop을 낮춘다.
+   - MaxProp는 threshold 기반으로 버퍼를 2영역으로 나눠 이런 모드 전환을 구조적으로 수행한다.
+   - Prophet 기반 RL은 이 구조적 스위치가 약해, 트래픽 변화 시 일관되게 최적 모드로 전환하기 어렵다.
+
+
+------------------------------------------------------------
+2) MaxProp의 성능을 만드는 "핵심 메커니즘" (프로젝트 구현 기준)
+------------------------------------------------------------
+
+프로젝트의 MaxProp 구현(MaxPropRouter)은 크게 4가지 축이 결합되어 성능이 나온다.
+
+축 A. Meeting probability 학습/전파 (MeetingProbabilitySet + transitive exchange)
+- 연결이 올라오면 만남 확률을 업데이트하고, transitive probability를 교환한다.
+- alpha 파라미터로 "방금 만난 노드"의 확률을 강화하고 정규화한다.
+
+축 B. Dijkstra 기반 비용(cost) 계산 (MaxPropDijkstra)
+- 간선 비용: w(u,v) = 1 - P_u(v)
+- 경로 비용: sum of (1 - P)
+- "이웃에게 넘긴 다음 그 이웃이 목적지로 보내는 비용"을 고려해 전송 우선순위를 정한다.
+
+축 C. 큐/전송 스케줄링 (threshold + cost 기반 정렬)
+- calcThreshold()로 버퍼를 두 영역(priority vs non-priority)으로 분할한다.
+  - priority 영역: hop count가 작은 메시지를 우선 전송
+  - non-priority 영역: cost(=Dijkstra) 작은 메시지를 우선 전송
+
+축 D. 드롭 정책 (getNextMessageToRemove)
+- 전송 정렬과 동일한 규칙으로 메시지를 정렬한 뒤, "가장 뒤(=가장 덜 중요한)" 메시지를 drop 후보로 선택한다.
+
+결론
+- MaxProp는 "포워딩 여부"만이 아니라,
+  (1) 어떤 메시지를 우선 전송하고, (2) 어떤 메시지를 버리고,
+  (3) 경로 비용을 반영해 다음 hop을 고르는 구조적 강점을 가진다.
+
+
+------------------------------------------------------------
+3) RMAPPO 이전: 수동/휴리스틱 기반 MaxProp++ (MaxProp보다 더 좋게 만들기 목표)
+------------------------------------------------------------
+
+여기서 말하는 "휴리스틱"은,
+- RMAPPO처럼 학습으로 policy를 얻기 전에,
+- 사람이 직접 설계/튜닝 가능한 규칙(rule)과 제어(control)로
+  MaxProp의 파라미터와 의사결정을 "동적 트래픽에 맞게" 바꾸는 방법이다.
+
+핵심 메시지
+- 동적 트래픽(메시지 생성률이 계속 변함)에서는, 정적/준정적 파라미터를 쓰는 순수 MaxProp가
+  최적점에서 자주 벗어난다(특히 혼잡/완화 구간 전환).
+- 따라서 MaxProp의 구조는 유지하되, "국면 감지 + 피드백 제어"로
+  (alpha, threshold, transitive trust, cost bias 등)을 실시간으로 조절하는 MaxProp++를 만들면,
+  해당 시나리오에서는 MaxProp보다 더 나은 delivery/overhead/delay 트레이드오프를 노릴 수 있다.
+
+3.1 휴리스틱 설계 원칙: Residual(base + delta) + Feedback(목표 추종)
+- Prophet에서 하던 개념(예측도에 +delta/-delta)처럼, MaxProp도 "base + delta"로 설계한다.
+  - delta=0이면 즉시 MaxProp로 복귀(안전/디버깅 기준점)
+  - delta는 작게(clamp) 유지해서, 규칙이 틀려도 폭주하지 않게 한다.
+- 그리고 delta/파라미터는 "관측된 혼잡/성공률/오버헤드"를 목표값으로 맞추는 피드백 제어로 업데이트한다.
+
+3.2 국면(Phase) 감지: 동적 트래픽에서 MaxProp를 이기려면 먼저 '상황 전환'을 잡아야 함
+아래 신호를 window(예: 60~600s)로 EMA로 평활한 뒤, 히스테리시스(hysteresis)로 안정적으로 구간을 나눈다.
+
+(A) 트래픽/혼잡 신호
+- B = 전역 평균 버퍼 점유율(0~1)
+- dB = B의 변화율(상승/하강)
+- C = 생성률(created msgs/sec/node) 및 dC
+
+(B) 성능 신호
+- SR = delivered/created (step 또는 window)
+- OH = overhead proxy(예: relayed/delivered, transmissions/delivered)
+- DL = delivered 메시지의 평균 지연(가능하면)
+- AB = aborted rate(전송 실패/중단 비율)
+
+국면 예시(3~4개면 충분)
+- LOW  : B 낮고(dB<=0), C 낮음 -> 확산/지연 최소화 모드
+- RISE : dB>0 또는 C 급증 -> 폭주 방지/완충 모드(이 구간이 동적 트래픽에서 핵심)
+- HIGH : B 높음 또는 OH/AB 악화 -> 억제/정리 모드(오버헤드/드롭 억제)
+- FALL : dB<0로 안정화 중 -> 다시 공격성을 회복하는 복귀 모드
+
+3.3 사람이 조절할 "수동 파라미터 세트"를 먼저 만든다(=MaxProp++의 핸드 튜닝 포인트)
+RMAPPO 없이도 MaxProp를 이기려면, 최소한 아래 4종을 수동으로 튜닝 가능하게 설계하는 게 현실적이다.
+
+(A) alpha 모드값: {alpha_low, alpha_mid, alpha_high}
+- LOW에서는 alpha_high로 빠른 학습/전파
+- HIGH에서는 alpha_low로 확률 과민반응/오버탐색 방지
+
+(B) threshold/priority 비율 모드값: {p_low, p_mid, p_high} 또는 {thr_shift_*}
+- LOW: priority 영역 확대(낮은 hop 빠르게 확산) -> delay 개선
+- HIGH: priority 영역 축소(효율 경로 위주) -> overhead/drop 개선
+
+(C) transitive trust 모드값: {trust_low, trust_mid, trust_high}
+- LOW: trust_high(전이 지식 적극 활용)
+- RISE/HIGH: trust_low(전이 지식 과잉 반응 억제, 불필요 릴레이 감소)
+
+(D) cost bias 강도 모드값: {k_cost_low, k_cost_mid, k_cost_high}
+- 아래 3.4의 residual delta를 cost에 얼마나 반영할지 결정.
+- HIGH에서 k_cost를 낮추면 "delta로 과도하게 흔들려 overhead가 늘어나는 현상"을 막을 수 있다.
+
+3.4 Prophet-delta 철학을 휴리스틱으로 구현: cost/확률/threshold에 '규칙 기반 delta'를 주입
+RMAPPO 없이도 Prophet에서 하던 "전이예측도 보정" 느낌을 살리려면,
+delta를 학습 대신 규칙으로 생성하고, 이를 MaxProp의 핵심 값에 주입하면 된다.
+
+가장 현실적인 1순위: (host,dest) 단위 delta를 Dijkstra cost에 주입 (Residual Cost Bias)
+- 핵심: MaxProp의 비결정(전송/드롭)은 결국 cost 비교(또는 threshold)로 귀결되므로,
+  cost에 delta를 주면 '포워딩+큐+드롭'이 같이 움직인다.
+
+  delta의 규칙 기반 예시(정답이 아니라 출발점)
+  - 입력 피처:
+    - dc = cost(self,d) - cost(neighbor,d)          (양수면 neighbor가 더 좋음)
+    - u  = my buffer util(0~1)
+    - un = neighbor buffer util(0~1)
+    - ttl = TTL urgency(0~1) (임박할수록 1)
+    - phase in {LOW, RISE, HIGH, FALL}
+  - delta(h,d) 생성(스칼라):
+      base = sgn(dc) * min(1, |dc|/dc_scale)
+      cong = clamp((u - u0) / (1-u0), 0, 1)         # u0는 혼잡 시작점(예: 0.6~0.8)
+      head = clamp((1-un), 0, 1)                    # 이웃 여유
+      urg  = ttl
+      gate = head * (1-cong)                        # 내 혼잡이면 gate가 줄어듦
+      delta = DeltaMax * base * (w1*urg + w2*gate)
+    - 해석:
+      - neighbor가 cost를 충분히 줄여주고(dc>0), TTL이 임박하며, neighbor 여유가 있을수록 delta를 +로 키움
+      - 내 버퍼가 혼잡하면 gate가 줄어 과도한 릴레이를 억제
+
+  cost에 주입:
+      cost_eff = cost_base - k_cost(phase) * clamp(delta, -DeltaMax, +DeltaMax)
+
+이 방식이 MaxProp를 이길 수 있는 이유(동적 트래픽 관점)
+- MaxProp는 cost 자체에는 "혼잡/TTL urgency"가 직접 반영되지 않는다.
+- 위 규칙은 cost 비교에 혼잡/TTL/이웃 여유를 섞어, 동적 트래픽에서 흔한
+  "혼잡 급증 구간(RISE)"에서 오버헤드 폭발을 막고, "완화 구간(FALL)"에서 공격성을 회복한다.
+
+3.5 피드백 제어(제약 추종)로 휴리스틱을 더 강하게 만든다: 수동 규칙 + 자동 게인 업데이트
+규칙이 아무리 좋아도, 시나리오별 스케일이 다르면 튜닝이 깨진다.
+그래서 아래처럼 "목표값을 추종하는 스칼라 가격(price)"를 두고, 이를 통해 공격성을 자동으로 조절하면
+MaxProp 대비 일관된 개선을 만들기 쉽다(Constrained control; RL의 Lagrangian을 수동으로 흉내).
+
+(A) 혼잡 가격 lambda_buf 업데이트(예시)
+- 목표: 평균 버퍼 점유율을 B_target 근처로 유지(드롭/abort 폭주 방지)
+  lambda_buf(t+1) = clamp(lambda_buf(t) + k1*(B - B_target) + k2*dB, 0, lambda_max)
+- 사용: lambda_buf가 커질수록
+  - threshold 축소(우선영역 축소)
+  - trust 감소(전이 지식 덜 믿음)
+  - k_cost 감소 또는 relay gate 강화(불필요 릴레이 억제)
+
+(B) 오버헤드 가격 lambda_oh 업데이트(예시)
+- 목표: OH_target 이하로 유지
+  lambda_oh(t+1) = clamp(lambda_oh(t) + k3*(OH - OH_target), 0, lambda_oh_max)
+- 사용: lambda_oh가 커질수록
+  - delta clamp를 더 강하게(DeltaMax 축소)
+  - "재전송/확산" 계열 모드로의 진입을 늦춤
+
+(C) 지연 가격 lambda_delay(선택)
+- 목표: DL_target 이하로 유지
+  lambda_delay(t+1) = clamp(lambda_delay(t) + k4*(DL - DL_target), 0, lambda_delay_max)
+- 사용: lambda_delay가 커질수록
+  - LOW/FALL 구간에서 공격성을 더 빨리 회복(지연을 줄이기 위해 복제/확산을 허용)
+
+이 제어법은 "수동 게인(k1~k4)"만 튜닝하면, 나머지는 자동으로 트래픽 변동을 따라간다.
+동적 트래픽에서 정적 MaxProp보다 유리해질 수 있는 지점이 바로 여기다.
+
+3.6 휴리스틱을 설계할 때 '이기는 게임'을 만든다: MaxProp의 빈칸(혼잡/TTL/이웃여유)을 직접 메운다
+MaxProp는 강력하지만, 아래 요소는 구조적으로 약하거나 고정값에 의존한다.
+- 혼잡(버퍼/abort) 반응 속도: avgTransferredBytes/threshold는 느리게 반응할 수 있음
+- TTL urgency 반영: hop 중심 우선순위는 TTL 임박 메시지 보호에 직접적이지 않음
+- 이웃의 여유/리스크: cost는 (1-P)로만 구성되어, 이웃 버퍼/드롭 위험을 직접 반영하지 않음
+
+따라서 휴리스틱 MaxProp++의 성능 목표를 "MaxProp보다 좋게" 설정하려면,
+적어도 아래 3가지는 반드시 들어가야 한다.
+1) 혼잡 가격(lambda) 기반의 억제/완화 스위치(phase 전환)
+2) TTL urgency가 반영되는 스케줄링/드롭 보정
+3) 이웃 여유/리스크를 반영하는 cost residual 또는 gating
+
+3.7 수동 튜닝 절차(현실적으로 이렇게 해야 MaxProp를 넘어설 확률이 높음)
+1) Baseline(MaxProp)로 먼저 구간별 실패 모드를 분해
+  - RISE 구간에서 overhead/abort가 터지는지
+  - HIGH 구간에서 drop이 급증하는지
+  - LOW/FALL 구간에서 delay가 길어지는지
+
+2) "모드 3종(LOW/HIGH/RISE)"의 파라미터 세트를 손으로 만든다
+  - alpha_{low,high}, trust_{low,high}, p_{low,high}, DeltaMax_{low,high}
+  - 처음엔 극단값보다 완만하게(정적 MaxProp에서 크게 벗어나지 않게)
+
+3) 피드백 가격(lambda) 업데이트 게인을 튜닝
+  - k1(버퍼)부터: 너무 크면 진동(thrashing), 너무 작으면 반응이 늦음
+  - 그 다음 k3(오버헤드), 마지막으로 k4(지연)
+
+4) 마지막으로 delta 규칙(3.4)의 dc_scale, u0, w1,w2만 조절
+  - dc_scale: cost 차이가 어느 정도일 때 '의미 있는 개선'으로 볼지
+  - u0: 혼잡 시작점(시나리오의 버퍼/생성률에 따라 달라짐)
+
+3.8 이 휴리스틱은 RMAPPO의 "교과서"가 된다
+- 휴리스틱 MaxProp++를 먼저 만들면,
+  - (a) RMAPPO 관측/보상/제약을 설계할 때 기준점이 생기고,
+  - (b) imitation/behavior cloning 데이터도 얻기 쉬우며,
+  - (c) RMAPPO가 불안정할 때 safe fallback 정책으로 사용 가능하다.
+- 즉, RMAPPO는 휴리스틱을 "대체"하는 게 아니라,
+  잘 튜닝된 휴리스틱 위에서 residual로 더 미세한 개선을 하는 방향이 가장 안정적이다.
+
+
+------------------------------------------------------------
+4) RMAPPO로 MaxProp를 개선하는 3가지 큰 방향(추천 순서)
+------------------------------------------------------------
+
+RMAPPO를 MaxProp에 붙이는 방법은 크게 3가지로 나눌 수 있다.
+현실적 난이도/안정성을 기준으로 추천 순서를 제안한다.
+
+방향 1) "MaxProp를 유지" + RL은 저차원 파라미터를 동적으로 조절 (가장 현실적)
+- RL이 직접 메시지 선택을 하지 않고, MaxProp의 비교/정렬 규칙을 좌우하는 파라미터를 제어한다.
+- 장점: 행동 공간이 작아 안정적이고, baseline(MaxProp)을 크게 깨지지 않게 개선 가능.
+
+방향 2) RL이 큐 스케줄러/드로퍼를 직접 학습 (성능 잠재력 높음, 난이도 높음)
+- RL이 (message, neighbor) 후보에 대해 score를 출력하고, 최대 score를 전송/최소 score를 drop한다.
+- 장점: "MaxProp의 고정 규칙"을 넘어 scenario 특화 최적화 가능.
+- 단점: 가변 길이 버퍼/상대 노드 수로 인해 상태/액션이 커지고 학습이 불안정해질 수 있음.
+
+방향 3) 하이브리드/계층형: RL이 "모드"를 선택하고, 모드 내에서는 MaxProp 규칙 적용
+- 예: (Aggressive / Balanced / Conservative) 중 하나를 고른 뒤, 각 모드별로 다른 파라미터/정렬을 사용.
+- 장점: 방향 1의 안정성 + 방향 2의 표현력 일부 확보.
+
+
+------------------------------------------------------------
+5) 방향 1: RL로 MaxProp의 핵심 파라미터를 동적으로 제어(강력 추천)
+------------------------------------------------------------
+
+핵심 아이디어
+- MaxProp의 "구조"는 유지하되, 그 구조를 구성하는 하이퍼파라미터/가중치를
+  트래픽/혼잡 상태에 따라 동적으로 바꾼다.
+- 즉 RL의 action을 "저차원 연속값(continuous)"으로 설계해, 학습 안정성과 일반화를 확보한다.
+
+5.1 제어 후보 파라미터(예시)
+(A) alpha(t): meeting probability 업데이트 강도
+- 저부하/희소(sparse) 구간: alpha를 키워 빠르게 학습(공격적)
+- 고부하/혼잡 구간: alpha를 줄여 확률 변화 과민반응 방지(보수적)
+- 확장: neighbor/시간대별 alpha를 달리(하지만 action 차원 증가)
+
+(B) threshold(t) 또는 priority portion p(t): 버퍼 2영역 분할의 동적화
+- MaxProp는 avgTransferredBytes로 p를 계산한 뒤 threshold를 정한다.
+- RL이 직접 p를 비율로 출력하면(0~1), 트래픽 모드에 맞게 priority 영역 크기를 조정 가능.
+  - 고부하: priority 영역을 작게/엄격하게(초저홉 우선) -> overhead/drop 완화
+  - 저부하: priority 영역을 크게(더 많은 메시지를 hop 기준으로 빠르게 확산) -> delay 완화
+
+(C) cost 기반 정렬에 "혼잡/지연" 보정항을 추가하는 가중치
+- MaxProp의 cost는 (1 - meetingProb)만 반영 -> 혼잡/큐잉 지연은 직접 반영하지 않는다.
+- RL이 lambda_congestion, lambda_delay 같은 가중치를 출력:
+  score(m, neighbor) = cost(neighbor -> dest)
+                     + lambda_congestion * util(neighbor)
+                     + lambda_dropRisk * dropRisk(neighbor)
+                     + lambda_ttl * ttlUrgency(m)
+                     + lambda_size * sizePenalty(m)
+  를 최소화하는 방향으로 정렬하면, "경로비용 + 혼잡 + TTL"을 같이 최적화 가능.
+
+(D) resend 정책(선택)
+- 현재 MaxProp 구현은 sentMessages로 "이미 보낸 메시지는 같은 이웃에게 재전송하지 않음".
+- 동적 트래픽/버퍼 삭제가 심하면, 선택적 재전송이 유리한 구간이 있을 수 있다.
+- RL이 "재전송 허용 임계" 같은 저차원 파라미터를 제어해, overhead 폭발 없이 유리한 재전송만 허용.
+
+(E) Prophet에서 쓰던 "전이 예측도 +/- delta" 철학을 MaxProp로 이식: Residual(MaxProp+delta) 설계
+- 핵심은 MaxProp를 "대체"하는 게 아니라, MaxProp가 계산한 값(확률/거리/비용/임계치)에 RL이 작은 delta를 더해
+  그때그때(동적 트래픽 국면) 더 공격적/더 보수적으로 바이어스(bias)하는 것이다.
+- Prophet에서 했던 것처럼 "base + delta" 형태를 유지하면, delta=0일 때 MaxProp로 즉시 복귀하는 안전장치가 된다.
+
+  (E1) Dijkstra cost 자체에 delta를 더하고 빼기(가장 Prophet-delta에 대응됨, 추천)
+  - MaxProp의 전송/드롭 정렬은 결국 cost 비교로 수렴(특히 threshold 밖 구간)하므로,
+    RL이 cost를 보정하면 큐 스케줄링/드롭/포워딩이 동시에 바뀐다.
+  - 개념식(부호는 "delta>0이면 더 선호"로 맞추는 편이 직관적):
+      cost_eff(h, d) = cost_base(h, d) - k_cost * clamp(delta(h, d), -Delta, +Delta)
+    - cost는 작을수록 좋으므로, delta가 +면 cost를 낮춰 더 선호하게 만든다.
+    - delta(h,d)는 Prophet에서의 (host,dest) delta와 1:1로 대응되는 형태라 "기존 개념"을 그대로 가져오기 쉽다.
+  - 장점: destination-conditioned bias를 직접 줄 수 있어, "특정 목적지로 가는 메시지만" 공격/억제를 쉽게 학습한다.
+  - 안전성: delta=0이면 원래 MaxProp cost 비교로 돌아간다(Residual control).
+  - Prophet의 "예측도는 0~1" 감각을 그대로 가져오고 싶다면(=delta가 항상 비슷한 의미를 갖게 하고 싶다면),
+    cost를 (0,1] 범위의 pseudo-predictability로 변환한 뒤 delta를 더하고 다시 cost로 되돌리는 방법이 더 안정적일 수 있다:
+      pred_cost(h,d) = exp(-cost_base(h,d) / tau)              # (0,1]
+      pred_eff(h,d)  = clamp(pred_cost(h,d) + delta(h,d), eps, 1-eps)
+      cost_eff(h,d)  = -tau * log(pred_eff(h,d))
+    - 이렇게 하면 delta가 "예측도 보정"처럼 작동하고, cost가 큰 구간/작은 구간에서 delta 영향이 과도하게 달라지는 문제를 줄인다.
+
+  (E2) 간선 가중치 w(u,v)=1-P_u(v) 또는 meeting probability P_u(v)에 delta를 주입(더 직접적, 난이도↑)
+  - MaxProp의 cost는 그래프 간선 w(u,v)=1-P_u(v)에서 나오므로, delta를 간선/확률에 주면
+    "경로 자체"가 바뀌는 강력한 효과를 낸다(Prophet의 전이 예측도를 직접 조작하는 느낌에 가장 가깝다).
+  - 단, 제약이 있음:
+    - Dijkstra는 음수 간선이 깨지므로 w_eff는 0 이상이어야 함.
+    - P는 0~1, 그리고(구현상) 합이 1인 분포에 가까우므로, 단순 덧셈 후 정규화/클램프가 필요.
+  - action 차원을 폭발시키지 않으면서도 "목적지(dest) 조건부"로 delta를 주고 싶다면,
+    Prophet에서 하던 것처럼 delta(h,d)를 유지하되, 이를 이웃 v별로 분배하는 factorization이 현실적이다:
+      delta_edge(u,v | d) = delta(u,d) * g(u,v,d)
+    - g(u,v,d)는 (v가 d에 더 가까운지/혼잡이 덜한지/TTL에 유리한지)를 나타내는 고정(feature-based) 스칼라로 두고,
+      RL은 delta(u,d) 하나만 내서 "전이 경로 바이어스 강도"를 조절한다(=Prophet-delta 철학 유지).
+  - 안정적 설계 예시(확률 공간 대신 logit 공간에서 잔차를 더함):
+      logit_eff(u->v) = log(P_u(v)+eps) + k_edge * delta_edge(u,v)
+      P_eff = softmax_v(logit_eff)
+      w_eff(u,v) = 1 - P_eff(u,v)
+    - 이렇게 하면 P_eff는 자동으로 [0,1]이고 합이 1로 정규화되며, delta의 영향이 부드럽다.
+
+  (E3) "전이(transitive) 정보" 자체의 신뢰도에 delta를 주입(Prophet의 전이예측도 개념과 구조적으로 대응)
+  - Prophet의 핵심은 전이 예측도를 통해 "내가 직접 못 만나도, 다른 노드의 지식을 빌려" 경로를 만든다는 점이다.
+  - MaxProp에서도 allProbs 교환(updateTransitiveProbs)이 사실상 전이 지식의 유입 경로이므로,
+    RL이 "전이 지식을 얼마나 믿을지"를 delta로 조절하면 동적 트래픽에서 과잉/과소 전파를 줄일 수 있다.
+  - 예시(개념식):
+      trust = sigmoid(delta_trust(t))          # 0~1
+      P_eff = normalize( (1-trust)*P_local + trust*P_transitive )
+    - 고부하/변동 구간: trust를 낮춰 "전이 확률의 과민반응"을 억제(불필요 릴레이 감소)
+    - 저부하/안정 구간: trust를 높여 빠르게 경로 지식을 확산(지연 감소)
+
+  (E4) threshold(우선영역 분할)에 delta를 주입(큐 스케줄링/드롭 모드 전환을 delta로 구현)
+  - Prophet에서는 delta로 "릴레이/억제"를 직접 흔들었다면,
+    MaxProp에서는 delta로 "hop 우선(priority) vs cost 우선(non-priority)" 모드를 흔들 수 있다.
+  - 개념식:
+      thr_eff = thr_base + round(k_thr * delta_thr(t))
+    - 고부하: thr_eff를 낮춰(priority 영역 축소) cost/효율 중심으로 보내서 overhead/drop 완화
+    - 저부하: thr_eff를 높여(priority 영역 확장) 확산을 빠르게 해서 delay 완화
+  - 장점: action이 1~2개 스칼라여도 트래픽 국면 전환 효과가 큼(학습 안정적).
+
+5.2 상태(관측) 설계(저차원 파라미터 제어용)
+관측은 크게 3종류로 묶는 것이 좋다.
+
+(A) 글로벌/국면(phase) 피처
+- 최근 메시지 생성률(노드당 msg/sec), 그 변화율(slope)
+- 전역 평균 버퍼 점유율, 변화율
+- 최근 success rate(Delivered/Created), 그 변화
+- 최근 overhead proxy(예: relayed/delivered) 또는 episode 누적 오버헤드
+
+(B) 로컬 노드 피처
+- 내 버퍼 점유율, free buffer
+- 평균 전송량(avgTransferredBytes) 및 최근 contact 통계
+- 최근 aborted/drop/relayed 카운트(연결 품질/혼잡의 간접 지표)
+
+(C) 연결/이웃 피처(집계)
+- 현재 연결된 이웃 수
+- 연결된 이웃의 평균/최대 버퍼 점유율
+- 연결된 이웃과의 평균 접촉 빈도
+
+저차원 action의 장점은, 이런 "집계 피처"로도 의미 있는 정책을 만들 수 있다는 점이다.
+
+5.3 학습 관점 이점
+- action 차원이 작아 PPO/RMAPPO가 안정적으로 수렴하기 쉬움
+- 기존 MaxProp의 구조적 장점(Dijkstra + threshold)을 유지하므로,
+  "학습 실패 = 성능 붕괴" 위험이 상대적으로 작음
+- 모드 전환(저부하/고부하)을 RL이 자연스럽게 학습할 수 있음
+- 특히 (E)처럼 base(MaxProp)에 작은 delta만 더하는 잔차 제어(residual) 형태면,
+  "delta=0 => MaxProp"라는 강력한 안전/디버깅 기준점을 확보할 수 있다.
+
+
+------------------------------------------------------------
+6) 방향 2: RMAPPO로 스케줄링/드롭을 직접 학습(고난이도/고잠재력)
+------------------------------------------------------------
+
+핵심 아이디어
+- MaxProp의 비교기(comparator)를 "학습 가능한 scoring 함수"로 치환/보강한다.
+- RL은 매 step(또는 contact 이벤트)마다 후보 메시지들에 대한 우선순위(score)를 내고,
+  가장 좋은 것을 전송하며, 버퍼가 찰 때는 가장 나쁜 것을 drop한다.
+
+6.1 가장 큰 난제: 가변 길이(action space explosion)
+- 노드마다 메시지 개수, 이웃 개수가 시시각각 달라서,
+  "고정 차원 벡터 -> 고정 차원 action" 구조가 그대로는 맞지 않는다.
+
+현실적 해결책(대표 3가지)
+(A) Top-K 근사
+- 버퍼에서 상위 K개만 후보로 보고(예: TTL 임박, hop 낮음, cost 낮음 등),
+  RL은 그 K개 중 선택/정렬한다.
+- K를 작게 유지하면 학습/추론이 쉬워진다.
+
+(B) 스코어링 네트워크 + argmax 선택
+- RL actor는 각 후보(메시지 또는 (메시지,이웃) 튜플)에 대해 score를 출력하고,
+  시스템은 score 최대를 선택한다.
+- 구현은 "포인터 네트워크(pointer) / attention" 형태가 일반적.
+
+(C) 모드 + 규칙 기반 후보 축소(하이브리드)
+- RL이 먼저 "어느 정책 모드"를 고르고,
+  그 모드에서 규칙 기반으로 후보를 줄인 뒤, 남은 후보만 RL이 선택한다.
+
+6.2 상태 피처(메시지 단위)
+메시지마다 최소한 아래 피처는 들어가는 것이 좋다.
+- hopCount, age(또는 TTL ratio), size
+- dest에 대한 MaxProp cost(self->dest), cost(neighbor->dest)
+- "cost 감소량": deltaCost = cost(self,dest) - cost(neighbor,dest)
+- 과거 전송/실패 이력(이 메시지가 얼마나 relayed/aborted 되었는지 등)
+
+이 피처들은 MaxProp의 기존 지식(경로 비용)을 RL이 그대로 활용하게 해준다.
+
+6.3 드롭 정책 학습 시의 보상 설계(필수)
+- 드롭은 즉시 보상이 아니라 "미래 delivery 손실"로 나타나는 경우가 많아 credit assignment가 어렵다.
+- 해결책:
+  - (Potential-based shaping) 메시지의 potential을 두고, drop 시 potential 손실을 즉시 페널티로 부여
+  - 메시지 생성 step id 추적 후, 나중에 delivered 여부로 hindsight credit(프로젝트에 이미 유사 트래킹 존재)
+  - 또는 Lagrangian/제약 형태로 drop률을 제어
+
+
+------------------------------------------------------------
+7) 방향 3: 모드 선택형(안정성 + 표현력) 하이브리드 설계
+------------------------------------------------------------
+
+핵심 아이디어
+- RL은 복잡한 세부 결정을 직접 하지 않고,
+  "지금은 공격적으로 확산할 때/지금은 억제할 때/지금은 버퍼를 정리할 때"
+  같은 상위 모드만 선택한다.
+- 각 모드는 MaxProp의 파라미터 세트 또는 스케줄링 규칙 세트에 대응한다.
+
+모드 예시(3~5개 정도가 적당)
+1) Aggressive (저부하, delay 최소화)
+- alpha up, priority 영역 확장, 전송 후보 폭 넓힘
+
+2) Balanced (평상시)
+- 기본 MaxProp 유사
+
+3) Conservative (고부하, overhead/drop 억제)
+- alpha down, priority 영역 축소, cost 감소가 확실한 전송만 허용
+
+4) Cleanup (버퍼 포화 직전)
+- 드롭/선별 우선, 큰 메시지/TTL 낮은 메시지 우선 전송 등
+
+장점
+- action space가 작다(모드 번호만 선택)
+- 해석 가능(왜 그런 행동이 나왔는지 설명 가능)
+- MaxProp를 크게 망가뜨리지 않고도 트래픽 변화에 대응
+
+
+------------------------------------------------------------
+8) Reward(보상) 설계: MaxProp 개선에 맞춘 "분해 가능한" 보상
+------------------------------------------------------------
+
+MaxProp 개선 목적이 delivery/overhead/delay 동시 개선이므로,
+보상은 단일 스칼라지만 내부 구성은 아래처럼 분해해서 설계하는 것이 실용적이다.
+
+8.1 기본 이벤트 보상
+- delivered: +R_deliver (TTL 가중치 가능)
+- relayed: 소량 보상 또는 0 (무조건 보상하면 overhead 폭발 위험)
+- aborted transfer: -R_abort (연결-용량 예측 실패 페널티)
+- dropped due to buffer: -R_drop (단, 모든 drop을 동일 페널티로 두면 정책이 지나치게 보수적일 수 있음)
+
+8.2 overhead/delay shaping
+- overhead penalty: relayed - delivered(또는 transmissions/delivered) 기반 페널티
+- delay penalty: delivered된 메시지의 end-to-end delay 기반 페널티(지수 포화 형태 추천)
+
+8.3 Potential-based shaping (MaxProp cost 활용)
+- 메시지 m이 어떤 노드 i에 있을 때 potential:
+    Phi(i,m) = -cost(i -> dest(m))   (cost는 MaxPropDijkstra 기반)
+- m을 이웃 j로 전달해 위치가 바뀌면 shaping reward:
+    r_shape = gamma * Phi(j,m) - Phi(i,m)
+  => "cost를 줄이는 전송"을 즉시 강화하므로 학습이 빨라진다.
+
+8.4 제약 기반(Constrained RL) 권장
+- 동적 트래픽에서 greedy 정책은 쉽게 overhead를 폭증시킨다.
+- overhead/drop/delay 각각에 목표값을 두고, Lagrangian penalty로 constraint를 걸면
+  정책이 안정적으로 trade-off를 학습한다.
+
+
+------------------------------------------------------------
+9) 관측(상태) 설계 체크리스트: MaxProp의 강점을 RL에 넣어라
+------------------------------------------------------------
+
+MaxProp 개선을 원한다면, RL이 최소한 아래 정보를 관측할 수 있어야 한다.
+
+필수(권장) 피처
+- 버퍼 점유율(내/이웃), 최근 증가율(트래픽 국면)
+- 메시지의 TTL/age/size/hop
+- cost(self->dest), cost(neighbor->dest), deltaCost
+- 최근 contact 통계(접촉 빈도, 평균 전송량, 연결 지속시간 proxy)
+- 최근 aborted/drop/relayed/delivered 카운트
+
+왜 필요한가
+- MaxProp가 잘하는 이유는 "cost/threshold/드롭"이 모두 hop/비용/전송용량과 결합되어 있기 때문.
+- RL이 이 정보를 못 보면, 결국 Prophet 기반처럼 "포워딩 여부" 수준에서 맴돈다.
+
+
+------------------------------------------------------------
+10) 학습 전략(중요): MaxProp를 이기려면, 먼저 MaxProp를 배워라
+------------------------------------------------------------
+
+현실적으로 MaxProp는 강한 휴리스틱+그래프 최적화가 결합된 정책이다.
+RL이 처음부터 무작정 탐색으로 이를 이기기는 매우 어렵다.
+
+추천 학습 커리큘럼
+1) Imitation(Behavior Cloning)로 MaxProp의 스케줄링/드롭 결정을 모사
+  - 로그로 (state -> MaxProp가 선택한 전송/드롭) 데이터를 수집
+  - 지도학습으로 "MaxProp 수준"의 초기 정책을 만든다.
+
+2) 그 다음 RL fine-tuning
+  - 동적 트래픽/혼잡 같은 "MaxProp가 덜 최적일 수 있는" 구간에서만
+    reward로 미세 조정하도록 한다.
+
+3) Safe fallback(혼합 정책)
+  - RL의 출력이 불확실하면(Max entropy 높음, score margin 작음 등)
+    기본 MaxProp 결정을 따르게 하면 학습/평가에서 성능 붕괴를 막는다.
+
+이 커리큘럼의 장점
+- "최소 성능 보장"을 확보하고, 그 위에서 개선을 시도할 수 있다.
+- 특히 action space가 큰 방향 2(직접 스케줄링/드롭)에서 필수에 가깝다.
+
+
+------------------------------------------------------------
+11) 실험/검증 플랜(코드 수정 없이도 먼저 할 수 있는 것)
+------------------------------------------------------------
+
+실제로 어디서 성능이 깨지는지 먼저 분해해서 보지 않으면, 개선 방향이 흔들릴 수 있다.
+아래는 구현 없이도(보고서/로그 기반) 할 수 있는 진단 항목들이다.
+
+진단 질문
+1) RL(Prophet 기반)이 MaxProp 대비 delivery가 낮은 구간은 "언제"인가?
+  - 저부하 vs 중부하 vs 고부하(메시지 생성률 변화 구간별)
+
+2) 차이가 drop 때문인가, 잘못된 forwarding 때문인가, 스케줄링(전송 순서) 때문인가?
+  - buffer occupancy 곡선, drop count/원인, aborted count 비교
+
+3) overhead가 나쁜 이유가 "불필요 릴레이"인지, "재전송/루프"인지, "큰 메시지 abort"인지?
+  - relayed - delivered, aborted bytes, hop distribution을 분해
+
+4) MaxProp의 장점이 주로 'drop 정책'에서 나오는지, 'Dijkstra cost'에서 나오는지?
+  - MaxProp의 구성 요소를 ablation(개념적으로)하여 기여도를 추정
+
+이 진단 결과에 따라, 위 3가지 방향 중 어디에 투자할지 결정하는 것이 비용 대비 효과가 크다.
+
+
+------------------------------------------------------------
+12) 결론: "MaxProp를 더 개선"하려면 RL의 역할을 '포워딩' 밖으로 확장해야 한다
+------------------------------------------------------------
+
+핵심 정리
+- MaxProp가 강한 이유는 forwarding만이 아니라,
+  스케줄링/드롭/경로비용 최적화가 결합되어 있기 때문이다.
+- RMAPPO로 MaxProp를 이기거나 더 개선하려면,
+  RL이 최소한 아래 중 하나를 해야 한다:
+  1) MaxProp의 파라미터(Alpha/Threshold/가중치)를 동적으로 제어(가장 현실적)
+  2) 큐 스케줄링/드롭을 직접 학습(가장 잠재력 높지만 난이도 높음)
+  3) 모드 선택형 하이브리드로 안정적 모드 전환을 학습
+
+추천 시작점
+- "방향 1(저차원 파라미터 제어)"로 먼저 개선 여지를 확인한 뒤,
+  여전히 격차가 크면 "방향 2(직접 스케줄링/드롭)"으로 확장하는 것이 리스크가 낮다.

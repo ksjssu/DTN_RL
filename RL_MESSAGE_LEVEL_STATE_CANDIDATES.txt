@@ -1,0 +1,193 @@
+메시지 단위 RL(State) 설계 후보 (DTN / MaxProp 관점)
+=====================================================
+
+목적
+----
+메시지 단위로 RL 에이전트가 의사결정할 때, 관측(state)은 최소한 아래 결정을 내리기에
+충분한 정보들을 담아야 합니다.
+- 릴레이(전송) vs 릴레이 억제(보류)
+- (확장) 어떤 이웃에게 보낼지, 큐(전송 스케줄)에서 우선순위를 어디에 둘지,
+  드롭(drop) 후보로 둘지
+
+특히 DTN에서는 트래픽이 시간에 따라 변하고, 링크/접촉이 이질적이며,
+버퍼/에너지 제약 때문에 단순 확률(P)만으로는 판단이 어려워 state 구성이 중요합니다.
+
+아래 체크리스트는 다음 형태로 조합할 수 있습니다.
+- 메시지 단독 state: s(m)
+- 메시지+이웃 state: s(m, n)  (예: "메시지 m을 이웃 n에게 보낼까?")
+- 메시지+큐 state: s(m, q)    (예: "m의 전송/드롭 우선순위를 어디에 둘까?")
+
+표기
+----
+- m: 현재 평가/결정 대상 메시지
+- i: 현재 노드(자기 자신)
+- n: 현재 연결된 이웃 노드
+- d: 메시지 m의 목적지 노드
+- t: 현재 시각(시뮬레이션 시간)
+
+구현 팁
+-------
+- 수치들은 정규화(최대값으로 나누기, 로그 스케일 등)하는 게 안정적입니다.
+- msg_id 같은 "순수 ID"를 그대로 연속값으로 넣으면 학습에 독이 되기 쉬우니,
+  보통 제외하거나(권장) 카테고리/임베딩/해시 요약 형태로만 씁니다.
+
+
+A. 메시지 자체 특징 (Message-Intrinsic, per-message)
+-----------------------------------------------------
+정체성/엔드포인트(대개 카테고리로 처리하거나 생략):
+- src_id, dst_id (또는 src_group, dst_group)
+- msg_class / app_id (트래픽 유형이 여러 개인 경우)
+- priority_class (긴급/일반 등 우선순위가 있는 경우)
+
+크기/시간:
+- size_bytes (메시지 크기)
+- remaining_bytes (부분 전송/재개 모델이면 중요)
+- creation_time 또는 age = t - creation_time (생성 후 경과시간)
+- ttl_remaining 또는 deadline_remaining (남은 TTL/데드라인)
+- receive_time_at_i (i가 이 메시지를 받은 시각) 또는 time_since_received
+- buffer_time_so_far_at_i (i 버퍼에 머문 시간)
+
+경로/복제 히스토리:
+- hop_count (현재 홉 수)
+- last_hop_id(카테고리) 또는 last_hop_group
+- visited_count (또는 최근 K-hop 요약/해시)
+- copy_count_estimate / replication_count_so_far (복제본 수 추정/카운트)
+- 전송 시도 이력: recently_attempted_flag, last_attempt_time,
+  attempt_count, abort_count
+
+전달/ACK 상태:
+- delivered_ack_known (i가 "이미 목적지에 전달됨"을 알고 있는지)
+- blacklisted_flag (앱/라우터가 드롭 요청으로 블랙리스트 처리했는지)
+
+Prophet +/- delta 컨셉을 유지한다면(상태에 델타를 포함시켜도 됨):
+- delta_applied (현재 스코어링에 적용 중인 delta)
+- delta_policy_confidence / uncertainty (선택: 정책 신뢰도/불확실도)
+
+
+B. 자기 노드 i 상태 (로컬 자원 + 프로토콜 내부 상태)
+------------------------------------------------------
+버퍼/혼잡:
+- buffer_capacity_bytes (버퍼 총 용량)
+- buffer_occupancy_bytes (현재 점유)
+- buffer_free_bytes (여유)
+- buffer_pressure = occupancy/capacity (버퍼 압력)
+- msg_rank_in_send_queue (전송 큐에서 상대순위) 또는 percentile
+- msg_rank_in_drop_queue (드롭 후보 정렬에서 상대순위) 또는 percentile
+
+에너지/가용성:
+- energy_remaining (남은 에너지)
+- 에너지 소모 계수: scanEnergy, transmitEnergy 등(설정 기반)
+- scan_interval (net.scanInterval; 스캔 빈도는 에너지/접촉에 직결)
+- active_window_remaining (듀티사이클/activeTimes가 있으면 남은 활성시간)
+
+인터페이스 요약(i 기준):
+- interface_types (BLE/WiFi 등; 카테고리)
+- nominal_tx_speed (명목 전송률)
+- nominal_range (명목 범위)
+- current_concurrency (현재 연결 수, 진행 중 전송 수)
+
+MaxProp/Prophet 내부 요약(가능하면 작게 유지):
+- P_i(d): i가 목적지 d를 만날/전달할 확률(프로토콜이 제공하는 값)
+- prob_set_size: 확률 테이블 크기(저장 엔트리 수)
+- alpha: MaxProp에서 "막 만난 노드 확률을 강화"할 때 쓰는 강화계수(컨텍스트 스칼라)
+- topK_prob_stats: P_i(*) 상위 K개에 대한 max/mean/entropy(선택)
+- cost_i_to_d: MaxProp Dijkstra 비용(가능하면)
+- threshold_i: MaxProp calcThreshold 결과(버퍼 priority/non-priority 분할)
+- is_priority_region(m) = (hop_count(m) < threshold_i)
+
+최근 로컬 부하(윈도우 통계):
+- tx_bytes_lastW, rx_bytes_lastW
+- forwards_lastW, drops_lastW
+- contact_count_lastW
+
+
+C. 이웃/링크 특징 (현재 연결된 이웃 n 기준)
+--------------------------------------------
+액션이 "m을 n에게 보낼까?" 형태라면 state는 (m,n) 쌍으로 구성하는 게 일반적입니다.
+
+이웃 정체성(카테고리):
+- nbr_group/type (시민/차량/대응팀/드론/허브/백홀 등)
+- nbr_is_destination: (n == d) 여부
+
+링크 품질(현재 접촉 기반):
+- contact_age (연결된 지 얼마나 됐는지)
+- estimated_remaining_contact_time (추정 가능하면 매우 유용; 불가하면 생략)
+- effective_tx_rate_now (간섭/거리용량 반영된 "현재 유효 속도")
+- link_range_class / distance_bucket (거리 버킷)
+- abort_risk_est (과거 abort 빈도 기반 위험도; 선택)
+
+이웃 자원(교환 가능/추정 가능할 때):
+- nbr_buffer_free_bytes, nbr_buffer_pressure
+- nbr_energy_remaining
+- nbr_scan_interval
+- nbr_active_window_remaining / duty_state
+
+목적지 d에 대한 "상대 우위"(포워딩 핵심):
+- P_n(d), deltaP = P_n(d) - P_i(d)
+- cost_n_to_d (n 쪽 비용; 직접/추정)
+- via_cost = w(i,n) + cost_n_to_d  (MaxProp 스타일: i->n 간선 + n->d)
+- deltaCost = cost_i_to_d - via_cost (양수면 n을 거치는 게 유리)
+
+중복/루프 방지:
+- nbr_has_message(m): 이웃이 이미 m을 갖고 있는지
+- nbr_seen_recently_in_path(m): 최근 K-hop에 n이 포함되는지(루프 억제)
+
+이웃 신뢰도/사회적 신호(선택):
+- nbr_delivery_success_rate_est (이웃 전달 성공률 추정)
+- nbr_forwarding_load_est / congestion_est (이웃 혼잡 추정)
+
+
+D. 목적지/환경 컨텍스트 (비정상성 대응용)
+-----------------------------------------
+시간/페이즈(버스트 트래픽에서 특히 도움):
+- sim_time_normalized = t/endTime
+- phase_id (사고 전/사고 중/복구 등) 또는 임베딩
+- recent_message_creation_rate_est (로컬 추정 생성률)
+- recent_drop_rate_est, recent_overhead_est (로컬 추정)
+
+이동/위치의 거친 컨텍스트:
+- self_area_id(그리드 셀/맵 영역), neighbor_area_id(선택)
+- self_speed, neighbor_speed (접근 가능하면)
+
+
+E. 실무 팁: state는 작게(폭발 방지)
+-----------------------------------
+자주 쓰는 압축 방식:
+- 확률 벡터 P_i(*)를 통째로 넣기보다, 목적지 관련 값(P_i(d), P_n(d))과
+  비용(cost_i_to_d, cost_n_to_d, deltaCost) 같은 "의사결정에 직접 필요한 값"만 넣기.
+- 더 전역 컨텍스트가 필요하면 Top-K 요약을 추가:
+  - P_i(*) 상위 K개 mean/max/entropy
+  - 현재 이웃들에 대한 deltaP 상위 K개 요약
+- 큐 전체를 그대로 넣기보다 통계로 요약:
+  - ttl < tau 메시지 비율
+  - 버퍼 내 size 평균/중앙값
+  - priority region 비율
+
+추천 최소 state 템플릿(예시 3종):
+1) forward/suppress만(이웃 선택 없음):
+   s(m) = [ttl_remaining, size, hop_count, is_priority_region,
+           buffer_pressure, energy_remaining,
+           P_i(d), cost_i_to_d, recent_drop_rate_est]
+
+2) forward + 이웃 선택:
+   s(m,n) = s(m) + [nbr_is_destination, effective_tx_rate_now, contact_age,
+                    P_n(d), deltaP, deltaCost,
+                    nbr_buffer_pressure, nbr_energy_remaining]
+
+3) forward + 드롭까지 의식:
+   s(m,n) = (2) + [msg_rank_in_drop_queue(또는 percentile),
+                   copy_count_est, attempt_count, abort_count]
+
+
+F. "Prophet +/− delta" 아이디어와의 연결
+----------------------------------------
+delta 제어(더하고/빼서 정책을 조절) 아이디어를 유지한다면,
+state에는 "delta가 의미 있게 작동"하도록 아래 입력들이 포함되는 게 좋습니다.
+- base_score 항: P_i(d), P_n(d), cost_i_to_d, deltaCost
+- 안전장치 항: ttl_remaining, effective_tx_rate_now, buffer_pressure, energy
+- 비정상성 항: phase_id, recent_creation_rate_est
+
+이때 정책 출력은:
+- forward/suppress 임계값을 delta로 이동시키거나,
+- (MaxProp/Prophet 기반) 합성 점수(composite score)에 bounded delta를 더하는 형태
+등으로 설계할 수 있고, "기본 신호에 앵커링"되므로 폭주를 줄일 수 있습니다.

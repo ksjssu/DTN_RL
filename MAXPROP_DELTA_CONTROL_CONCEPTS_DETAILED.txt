@@ -1,0 +1,230 @@
+MaxProp + Delta 제어 개념 상세 정리 (alpha 포함)
+=============================================
+
+목적
+- Prophet에서 했던 것처럼 "base 값에 +/- delta를 얹어" 정책을 동적으로 바꾸는 개념을,
+  MaxProp의 4개 축(A~D: 확률학습/전파, 경로비용, 스케줄링, 드롭)에 대응시켜 설명한다.
+- 특히 alpha가 무엇을 의미하는지(코드 상에서)와, 각 축에 delta를 주입하면 무엇이 바뀌는지를
+  개념적으로 명확히 한다.
+
+참고(프로젝트 구현 기준 파일)
+- src/routing/MaxPropRouter.java
+- src/routing/maxprop/MeetingProbabilitySet.java
+- src/routing/maxprop/MaxPropDijkstra.java
+
+
+------------------------------------------------------------
+0) MaxProp에서 P의 의미(중요): "전달 성공확률"이 아니라 "다음 만남 확률"
+------------------------------------------------------------
+
+MaxProp의 MeetingProbabilitySet에 저장되는 P_u(v)는:
+- "노드 u가 다음 접촉(next contact)으로 v를 만날 확률"
+
+즉 Prophet의 predictability(최종 목적지까지 도달 가능성)과는 의미가 다르다.
+MaxProp는 이 "다음 만남 확률"을 그래프 간선으로 바꿔 Dijkstra로 경로 비용(cost)을 계산하고,
+그 cost를 이용해 전송/드롭 우선순위를 만든다.
+
+
+------------------------------------------------------------
+1) alpha의 의미: "방금 만난 노드"를 분포에 얼마나 강하게 반영할지
+------------------------------------------------------------
+
+alpha는 MeetingProbabilitySet.updateMeetingProbFor(index)에서 쓰이는 파라미터다.
+u가 v를 만났을 때, u의 P_u(.) 분포를 v 쪽으로 끌어당기는 "업데이트 강도"로 동작한다.
+
+구현 개념(정규화 포함)
+- 먼저 v의 항목을 alpha만큼 증가시킨다:
+    P_tmp(v) = P_old(v) + alpha    (없으면 P_old(v)=0)
+    P_tmp(x) = P_old(x)            (x != v)
+- 그 다음 전체를 (1+alpha)로 나눠 정규화한다:
+    P_new(k) = P_tmp(k) / (1 + alpha)
+
+결과 해석(분포가 이미 합=1이라고 가정하면 더 직관적)
+- v 항목:
+    P'_u(v) = (P_u(v) + alpha) / (1 + alpha)
+- v가 아닌 항목:
+    P'_u(x) = P_u(x) / (1 + alpha)
+
+직관
+- alpha가 크면: "이번 만남"이 다음 만남 분포에 크게 반영(최근 접촉에 민감, 빠른 적응)
+- alpha가 작으면: 분포 변화가 완만(최근 접촉에 둔감, 안정적)
+
+동적 트래픽 관점
+- 혼잡/오버헤드가 커지는 구간에서 alpha를 너무 크게 두면,
+  P가 빠르게 흔들리며 경로/정렬이 급변 -> 불필요 릴레이/진동 가능성이 증가할 수 있다.
+- 저부하/초기 적응 구간에서는 alpha를 키워 지식 축적을 빠르게 하는 것이 지연/성공률에 유리할 수 있다.
+
+
+------------------------------------------------------------
+2) 축 A: Meeting probability 학습/전파에 delta를 주면 무엇이 바뀌나
+------------------------------------------------------------
+
+축 A가 의미하는 것
+- 직접 만남 시 P 업데이트(=probs.updateMeetingProbFor)
+- 연결 시 transitive probability 교환(=updateTransitiveProbs + allProbs 교체)
+
+A-1) alpha에 delta를 주입: 학습 민감도(=분포 업데이트 강도) 제어
+- base:
+    alpha_base
+- delta 적용:
+    alpha_eff(t) = clamp(alpha_base + delta_alpha(t), alpha_min, alpha_max)
+
+의미
+- delta_alpha > 0:
+  최근 접촉을 더 강하게 믿음 -> P 변화가 커짐 -> Dijkstra cost가 더 빨리 바뀜
+- delta_alpha < 0:
+  최근 접촉 반영 약화 -> P 변화 완만 -> cost/정렬 변화 완화
+
+A-2) transitive trust에 delta를 주입: "전이 지식" 반영률 제어
+MaxProp에서 전이 지식은 allProbs 교환을 통해 들어온다.
+trust delta는 "전이 지식을 얼마나 믿고 섞을지"를 조절하는 개념이다.
+
+- 예시 개념식:
+    trust(t) = sigmoid(delta_trust(t))  # 0~1
+    P_eff = normalize((1-trust)*P_local + trust*P_transitive)
+
+의미
+- trust 낮춤:
+  전이 지식 과잉 반응을 줄여 안정적/보수적(불필요 릴레이 억제 가능)
+- trust 높임:
+  전이 지식 확산을 가속해 더 공격적(지연 개선 가능)
+
+A-3) P 자체에 delta 주입(강력하지만 정규화 필수)
+P는 0~1이고(사실상) 분포라서 단순히 P+delta는 깨질 수 있다.
+안정적 접근은 logit + softmax 재정규화 같은 방식이다.
+
+
+------------------------------------------------------------
+3) 축 B: Dijkstra 기반 비용(cost)에 delta를 주면 무엇이 바뀌나
+------------------------------------------------------------
+
+축 B가 의미하는 것
+- MaxPropDijkstra는 allProbs를 그래프로 보고, 목적지까지 최소 비용(cost)을 계산한다.
+
+비용 정의(프로젝트 구현 그대로)
+- 간선 비용:
+    w(u,v) = 1 - P_u(v)
+- 경로 비용:
+    cost(u->d) = sum of (1 - P)  의 최소값(Dijkstra)
+
+직관
+- u가 v를 다음에 만날 확률이 높으면(P_u(v) 큰), 간선 비용(1-P)이 작아 "가까운" 링크가 된다.
+- 이런 링크를 이어 목적지까지 가는 최소 비용 경로를 찾는다.
+
+B-1) cost 자체에 residual delta(추천): "경로 선호도"를 목적지 단위로 바이어스
+- base:
+    cost_base(h,d)
+- delta 적용:
+    cost_eff(h,d) = cost_base(h,d) - k_cost * clamp(delta(h,d), -Delta, +Delta)
+
+왜 Prophet-delta와 가장 대응되나
+- Prophet에서 delta를 주면 (host,dest)별 전이예측도/전송결정이 바뀐다.
+- MaxProp에서는 메시지 정렬(특히 non-priority 영역)이 cost 비교로 수렴하므로,
+  cost에 delta를 주면:
+  - 어떤 메시지를 먼저 보낼지(큐/전송 순서)
+  - 어떤 메시지를 덜/더 버릴지(드롭 우선순위)
+  가 한 번에 바뀐다.
+
+부호 해석
+- cost는 작을수록 좋다.
+- 따라서 delta>0이면 cost를 낮춰 "그 목적지"를 더 선호하게 만드는 형태가 직관적이다.
+
+B-2) cost를 pseudo-predictability(0~1)로 변환 후 delta 적용(스케일 안정)
+cost는 스케일이 상황마다 달라 delta의 의미가 흔들릴 수 있다.
+이를 Prophet의 "예측도 0~1 공간" 감각으로 되돌리기 위한 변환이다.
+
+- 예시:
+    pred_cost = exp(-cost_base/tau)              # (0,1]
+    pred_eff  = clamp(pred_cost + delta, eps, 1-eps)
+    cost_eff  = -tau * log(pred_eff)
+
+의미
+- delta가 항상 "예측도 보정"처럼 작동하므로 튜닝/해석이 쉬워질 수 있다.
+
+B-3) 간선 또는 P에 delta(경로 자체 변형)
+- w(u,v) 또는 P_u(v)에 delta를 주면 경로 자체가 바뀐다.
+- 단, Dijkstra를 위해 w_eff >= 0, P_eff 범위/정규화 유지가 필요하다.
+
+
+------------------------------------------------------------
+4) 축 C: threshold/정렬 규칙에 delta를 주면 무엇이 바뀌나
+------------------------------------------------------------
+
+축 C가 의미하는 것
+- MaxProp는 calcThreshold()로 버퍼를 두 영역(priority vs non-priority)으로 나눈다.
+  - priority: hop count 작은 메시지를 우선
+  - non-priority: cost 작은 메시지를 우선
+
+따라서 threshold는:
+- "확산 중심(hop)" vs "효율 중심(cost)" 스케줄링 모드 전환 스위치다.
+
+C-1) threshold에 delta: priority 영역 크기를 동적으로 조절
+- base:
+    thr_base = calcThreshold()
+- delta 적용:
+    thr_eff = clamp(thr_base + round(k_thr*delta_thr(t)), thr_min, thr_max)
+
+의미
+- thr_eff ↑:
+  hop 중심 확산을 늘림 -> 지연(delay) 개선 가능(대신 오버헤드 위험)
+- thr_eff ↓:
+  cost 중심 효율을 늘림 -> 오버헤드/드롭 완화 가능
+
+동적 트래픽에서의 역할
+- RISE/HIGH에서 thr를 낮춰 폭주 억제
+- FALL/LOW에서 thr를 높여 지연 개선
+
+C-2) hop vs cost를 연속 혼합으로 만들고 delta로 가중치를 조절(진동 완화 목적)
+- 예:
+    a(t) = sigmoid(delta_a(t))
+    score = a(t)*hop_norm + (1-a(t))*cost_norm
+
+
+------------------------------------------------------------
+5) 축 D: 드롭 정책에 delta를 주면 무엇이 바뀌나
+------------------------------------------------------------
+
+축 D가 의미하는 것
+- MaxProp의 drop은 "정렬(전송 우선순위와 유사)"에서 가장 덜 중요한 메시지를 선택하는 구조다.
+- 따라서 drop 기준에 작은 delta만 줘도, 어떤 메시지가 살아남는지가 바뀌어 성능이 크게 달라질 수 있다.
+
+D-1) dropScore에 delta: TTL/크기/abort 위험을 반영해 버릴 대상을 보정
+- 개념:
+    dropScore_eff(m) = dropScore_base(m) + k_drop * delta_drop(m)
+  - dropScore가 큰 메시지를 먼저 버리는 정책으로 설계.
+
+delta_drop에 넣을 만한 의미 있는 신호
+- TTL 임박: delta_drop 음수(덜 버림)
+- 크기 큼 + aborted 잦음: delta_drop 양수(먼저 정리)
+- cost 개선 여지 없음/경로 막힘: delta_drop 양수
+
+D-2) 혼잡 가격(lambda)로 drop/억제 강도를 자동 조절(휴리스틱 강화 포인트)
+- 목표: 버퍼 점유율/오버헤드를 목표값 근처로 유지
+- 예:
+    lambda_buf(t+1) = clamp(lambda_buf(t) + k1*(B - B_target) + k2*dB, 0, lambda_max)
+- lambda가 커질수록:
+  - thr 감소, trust 감소, delta clamp 강화, 위험 메시지 우선 정리 등으로 "안정화"에 집중
+
+
+------------------------------------------------------------
+6) delta는 무엇으로 만들까(공통): 혼잡/효율/긴급 3요소
+------------------------------------------------------------
+
+입력 피처(예시)
+- 혼잡: 내/이웃 버퍼 점유율, 증가율, aborted/drop rate, 전역 평균 버퍼
+- 효율: dc = cost(self,d) - cost(neighbor,d) (이웃으로 넘기면 cost가 줄어드는가?)
+- 긴급: TTL urgency(임박 정도)
+
+규칙 기반 delta(h,d) 예시(출발점)
+    base = sgn(dc) * min(1, |dc|/dc_scale)
+    cong = clamp((u - u0)/(1-u0), 0, 1)
+    head = clamp(1 - util(neighbor), 0, 1)
+    urg  = ttlUrgency
+    gate = head * (1-cong)
+    delta = DeltaMax * base * (w1*urg + w2*gate)
+
+정리
+- MaxProp가 기본적으로 잘하는 "경로비용(cost) 기반 효율"을 유지하면서,
+  동적 트래픽에서 빈번히 문제 되는 "혼잡/TTL/이웃여유"를 delta로 보정하면
+  정적 MaxProp보다 더 좋은 트레이드오프를 노릴 수 있다.
+
