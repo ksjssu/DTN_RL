@@ -1,0 +1,223 @@
+Scenario.name = heuristic_d020_complex_12h_126_mixTTL_mixBuf_mixIF_100k_rng%%MovementModel.rngSeed%%
+MovementModel.rngSeed = [1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22; 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40; 41; 42; 43; 44; 45; 46; 47; 48; 49; 50; 51; 52; 53; 54; 55; 56; 57; 58; 59; 60; 61; 62; 63; 64; 65; 66; 67; 68; 69; 70; 71; 72; 73; 74; 75; 76; 77; 78; 79; 80; 81; 82; 83; 84; 85; 86; 87; 88; 89; 90; 91; 92; 93; 94; 95; 96; 97; 98; 99; 100]
+Scenario.endTime = 43200
+
+## Scenario settings
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+wifiInterface.type = SimpleBroadcastInterface
+wifiInterface.transmitSpeed = 6M
+wifiInterface.transmitRange = 120
+
+backhaulInterface.type = SimpleBroadcastInterface
+backhaulInterface.transmitSpeed = 10M
+backhaulInterface.transmitRange = 1000
+
+## Groups (126 nodes total)
+Scenario.nrofHostGroups = 9
+
+## Default group template
+Group.movementModel = ShortestPathMapBasedMovement
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.router = ProphetRouter
+
+## Pedestrians (small buffers, shorter TTL)
+Group.nrofHosts = 40
+Group.bufferSize = 10M
+Group.msgTtl = 60
+Group1.groupID = p
+
+## Cars
+Group2.groupID = c
+Group2.nrofHosts = 34
+Group2.speed = 3.0, 16.0
+Group2.bufferSize = 20M
+Group2.msgTtl = 180
+
+## Workers
+Group3.groupID = w
+Group3.nrofHosts = 34
+Group3.speed = 0.8, 1.8
+Group3.waitTime = 30, 240
+Group3.bufferSize = 20M
+Group3.msgTtl = 720
+
+## Taxis / couriers
+Group4.groupID = x
+Group4.nrofHosts = 10
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = wifiInterface
+Group4.speed = 6.0, 22.0
+Group4.waitTime = 0, 30
+Group4.bufferSize = 30M
+Group4.msgTtl = 180
+
+## Stationary hubs
+## NOTE: StationaryMovement requires nodeLocation. Use two separate 1-host groups.
+Group5.groupID = h
+Group5.nrofHosts = 1
+Group5.movementModel = StationaryMovement
+Group5.nodeLocation = 2500,2500
+Group5.nrofInterfaces = 1
+Group5.interface1 = backhaulInterface
+Group5.bufferSize = 200M
+Group5.msgTtl = 1440
+
+Group6.groupID = h
+Group6.nrofHosts = 1
+Group6.movementModel = StationaryMovement
+Group6.nodeLocation = 1200,3200
+Group6.nrofInterfaces = 1
+Group6.interface1 = backhaulInterface
+Group6.bufferSize = 200M
+Group6.msgTtl = 1440
+
+## Trams
+Group7.groupID = t
+Group7.nrofHosts = 2
+Group7.bufferSize = 100M
+Group7.msgTtl = 720
+Group7.movementModel = MapRouteMovement
+Group7.routeFile = data/tram3.wkt
+Group7.routeType = 1
+Group7.waitTime = 10, 30
+Group7.speed = 7, 10
+Group7.nrofInterfaces = 2
+Group7.interface1 = btInterface
+Group7.interface2 = backhaulInterface
+
+Group8.groupID = t
+Group8.nrofHosts = 2
+Group8.bufferSize = 100M
+Group8.msgTtl = 720
+Group8.movementModel = MapRouteMovement
+Group8.routeFile = data/tram4.wkt
+Group8.routeType = 2
+Group8.waitTime = 10, 30
+Group8.speed = 7, 10
+Group8.nrofInterfaces = 2
+Group8.interface1 = btInterface
+Group8.interface2 = backhaulInterface
+
+Group9.groupID = t
+Group9.nrofHosts = 2
+Group9.bufferSize = 100M
+Group9.msgTtl = 720
+Group9.movementModel = MapRouteMovement
+Group9.routeFile = data/tram10.wkt
+Group9.routeType = 2
+Group9.waitTime = 10, 30
+Group9.speed = 7, 10
+Group9.nrofInterfaces = 2
+Group9.interface1 = btInterface
+Group9.interface2 = backhaulInterface
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+ProphetRouter.heuristicDelta = 0.2
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100
+
+## Message creation: realistic mix (background + bulky + urgent + flash crowds)
+Events.nrof = 7
+
+Events1.class = MessageEventGenerator
+Events1.interval = 40,80
+Events1.size = 50k,200k
+Events1.hosts = 0,118
+Events1.time = 0,43199
+Events1.prefix = BG
+
+Events2.class = MessageEventGenerator
+Events2.interval = 180,300
+Events2.size = 2M,8M
+Events2.hosts = 74,108
+Events2.tohosts = 74,108
+Events2.time = 0,43199
+Events2.prefix = BULK
+
+Events3.class = MessageEventGenerator
+Events3.interval = 5,10
+Events3.size = 10k,30k
+Events3.hosts = 0,40
+Events3.tohosts = 118,120
+Events3.time = 3600,5400
+Events3.prefix = UAM
+
+Events4.class = MessageEventGenerator
+Events4.interval = 5,10
+Events4.size = 10k,30k
+Events4.hosts = 0,40
+Events4.tohosts = 118,120
+Events4.time = 30000,33000
+Events4.prefix = UPM
+
+Events5.class = MessageBurstGenerator
+Events5.interval = 2400,3600
+Events5.size = 100k,300k
+Events5.hosts = 108,118
+Events5.tohosts = 0,40
+Events5.time = 0,7200
+Events5.prefix = BURST_AM
+
+Events6.class = MessageEventGenerator
+Events6.interval = 10,20
+Events6.size = 200k,1M
+Events6.hosts = 0,40
+Events6.tohosts = 0,118
+Events6.time = 14400,18000
+Events6.prefix = LUNCH
+
+Events7.class = MessageBurstGenerator
+Events7.interval = 1,1
+Events7.size = 50k,100k
+Events7.hosts = 118,120
+Events7.tohosts = 0,126
+Events7.time = 28800,28810
+Events7.prefix = ALERT
+
+## Reports (comprehensive + heuristic controller)
+Report.warmup = 0
+Report.reportDir = reports/heuristic_d020_complex_12h_126_mixTTL_mixBuf_mixIF/
+Report.nrofReports = 7
+Report.report1 = MessageStatsReport
+Report.report2 = DeliveryRatePerIntervalReport
+Report.report3 = OverheadPerIntervalReport
+Report.report4 = LatencyPerIntervalReport
+Report.report5 = BufferOccupancyReport
+Report.report6 = ContactsPerHourReport
+Report.report7 = BufferLoadHeuristicReport
+
+DeliveryRatePerIntervalReport.binSize = 3600
+DeliveryRatePerIntervalReport.cumulativeMode = true
+OverheadPerIntervalReport.binSize = 3600
+OverheadPerIntervalReport.cumulativeMode = true
+LatencyPerIntervalReport.binSize = 3600
+LatencyPerIntervalReport.cumulativeMode = true
+
+BufferOccupancyReport.occupancyInterval = 60
+
+BufferLoadHeuristicReport.sampleInterval = 20
+BufferLoadHeuristicReport.lowThreshold = 0.33
+BufferLoadHeuristicReport.highThreshold = 0.66
+BufferLoadHeuristicReport.bufOccMaxAge = 600
+BufferLoadHeuristicReport.logActions = false

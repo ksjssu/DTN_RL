@@ -45,6 +45,7 @@ reports_plots/
 
 # Scratch outputs
 .tmp/auto_onpolicy/
+.tmp/
 
 # Backup directories
 backup/
@@ -56,6 +57,7 @@ models_rmappo/
 models_masac/
 models_rmappo_export/
 models/
+best_models/
 
 # LaTeX files
 *.tex

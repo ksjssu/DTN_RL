@@ -193,7 +193,10 @@ public abstract class ActiveRouter extends MessageRouter {
 		else if (deleteDelivered && retVal == DENIED_OLD &&
 				m.getTo() == con.getOtherNode(this.getHost())) {
 			/* final recipient has already received the msg -> delete it */
-			this.deleteMessage(m.getId(), false);
+			/* Note: message may have been deleted earlier in the same update */
+			if (this.hasMessage(m.getId())) {
+				this.deleteMessage(m.getId(), false);
+			}
 		}
 
 		return retVal;

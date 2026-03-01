@@ -1,0 +1,372 @@
+﻿﻿﻿﻿MADRL + PROPHET (Host-Dest Δ + P_INIT/beta/gamma) CTDE 설계 추천안 (에너지 미사용)
+==============================================================================
+업데이트: 2026-02-23
+
+요약(결론)
+----------
+- 목표: 기존 휴리스틱(고정 heuristicDelta)보다 “상황 적응”이 가능한 PROPHET 컨트롤러를 설계/구현.
+- 제어 단위:
+  1) Δ(host,dest): 목적지별(Host-Dest) 예측치 오프셋
+  2) P_INIT(host), beta(host), gamma(host): 호스트 레벨 PROPHET 파라미터 (매 step 조절)
+- CTDE 전제:
+  - Actor: 로컬 state만 사용(호스트 관측)
+  - Critic: 글로벌 state 사용(전체 상황 요약 + 이질성) + (필요 시) 로컬 concat
+- TTL은 메시지별 action으로 가지 않고(차원 폭발), Host-Dest TTL 통계(우선 mean)로 흡수.
+- 에너지는 state/보상에서 사용하지 않음.
+
+
+1) 현재 프로젝트의 PROPHET 구현(코드 기준) 핵심
+----------------------------------------------
+코드: src/routing/ProphetRouter.java
+
+Forwarding (GRTR / GRTRMax)
+- 릴레이 후보: P(other,dest) > P(self,dest) 이면 전송 후보.
+- 후보 정렬: 상대방의 P(other,dest) 큰 순(동점이면 sendQueue로 tie-break).
+  - sendQueue 지원: RANDOM, FIFO (src/routing/MessageRouter.java)
+
+PROPHET 업데이트 식(기본)
+1) Direct update (만남):
+   P(a,b) = P_old(a,b) + (1 - P_old(a,b)) * P_INIT
+2) Transitivity (전이):
+   P(a,c) = P_old(a,c) + (1 - P_old(a,c)) * P(a,b) * P(b,c) * beta
+3) Aging (망각):
+   P(a,b) = P_old(a,b) * (gamma ^ k),  k = Δt / secondsInTimeUnit
+
+확장 포인트(이미 존재)
+- extOffsets: 목적지별 offset 테이블
+  - getPredFor(dest) = clamp01(basePred + extOffset)
+  - getBasePredFor(dest): offset 없는 순수 P (reward hacking 방지에 중요)
+
+
+2) 우리가 하기로 한 Action(제어) 정의
+------------------------------------
+공통 원칙
+- 매 step(=RLBridgeReport.sampleInterval)마다 갱신.
+- 모든 action은 안전 범위로 clamp.
+- reward/진단에는 basePred(getBasePredFor)를 우선 사용(가능하면).
+
+2.1 Δ(host,dest) : 목적지별 offset (핵심)
+- 의미: P(host,dest)에 더해지는 외부 오프셋 (±Δ).
+- 적용 위치(권장):
+  - step 시작 시: ProphetRouter.clearExternalOffsets()
+  - dest별: ProphetRouter.setExternalOffset(dest, delta)
+- 범위(권장): delta ∈ [-deltaLimit, +deltaLimit]
+  - 기존 시나리오/브릿지 파라미터: RLBridgeReport.deltaLimit 활용 가능.
+
+2.2 P_INIT(host), beta(host), gamma(host) : 호스트 레벨 파라미터 3종
+- 의미:
+  - P_INIT: “직접 만남”에서 P를 얼마나 빨리 올릴지(학습 강도)
+  - beta: 전이 업데이트 강도(간접 학습/전파 강도)
+  - gamma: 망각 속도(비정상성 대응/오래된 지식 제거)
+- 제어 주기: 매 step 조절(MADRL)
+- 범위(권장 clamp):
+  - P_INIT ∈ [0, 1]
+  - beta ∈ [0, 1]
+  - gamma ∈ (0, 1]  (실무적으로는 [0.90, 0.9999] 같은 좁은 범위 권장)
+- 구현 메모:
+  - P_INIT는 현재 static final 상수라 “가변 파라미터화”가 필요.
+  - beta/gamma는 instance 변수로 이미 존재(ProphetRouter)하므로 setter + 적용만 추가하면 됨.
+- 안정화(권장):
+  - 파라미터가 step마다 급변하면 P 테이블이 흔들릴 수 있으므로,
+    (선택) action EMA 또는 rate-limit(예: |Δgamma| ≤ 0.01/step)을 권장.
+
+
+3) State 설계 (CTDE 기준, 에너지 제외)
+-------------------------------------
+핵심 목표: Actor가 3파라미터(P_INIT/beta/gamma)를 “상황에 맞게” 조절할 수 있게,
+(1) 비정상성/변동성, (2) 혼잡/오버헤드 압력, (3) 예측치 확신(분포)을 담는다.
+
+권장 구성은 2-layer로 분리한다.
+- Layer A: Host-level local state  → (P_INIT,beta,gamma) actor 입력
+- Layer B: Host-Dest local+dest state → Δ(host,dest) actor 입력
+그리고 CTDE critic은 global features를 공유한다.
+
+3.1 Global state (critic-only, shared vector)
+기존 RLBridgeReport의 global feature 패턴(변화율/모멘텀/혼잡 플래그)을 그대로 가져가고,
+가능하면 “오버헤드/드랍” 같은 전역 지표 + 이질성(분산)도 추가한다.
+
+권장 글로벌 feature 예시(10~20D)
+- 접촉/네트워크 상태:
+  - global_active_conns_norm
+  - global_avg_contacts_norm (window 기반)
+- 혼잡:
+  - global_avg_buf_occ
+  - global_high_buf_frac (buf_occ > 0.85 비율)
+  - global_buf_occ_change_rate_ema
+  - global_buf_occ_momentum_ema
+  - (권장 추가) buf_occ_std 또는 (p90 - p10)  ← 이질성(핵심)
+- 트래픽 변화:
+  - global_created_rate_ema (msgs/sec/node 정규화)
+  - global_total_msgs_norm
+  - global_msg_change_rate_ema, global_msg_change_momentum_ema
+- 품질/부작용(가능하면):
+  - global_overhead_ratio_ema = (transferred - delivered)/max(1, transferred)
+  - global_drop_rate_ema, global_abort_rate_ema
+  - (선택) global_delivery_rate_ema
+- 진행도:
+  - global_episode_time_norm (0~1) + (선택) phase one-hot
+
+CTDE critic 입력 방식(권장)
+- V/Q critic 입력 = concat(local_actor_state, global_state)
+  - global_state는 모든 host에 동일하게 복제해서 concat.
+
+3.2 Local state for (P_INIT, beta, gamma) actor (Host-level, 15~25D)
+호스트 단위로 1개 벡터를 만들고, 목적지와 무관하게 “내 상태”를 요약한다.
+
+A) 접촉/기회(학습 신호)
+- contacts_rate_ema: window 내 접촉 발생률(또는 contacts_norm)
+- unique_neighbors_norm: window 내 유니크 이웃 수 정규화
+- has_contact (0/1), active_conns_norm
+- inter_contact_time_norm: 마지막 접촉 이후 시간 / windowSize
+
+B) 혼잡/압력(오버헤드 위험)
+- self_buf_occ (0~1)
+- buf_occ_trend: (short EMA - long EMA) 또는 최근 Δbuf
+- created_rate_ema (msgs/sec)
+- transferred_rate_ema (msgs/sec 또는 bytes/sec)
+- drop_rate_ema, abort_rate_ema
+- overhead_ratio_ema = (transferred - delivered)/max(1, transferred)
+
+C) 예측치 P의 “확신/변동성”(basePred 기반 권장)
+- pred_table_size_norm: preds 엔트리 수 / cap
+- pred_mean, pred_max, pred_std  (dest별 basePred 통계)
+- pred_entropy 또는 topk_mass (분포가 뾰족한지)
+- pred_change_ema: 최근 |ΔP_base| 평균 (비정상성/환경 변화 지표)
+
+D) TTL 압박 요약(선택)
+- ttl_mean_all: 내 버퍼 전체의 남은 TTL 평균(정규화)
+- urgent_frac: TTL_rem < T_urgent 비율
+
+직관적 “정상 반응” 체크(디버깅용)
+- pred_change_ema↑ / 트래픽 변화↑  → gamma↓(더 빨리 잊기) 경향
+- overhead/drop↑ / buf_occ↑        → beta↓(전이 약화) 경향
+- 접촉 충분+안정적                 → P_INIT↑(직접 학습 강화) 가능
+
+3.3 Local+Dest state for Δ(host,dest) actor (Host-Dest, 8~15D)
+기존 RLBridgeReport는 이미 “host-dest state tuple”을 보내고 있다.
+이를 유지하면서 TTL 통계를 추가하는 것이 가장 구현/비교가 쉽다.
+
+권장 입력(기존 + 확장)
+- (기존) contacts_norm
+- (권장) p_base: getBasePredFor(dest)  ← action 누출/자기참조 감소 목적
+- (기존) bufocc_mean (글로벌 평균 버퍼 점유율)
+- (기존) self_buf_util (내 버퍼 점유율)
+- (기존) pressure_diff = self_buf_util - bufocc_mean
+- (기존/선택) capacity_norm, rate_delta
+- (추가) ttl_mean(host,dest): “내 버퍼에서 dest로 가는 메시지들의 남은 TTL 평균”
+- (추가) n_msgs_to_dest_norm: dest 메시지 개수 정규화
+- (선택) bytes_to_dest_norm: dest 메시지 총 size / bufferSize
+
+TTL 통계에 대한 결정(현재 단계)
+- 우선은 ttl_mean(host,dest)만으로 시작(차원/구현 단순).
+- 성능이 부족하면 다음 중 1개만 추가:
+  - ttl_p25(host,dest) 또는 ttl_min(host,dest)  (tail 반영)
+
+
+4) 프로토콜/브릿지(권장 형태)
+-----------------------------
+현 상태:
+- RLBridgeReport는 host-dest 단위 state와 prev_transition을 이미 서버로 전송하고,
+  응답으로 host#dest → delta를 받아 ProphetRouter.setExternalOffset() 적용한다.
+
+확장(권장):
+- 응답에 host-level params를 별도로 포함:
+  예) "host_params":[{"host":"p0","p_init":...,"beta":...,"gamma":...}, ...]
+- Java 적용 순서(권장):
+  1) host별 (p_init,beta,gamma) 적용
+  2) clearExternalOffsets()
+  3) host-dest delta 적용
+
+
+4.1 학습 알고리즘: MASAC(CTDE SAC)로 구현 (mp_v1 스타일)
+----------------------------------------------------
+참고 구현: toolkit/drl_server_rmappo_maxprop.py 의 handle_rmappo_maxprop_v1(req)
+
+핵심 컨셉(우리가 그대로 가져갈 것)
+- CTDE 구조:
+  - Actor(Decentralized): local state만 보고 action 산출
+  - Critic(Centralized): global_features(+local concat)로 Q/V 평가
+- Step 단위 데이터 플로우:
+  - Java → Python: (prev_transition, state_batch, global_features, created_since_last, ...)
+  - Python:
+    1) prev_transition 합계로 step 전역 reward(total_reward) 계산
+    2) 직전 step의 (s,a)와 현재 step의 s'로 전이(s,a,r,s') 적재
+    3) 현재 step action 산출 및 반환
+- Episode end 학습:
+  - mode=episode_end 신호에서 학습 업데이트 수행(또는 옵션으로 episode 중간 업데이트)
+- Reward는 “전역(global) 1개”를 계산한 뒤, per-host/per-key로 분배하는 방식(credit assignment 단순화)
+
+우리 문제(PROPHET)는 action이 2레벨(Host-level 3파라미터 + Host-Dest Δ)이라,
+MASAC 구현은 다음 둘 중 하나를 권장한다.
+
+권장안 A) (구현 단순/안정) 2-Policy 분리(파라미터 정책 + Δ 정책)
+- Policy-1 (Host-level): (P_INIT,beta,gamma) 전용
+  - key: host#param
+  - obs: 3.2의 Host-level local state
+  - action_dim=3
+- Policy-2 (Host-Dest): Δ(host,dest) 전용
+  - key: host#dest
+  - obs: 3.3의 Host-Dest state (ttl_mean 포함)
+  - action_dim=1 (delta)
+- Critic:
+  - 각 policy마다 critic 입력에 global_features를 concat(CTDE 유지)
+- 장점: action 차원 폭발 방지, 학습 안정성↑, 디버깅 쉬움.
+
+권장안 B) (표현력↑/복잡) 1-Policy 통합(Host action에 top-K dest Δ 포함)
+- Host-level actor가 1회에 (P_INIT,beta,gamma + K개의 Δ) 를 같이 출력
+- 장점: joint action 최적화 가능
+- 단점: K 선택/마스킹/순서 안정성 등 구현 난도가 큼(초기에는 비추천)
+
+
+4.2 Reward 설계: MP v1 “전역 합계 → 분배” 방식(에너지 제외 버전)
+------------------------------------------------------------
+목표:
+- 휴리스틱(고정 Δ)보다 “상황 적응”이 이득이 되도록,
+  delivery를 키우면서도 overhead/drop/delay 악화를 억제하는 전역 reward를 만든다.
+
+입력 소스(현재 RLBridgeReport가 이미 보내는 값)
+- req.created_since_last: 이번 step interval 동안 생성된 메시지 수(전역)
+- req.prev_transition[]: host-dest 단위 카운터/요약 (relayed, delivered, drops, aborted, avg_delay, avg_ttl_ratio, ...)
+  - 주의: RLBridgeReport에서 relayed는 firstDelivery 포함(=전송 성공 횟수 총합)이며,
+    delivered는 firstDelivery 횟수(최종 전달)이다.
+
+전역 합계(권장 정의)
+- created = created_since_last
+- transferred = Σ relayed
+- delivered = Σ delivered
+- dropped = Σ drops
+- aborted = Σ aborted
+
+정규화 지표(0~1 clamp)
+- S(success proxy) = clamp01(delivered / max(1, created))
+- O(overhead ratio) = clamp01((transferred - delivered) / max(1, transferred))
+- D(drop ratio) = clamp01((dropped + aborted) / max(1, created))
+- (선택) T(timeliness) = clamp01(weighted_mean(avg_ttl_ratio, weights=delivered))
+  - ttl_ratio는 1에 가까울수록 “빨리 도착”을 의미(현재 RLBridgeReport가 계산)
+
+Reward form (MP v1 스타일: prod/log + 가중치)
+- prod 형태(권장: overhead는 (1-O)로 패널티):
+  R = scale * (S^α) * ((1 - O)^β) * ((1 - D)^δ) * (T^η)
+- log 형태:
+  R = scale * (α*log(S) + β*log(1-O) + δ*log(1-D) + η*log(T))
+- EPS로 0 보호: max(eps, ·) 형태로 처리
+
+분배(credit assignment) 권장
+- 전역 R을 먼저 계산하고,
+  - Host-level policy에는: r_host = R / n_hosts
+  - Δ policy에는: host별로 r_host를 다시 host의 key 개수로 나눠 r_key로 분배
+- 이렇게 하면 “host 수” 변화/샘플링(maxMessagesPerNode)에 따른 보상 스케일 변동을 줄일 수 있다.
+
+주의(휴리스틱 baseline 대비 공정성)
+- baseline(고정 Δ)도 동일 reward로 평가해야 함(지표-목표 불일치 방지).
+- overhead 항을 잘못 두면(예: O^β) 오버헤드가 커질수록 reward가 커지는 역전이 생길 수 있으니,
+  (1-O) 형태를 권장한다.
+
+
+5) 시나리오/비교 실험 운영 원칙
+------------------------------
+핵심: “상황 적응”을 보려면 학습 중엔 다양성을 주되, 평가는 환경을 고정하고 컨트롤만 바꿔 비교한다.
+
+권장 베이스 시나리오
+- scenarios/dynamic/drl_train/*, scenarios/dynamic/drl_eval/* (이미 seed sweep + RLBridgeReport 구성 존재)
+- 평가 시에는 동일 RNG seed, 동일 이동/트래픽/TTL/버퍼로 고정.
+
+비교군(추천)
+1) 순수 PROPHET: RLBridgeReport 제거, heuristicDelta=0
+2) 휴리스틱 Δ: scenarios/dynamic/heuristic_d010|d020|d030
+3) MADRL-Δ only: Δ(host,dest)만 학습(파라미터 3종 고정)
+4) MADRL-Δ + (beta,gamma): 2종만 추가
+5) MADRL-Δ + (P_INIT,beta,gamma): 전체(최종)
+
+5.1 잠재력(“상황 적응”)을 끌어올리는 시나리오 추천
+------------------------------------------------
+비교 기준(반드시 지켜야 함)
+- baseline은 “Prophet + delta만 조절하는 휴리스틱(고정 heuristicDelta)”이며,
+  MADRL은 이 baseline보다 성능이 잘 나와야 한다.
+- 따라서 시나리오는 “고정 delta로는 동시에 만족시키기 어려운” 비정상성/이질성을 포함해야 한다.
+
+권장 방향 1) (가장 효과 큼) Episode 내부 Regime Shift (시간대별 급변)
+- 메시지 트래픽 변화(부하 변동):
+  - Low → High → Low 처럼 생성 간격(interval)과 생성량이 크게 변하는 구간을 넣기
+  - 목적: 고정 delta는 High 구간에서 오버헤드/드랍을 키우거나, Low 구간에서 전달률을 놓치기 쉬움
+  - 기대 효과: beta/gamma(전이/망각)와 Δ(host,dest)가 구간별로 다른 값이 최적이 됨
+- 목적지/커뮤니티 hotspot 이동(분포 변화):
+  - 시간 구간별로 MessageEventGenerator.hosts 범위(또는 src/dst 후보)를 바꿔
+    “초반엔 A군집 목적지 집중, 후반엔 B군집 목적지 집중” 형태를 만들기
+  - 기대 효과: host-dest Δ가 목적지별로 재배치되며, pred 분포/entropy가 변해 3파라미터 적응이 유리
+- TTL 압박 변화(급한 메시지 비율 변화):
+  - (가능하면) 구간별 TTL을 다르게 두거나, urgent 비율이 커지는 구간을 만들기
+  - 기대 효과: urgent_frac/ttl_mean에 반응해 delta/망각(특히 gamma)이 바뀌어야 함
+
+권장 방향 2) (현실적) Episode 간 Domain Randomization (시나리오 팩으로 랜덤 학습)
+다음 파라미터들은 시뮬레이터에서 “런 시작 시 고정”인 경우가 많아서,
+여러 개 시나리오 파일을 만들어 episode마다 랜덤 선택하는 방식을 권장.
+- 속도 변화(이동 모델/속도 분포 변경):
+  - 보행자/차량/트램 속도 범위를 2~3개 버전으로 만들어 학습(느린 날/빠른 날)
+  - 기대 효과: contact-rate가 달라져 gamma, P_INIT의 최적이 달라짐
+- 인터페이스 속도/범위 변화:
+  - transmitRange/transmitSpeed를 2~3개 버전으로 만들어 학습(연결 기회/처리량 변화)
+  - 기대 효과: 전이(beta) 공격성/보수성의 최적이 달라짐
+- 버퍼 크기 다양화(중요):
+  - buf10~buf90처럼 bufferSize sweep + (가능하면) 그룹별 이질적 buffer(일부만 매우 작게)
+  - 기대 효과: 고정 delta는 특정 buffer에만 맞고, MADRL은 state(capacity/buf_occ)에 따라 적응 가능
+
+권장 방향 3) (baseline을 확실히 이기기 쉬움) “고정 delta가 특히 약한” 스트레스 구조
+- 게이트웨이 소수(커뮤니티 분리) + 트래픽 버스트:
+  - 군집 내부는 접촉 많고, 군집 간은 특정 소수 노드(트램/버스 등)만 브릿지
+  - High 부하 구간에서 고정 delta는 불필요 릴레이/오버헤드가 급증하기 쉬움
+  - MADRL은 beta/gamma를 낮추거나 Δ를 목적지별로 줄여 억제하는 전략이 가능
+- 버퍼 이질성(일부 노드만 작은 버퍼) + 목적지 hotspot:
+  - 작은 버퍼 노드가 많은 릴레이를 떠안으면 드랍이 폭증
+  - MADRL은 local buf_occ/overhead 신호로 파라미터/Δ를 조절할 여지가 큼
+
+평가 프로토콜(“baseline보다 당연히 잘” 보이려면)
+- 휴리스틱 baseline은 delta=0.1/0.2/0.3 중 “해당 시나리오에서 가장 좋은 값”을 기준으로 비교(최강 baseline).
+- seed sweep(예: rng 1..30 이상)으로 평균/분산을 같이 보고, 특정 seed 과적합을 배제.
+- 버퍼 크기/트래픽 regime이 바뀌는 구간별 지표도 함께 보고(구간별 delivery/overhead/drop),
+  MADRL이 “구간 적응”으로 이득을 보는지 확인.
+
+5.2 “현실성(Realism)”을 만족시키는 시나리오 가이드
+-----------------------------------------------
+목표는 “MADRL이 잘 나오도록”만이 아니라, 사람이 보기에 납득 가능한 원인-결과(현실적 비정상성)를 포함하는 것이다.
+아래 원칙을 만족하면, baseline(고정 Δ) 대비 MADRL의 우위가 “현실적인 상황 적응”으로 설명되기 쉬워진다.
+
+현실적 변화의 대표 원인(시나리오에 넣기 좋은 것)
+- 일중(daily) 패턴: 출퇴근 러시아워/점심/야간처럼 트래픽과 접촉 밀도가 자연스럽게 변함
+- 공간 hotspot: 특정 구역(역/환승센터/상업지/행사장)로 목적지/트래픽이 집중됐다가 이동
+- 교통/날씨: 평균 속도·대기시간 변화(정체/비/눈)로 접촉 그래프가 “다른 날”처럼 변함
+- 디바이스 이질성: 일부는 작은 버퍼(폰), 일부는 큰 버퍼(차량/인프라)로 혼잡·드랍이 비균일
+- 링크 계층 현실: 근거리(블루투스) + 제한적 고속 링크(차량/핫스팟) 혼재
+
+시나리오 설계 시 “비현실적”으로 보이기 쉬운 패턴(피하기)
+- 아무 이유 없이 특정 시점에 속도/범위/링크가 급변(근거 없는 step change)
+- 목적지 분포가 너무 자주 완전히 랜덤으로 뒤집힘(의미 있는 hotspot 이동이 아니라 노이즈로 보임)
+- TTL/메시지 크기가 비현실적으로 극단(전부 1분/전부 1GB 등)
+
+현실성을 유지하면서도 MADRL 우위를 만들기 위한 추천 구성(구체)
+1) 24시간 “도시 하루” 템플릿 (가장 현실적 + 가장 설명 쉬움)
+   - 아침/저녁(2회) 러시아워: 생성률↑ + 목적지 hotspot(오피스/역 주변)↑
+   - 낮/야간: 생성률↓, 목적지 분산↑
+   - 기대: 고정 Δ는 rush hour에서 오버헤드/드랍을 키우거나, off-peak에서 전달률을 놓치기 쉬움.
+2) “대규모 행사” 템플릿 (현실적 + hotspot 이동이 강함)
+   - 특정 시간대에 행사장 목적지로 트래픽 집중(짧은 구간 버스트) + 이후 정상 복귀
+   - 기대: host-dest Δ가 목적지별로 크게 재배치되어야 하며, beta/gamma도 구간 적응이 유리.
+3) “평일 vs 악천후/정체” 템플릿 (현실적 + 이동/접촉 패턴 변화)
+   - 같은 트래픽이지만 평균 속도/대기시간이 느려지는 날(정체/눈/비)을 별도 시나리오로 학습
+   - 기대: contact-rate/ICT가 달라져 gamma, P_INIT 최적이 달라지고, 고정 Δ는 범용성이 떨어짐.
+
+구현 관점 팁(현재 repo 시나리오 포맷과 잘 맞는 방식)
+- Episode 내부 변화(시간대별 변화)는 “MessageEventGenerator를 시간 구간별로 여러 개”로 쪼개 구현.
+  - 이미 scenarios/dynamic/* 는 2시간 단위 구간(7200s)으로 트래픽을 바꾸는 패턴이 있음.
+- “속도/인터페이스/버퍼”처럼 런 중에 바꾸기 어려운 값은,
+  - 여러 시나리오 파일(예: normal / congested / eventday)을 만들어 episode 단위로 랜덤 학습하는 방식이 현실적.
+- 버퍼 이질성은 group별 bufferSize를 다르게 두면 자연스럽게 생성 가능(폰 vs 차량/트램).
+
+
+6) 다음에 확정할 것(우선순위)
+----------------------------
+1) Δ 후보 dest 집합 크기 K (RLBridgeReport.maxMessagesPerNode와 정렬/선정 기준)
+2) P_INIT/beta/gamma action 범위(특히 gamma 하한) + action smoothing 정책
+3) ttl_mean 정규화 기준(분 단위/ratio)과 urgent 임계값(T_urgent)
+4) 보상 설계(Delivery/Overhead/Drop/Delay 가중치) + basePred 사용 원칙
+

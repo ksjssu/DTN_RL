@@ -6,7 +6,7 @@
 *.txt           text
 *.md            text
 *.bat           text
-*.sh            text
+*.sh            text eol=lf
 *.pl            text
 *.pm            text
 *.py            text

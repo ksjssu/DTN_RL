@@ -30,6 +30,8 @@ import core.SimClock;
 public class ProphetRouter extends ActiveRouter {
 	/** delivery predictability initialization constant*/
 	public static final double P_INIT = 0.75;
+	/** Per-host configurable P_INIT setting key ({@value}). */
+	public static final String P_INIT_S = "pInit";
 	/** delivery predictability transitivity scaling constant default value */
 	public static final double DEFAULT_BETA = 0.25;
 	/** delivery predictability aging constant */
@@ -64,6 +66,8 @@ public class ProphetRouter extends ActiveRouter {
 	private double beta;
 	/** value of gamma setting */
 	private double gamma;
+	/** value of pInit setting (direct update strength) */
+	private double pInit;
 
     /** delivery predictabilities */
     private Map<DTNHost, Double> preds;
@@ -99,6 +103,17 @@ public class ProphetRouter extends ActiveRouter {
 			gamma = DEFAULT_GAMMA;
 		}
 
+		if (prophetSettings.contains(P_INIT_S)) {
+			pInit = prophetSettings.getDouble(P_INIT_S);
+		}
+		else {
+			pInit = P_INIT;
+		}
+		// Clamp to safe ranges
+		setBeta(beta);
+		setGamma(gamma);
+		setPInit(pInit);
+
 		initPreds();
 	}
 
@@ -111,6 +126,7 @@ public class ProphetRouter extends ActiveRouter {
 		this.secondsInTimeUnit = r.secondsInTimeUnit;
 		this.beta = r.beta;
 		this.gamma = r.gamma;
+		this.pInit = r.pInit;
 		initPreds();
 	}
 
@@ -139,8 +155,68 @@ public class ProphetRouter extends ActiveRouter {
 	 */
 	private void updateDeliveryPredFor(DTNHost host) {
 		double oldValue = getPredFor(host);
-		double newValue = oldValue + (1 - oldValue) * P_INIT;
+		double newValue = oldValue + (1 - oldValue) * this.pInit;
 		preds.put(host, newValue);
+	}
+
+	/**
+	 * Sets per-host P_INIT (direct-update strength).
+	 * @param pInit New P_INIT value (clamped to [0,1])
+	 */
+	public void setPInit(double pInit) {
+		if (!Double.isFinite(pInit)) {
+			return;
+		}
+		if (pInit < 0.0) { pInit = 0.0; }
+		if (pInit > 1.0) { pInit = 1.0; }
+		this.pInit = pInit;
+	}
+
+	/**
+	 * @return Current per-host P_INIT value.
+	 */
+	public double getPInit() {
+		return this.pInit;
+	}
+
+	/**
+	 * Sets per-host beta (transitivity scaling).
+	 * @param beta New beta value (clamped to [0,1])
+	 */
+	public void setBeta(double beta) {
+		if (!Double.isFinite(beta)) {
+			return;
+		}
+		if (beta < 0.0) { beta = 0.0; }
+		if (beta > 1.0) { beta = 1.0; }
+		this.beta = beta;
+	}
+
+	/**
+	 * @return Current per-host beta value.
+	 */
+	public double getBeta() {
+		return this.beta;
+	}
+
+	/**
+	 * Sets per-host gamma (aging/forgetting).
+	 * @param gamma New gamma value (clamped to (0,1])
+	 */
+	public void setGamma(double gamma) {
+		if (!Double.isFinite(gamma)) {
+			return;
+		}
+		if (gamma <= 0.0) { gamma = 1e-6; }
+		if (gamma > 1.0) { gamma = 1.0; }
+		this.gamma = gamma;
+	}
+
+	/**
+	 * @return Current per-host gamma value.
+	 */
+	public double getGamma() {
+		return this.gamma;
 	}
 
 	/**

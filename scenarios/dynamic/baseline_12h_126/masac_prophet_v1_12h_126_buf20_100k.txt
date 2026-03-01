@@ -1,0 +1,210 @@
+Scenario.name = masac_prophet_v1_12h_126_buf20_100k_rng%%MovementModel.rngSeed%%
+MovementModel.rngSeed = [1; 2; 3; 4; 5; 6; 7; 8; 9; 10;]
+Scenario.endTime = 43200
+
+## Scenario settings
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+highspeedInterface.type = SimpleBroadcastInterface
+highspeedInterface.transmitSpeed = 10M
+highspeedInterface.transmitRange = 1000
+
+## Groups (126 nodes: 40+40+40+2+2+2)
+Scenario.nrofHostGroups = 6
+
+Group.movementModel = ShortestPathMapBasedMovement
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.msgTtl = 300
+Group.bufferSize = 20M
+Group.router = ProphetRouter
+
+Group.nrofHosts = 40
+
+Group1.groupID = p
+
+Group2.groupID = c
+Group2.okMaps = 1
+Group2.speed = 2.7, 13.9
+
+Group3.groupID = w
+
+Group4.groupID = t
+Group4.bufferSize = 50M
+Group4.movementModel = MapRouteMovement
+Group4.routeFile = data/tram3.wkt
+Group4.routeType = 1
+Group4.waitTime = 10, 30
+Group4.speed = 7, 10
+Group4.nrofHosts = 2
+Group4.nrofInterfaces = 2
+Group4.interface1 = btInterface
+Group4.interface2 = highspeedInterface
+
+Group5.groupID = t
+Group5.bufferSize = 50M
+Group5.movementModel = MapRouteMovement
+Group5.routeFile = data/tram4.wkt
+Group5.routeType = 2
+Group5.waitTime = 10, 30
+Group5.speed = 7, 10
+Group5.nrofHosts = 2
+
+Group6.groupID = t
+Group6.bufferSize = 50M
+Group6.movementModel = MapRouteMovement
+Group6.routeFile = data/tram10.wkt
+Group6.routeType = 2
+Group6.waitTime = 10, 30
+Group6.speed = 7, 10
+Group6.nrofHosts = 2
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+ProphetRouter.heuristicDelta = 0.0
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100
+
+## Message creation (12h, 1h windows): L/M/H peaks (realistic diurnal-ish)
+##  - High:   interval 5..10s
+##  - Medium: interval 25..35s
+##  - Low:    interval 120..180s
+Events.nrof = 12
+
+Events1.class = MessageEventGenerator
+Events1.interval = 120,180
+Events1.size = 500k,1M
+Events1.hosts = 0,126
+Events1.time = 0,3599
+Events1.prefix = L0
+
+Events2.class = MessageEventGenerator
+Events2.interval = 25,35
+Events2.size = 500k,1M
+Events2.hosts = 0,126
+Events2.time = 3600,7199
+Events2.prefix = M0
+
+Events3.class = MessageEventGenerator
+Events3.interval = 5,10
+Events3.size = 500k,1M
+Events3.hosts = 0,126
+Events3.time = 7200,10799
+Events3.prefix = H0
+
+Events4.class = MessageEventGenerator
+Events4.interval = 5,10
+Events4.size = 500k,1M
+Events4.hosts = 0,126
+Events4.time = 10800,14399
+Events4.prefix = H1
+
+Events5.class = MessageEventGenerator
+Events5.interval = 25,35
+Events5.size = 500k,1M
+Events5.hosts = 0,126
+Events5.time = 14400,17999
+Events5.prefix = M1
+
+Events6.class = MessageEventGenerator
+Events6.interval = 25,35
+Events6.size = 500k,1M
+Events6.hosts = 0,126
+Events6.time = 18000,21599
+Events6.prefix = M2
+
+Events7.class = MessageEventGenerator
+Events7.interval = 25,35
+Events7.size = 500k,1M
+Events7.hosts = 0,126
+Events7.time = 21600,25199
+Events7.prefix = M3
+
+Events8.class = MessageEventGenerator
+Events8.interval = 5,10
+Events8.size = 500k,1M
+Events8.hosts = 0,126
+Events8.time = 25200,28799
+Events8.prefix = H2
+
+Events9.class = MessageEventGenerator
+Events9.interval = 5,10
+Events9.size = 500k,1M
+Events9.hosts = 0,126
+Events9.time = 28800,32399
+Events9.prefix = H3
+
+Events10.class = MessageEventGenerator
+Events10.interval = 25,35
+Events10.size = 500k,1M
+Events10.hosts = 0,126
+Events10.time = 32400,35999
+Events10.prefix = M4
+
+Events11.class = MessageEventGenerator
+Events11.interval = 120,180
+Events11.size = 500k,1M
+Events11.hosts = 0,126
+Events11.time = 36000,39599
+Events11.prefix = L1
+
+Events12.class = MessageEventGenerator
+Events12.interval = 120,180
+Events12.size = 500k,1M
+Events12.hosts = 0,126
+Events12.time = 39600,43199
+Events12.prefix = L2
+
+## Reports (comprehensive + MASAC controller bridge)
+Report.warmup = 0
+Report.reportDir = reports/masac_prophet_v1_12h_126_buf20/
+Report.nrofReports = 7
+Report.report1 = MessageStatsReport
+Report.report2 = DeliveryRatePerIntervalReport
+Report.report3 = OverheadPerIntervalReport
+Report.report4 = LatencyPerIntervalReport
+Report.report5 = BufferOccupancyReport
+Report.report6 = ContactsPerHourReport
+Report.report7 = RLBridgeReport
+
+DeliveryRatePerIntervalReport.binSize = 3600
+DeliveryRatePerIntervalReport.cumulativeMode = true
+OverheadPerIntervalReport.binSize = 3600
+OverheadPerIntervalReport.cumulativeMode = true
+LatencyPerIntervalReport.binSize = 3600
+LatencyPerIntervalReport.cumulativeMode = true
+
+BufferOccupancyReport.occupancyInterval = 60
+
+RLBridgeReport.sampleInterval = 100
+RLBridgeReport.windowSize = 600
+RLBridgeReport.contactsNormMode = cmax
+RLBridgeReport.contactsCmax = 10
+RLBridgeReport.maxMessagesPerNode = 20
+RLBridgeReport.deltaLimit = 1.0
+RLBridgeReport.bufOccMaxAge = 600
+RLBridgeReport.logActions = false
+RLBridgeReport.url = http://127.0.0.1:5010/infer_and_update
+RLBridgeReport.protocol = masac_prophet_v1
+RLBridgeReport.notifyEpisodeEnd = true
+RLBridgeReport.timeoutMs = 30000
+RLBridgeReport.activationTime = 0
+RLBridgeReport.episodeSeconds = 43200
+

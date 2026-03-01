@@ -1,0 +1,280 @@
+Scenario.name = masac_prophet_v1_complex_12h_126_mixTTL_mixBufVar50M_mixIF_100k_contactLite_num%%number%%_rng%%MovementModel.rngSeed%%
+number = [1;2]
+MovementModel.rngSeed = [1]
+Scenario.endTime = 43200
+
+## Scenario settings
+## contactLite: reduce connection churn/CPU while keeping heterogeneity
+Scenario.simulateConnections = true
+Scenario.updateInterval = 0.1
+
+## Interfaces
+btInterface.type = SimpleBroadcastInterface
+btInterface.transmitSpeed = 250k
+btInterface.transmitRange = 10
+
+wifiInterface.type = SimpleBroadcastInterface
+wifiInterface.transmitSpeed = 3M
+wifiInterface.transmitRange = 90
+
+backhaulInterface.type = SimpleBroadcastInterface
+backhaulInterface.transmitSpeed = 5M
+backhaulInterface.transmitRange = 700
+
+## Groups (126 nodes total)
+Scenario.nrofHostGroups = 15
+
+## Default group template
+Group.movementModel = ShortestPathMapBasedMovement
+Group.waitTime = 0, 120
+Group.nrofInterfaces = 1
+Group.interface1 = btInterface
+Group.speed = 0.5, 1.5
+Group.router = ProphetRouter
+Group.deleteDelivered = true
+
+## Pedestrians (diverse buffers/TTL/speeds/waits) - 40 total
+Group1.groupID = p
+Group1.nrofHosts = 10
+Group1.bufferSize = 5M
+Group1.msgTtl = 30
+Group1.speed = 0.4, 1.0
+Group1.waitTime = 30, 240
+
+Group2.groupID = p
+Group2.nrofHosts = 10
+Group2.bufferSize = 10M
+Group2.msgTtl = 60
+Group2.speed = 0.5, 1.2
+Group2.waitTime = 0, 180
+
+Group3.groupID = p
+Group3.nrofHosts = 10
+Group3.bufferSize = 20M
+Group3.msgTtl = 120
+Group3.speed = 0.6, 1.6
+Group3.waitTime = 0, 120
+
+Group4.groupID = p
+Group4.nrofHosts = 10
+Group4.bufferSize = 20M
+Group4.msgTtl = 120
+Group4.speed = 0.8, 1.8
+Group4.waitTime = 0, 60
+
+## Cars - 34 total
+Group5.groupID = c
+Group5.nrofHosts = 17
+Group5.bufferSize = 10M
+Group5.msgTtl = 180
+Group5.speed = 3.0, 12.0
+
+Group6.groupID = c
+Group6.nrofHosts = 17
+Group6.bufferSize = 30M
+Group6.msgTtl = 240
+Group6.speed = 6.0, 18.0
+
+## Workers - 34 total
+Group7.groupID = w
+Group7.nrofHosts = 17
+Group7.bufferSize = 20M
+Group7.msgTtl = 720
+Group7.speed = 0.7, 1.6
+Group7.waitTime = 60, 360
+
+Group8.groupID = w
+Group8.nrofHosts = 17
+Group8.bufferSize = 30M
+Group8.msgTtl = 720
+Group8.speed = 0.8, 2.0
+Group8.waitTime = 30, 240
+
+## Taxis / couriers - 10 total (wifi-enabled)
+Group9.groupID = x
+Group9.nrofHosts = 5
+Group9.nrofInterfaces = 2
+Group9.interface1 = btInterface
+Group9.interface2 = wifiInterface
+Group9.bufferSize = 30M
+Group9.msgTtl = 180
+Group9.speed = 6.0, 20.0
+Group9.waitTime = 0, 45
+
+Group10.groupID = x
+Group10.nrofHosts = 5
+Group10.nrofInterfaces = 2
+Group10.interface1 = btInterface
+Group10.interface2 = wifiInterface
+Group10.bufferSize = 50M
+Group10.msgTtl = 180
+Group10.speed = 8.0, 25.0
+Group10.waitTime = 0, 30
+
+## Stationary hubs - 2 total (backhaul)
+Group11.groupID = h
+Group11.nrofHosts = 1
+Group11.movementModel = StationaryMovement
+Group11.nodeLocation = 2500,2500
+Group11.nrofInterfaces = 1
+Group11.interface1 = backhaulInterface
+Group11.bufferSize = 50M
+Group11.msgTtl = 1440
+
+Group12.groupID = h
+Group12.nrofHosts = 1
+Group12.movementModel = StationaryMovement
+Group12.nodeLocation = 1200,3200
+Group12.nrofInterfaces = 1
+Group12.interface1 = backhaulInterface
+Group12.bufferSize = 50M
+Group12.msgTtl = 1440
+
+## Trams - 6 total (bt + backhaul)
+Group13.groupID = t
+Group13.nrofHosts = 2
+Group13.bufferSize = 50M
+Group13.msgTtl = 720
+Group13.movementModel = MapRouteMovement
+Group13.routeFile = data/tram3.wkt
+Group13.routeType = 1
+Group13.waitTime = 10, 30
+Group13.speed = 7, 10
+Group13.nrofInterfaces = 2
+Group13.interface1 = btInterface
+Group13.interface2 = backhaulInterface
+
+Group14.groupID = t
+Group14.nrofHosts = 2
+Group14.bufferSize = 50M
+Group14.msgTtl = 720
+Group14.movementModel = MapRouteMovement
+Group14.routeFile = data/tram4.wkt
+Group14.routeType = 2
+Group14.waitTime = 10, 30
+Group14.speed = 7, 10
+Group14.nrofInterfaces = 2
+Group14.interface1 = btInterface
+Group14.interface2 = backhaulInterface
+
+Group15.groupID = t
+Group15.nrofHosts = 2
+Group15.bufferSize = 50M
+Group15.msgTtl = 720
+Group15.movementModel = MapRouteMovement
+Group15.routeFile = data/tram10.wkt
+Group15.routeType = 2
+Group15.waitTime = 10, 30
+Group15.speed = 7, 10
+Group15.nrofInterfaces = 2
+Group15.interface1 = btInterface
+Group15.interface2 = backhaulInterface
+
+## Default router settings
+ProphetRouter.secondsInTimeUnit = 30
+ProphetRouter.heuristicDelta = 0.0
+
+## Optimization
+Optimization.cellSizeMult = 5
+Optimization.randomizeUpdateOrder = true
+
+## GUI
+GUI.UnderlayImage.fileName = data/helsinki_underlay.png
+GUI.UnderlayImage.offset = 64, 20
+GUI.UnderlayImage.scale = 4.75
+GUI.UnderlayImage.rotate = -0.015
+GUI.EventLogPanel.nrofEvents = 100
+
+## Message creation: baseline traffic
+Events.nrof = 7
+
+Events1.class = MessageEventGenerator
+Events1.interval = 40,80
+Events1.size = 50k,200k
+Events1.hosts = 0,118
+Events1.time = 0,43199
+Events1.prefix = BG
+
+Events2.class = MessageEventGenerator
+Events2.interval = 180,300
+Events2.size = 2M,8M
+Events2.hosts = 74,108
+Events2.tohosts = 74,108
+Events2.time = 0,43199
+Events2.prefix = BULK
+
+Events3.class = MessageEventGenerator
+Events3.interval = 5,10
+Events3.size = 10k,30k
+Events3.hosts = 0,40
+Events3.tohosts = 118,120
+Events3.time = 3600,5400
+Events3.prefix = UAM
+
+Events4.class = MessageEventGenerator
+Events4.interval = 5,10
+Events4.size = 10k,30k
+Events4.hosts = 0,40
+Events4.tohosts = 118,120
+Events4.time = 30000,33000
+Events4.prefix = UPM
+
+Events5.class = MessageBurstGenerator
+Events5.interval = 2400,3600
+Events5.size = 100k,300k
+Events5.hosts = 108,118
+Events5.tohosts = 0,40
+Events5.time = 0,7200
+Events5.prefix = BURST_AM
+
+Events6.class = MessageEventGenerator
+Events6.interval = 10,20
+Events6.size = 200k,1M
+Events6.hosts = 0,40
+Events6.tohosts = 0,118
+Events6.time = 14400,18000
+Events6.prefix = LUNCH
+
+Events7.class = MessageBurstGenerator
+Events7.interval = 1,1
+Events7.size = 50k,100k
+Events7.hosts = 118,120
+Events7.tohosts = 0,126
+Events7.time = 28800,28810
+Events7.prefix = ALERT
+
+## Reports (comprehensive + R-MAPPO controller bridge)
+Report.warmup = 0
+Report.reportDir = reports/masac_prophet_v1_complex_12h_126_mixTTL_mixBufVar50M_mixIF_100k_contactLite/
+Report.nrofReports = 7
+Report.report1 = MessageStatsReport
+Report.report2 = DeliveryRatePerIntervalReport
+Report.report3 = OverheadPerIntervalReport
+Report.report4 = LatencyPerIntervalReport
+Report.report5 = BufferOccupancyReport
+Report.report6 = ContactsPerHourReport
+Report.report7 = RLBridgeReport
+
+DeliveryRatePerIntervalReport.binSize = 3600
+DeliveryRatePerIntervalReport.cumulativeMode = true
+OverheadPerIntervalReport.binSize = 3600
+OverheadPerIntervalReport.cumulativeMode = true
+LatencyPerIntervalReport.binSize = 3600
+LatencyPerIntervalReport.cumulativeMode = true
+
+BufferOccupancyReport.occupancyInterval = 60
+
+RLBridgeReport.sampleInterval = 100
+RLBridgeReport.windowSize = 600
+RLBridgeReport.contactsNormMode = cmax
+RLBridgeReport.contactsCmax = 10
+RLBridgeReport.maxMessagesPerNode = 20
+RLBridgeReport.deltaLimit = 1.0
+RLBridgeReport.bufOccMaxAge = 600
+RLBridgeReport.logActions = false
+RLBridgeReport.url = http://127.0.0.1:5011/infer_and_update
+RLBridgeReport.protocol = masac_prophet_v1
+RLBridgeReport.notifyEpisodeEnd = true
+RLBridgeReport.timeoutMs = 30000
+RLBridgeReport.activationTime = 0
+RLBridgeReport.episodeSeconds = 43200

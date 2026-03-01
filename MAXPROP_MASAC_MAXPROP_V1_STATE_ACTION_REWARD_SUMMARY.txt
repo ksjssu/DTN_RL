@@ -1,0 +1,276 @@
+MaxProp(순수) 및 MA-SAC+MaxProp++ v1(파라미터 제어) 구현 정리
+============================================================
+
+작성 목적
+---------
+- 본 프로젝트(코드 기준)에 “순수 MaxProp 라우팅”이 어떻게 동작하는지와,
+  MaxProp++ v1 경로에서 MA-SAC가 어떤 state/action/reward로 MaxProp 파라미터를 제어하는지
+  (state/action/reward 정의 + 데이터 플로우) 를 한 파일에 정리한다.
+
+대상 구현(코드 위치)
+-------------------
+[순수 MaxProp]
+- 라우터: src/routing/MaxPropRouter.java
+- (추정치 변형): src/routing/MaxPropRouterWithEstimation.java
+- 확률/최단경로: src/routing/maxprop/MeetingProbabilitySet.java, src/routing/maxprop/MaxPropDijkstra.java
+
+[MaxProp++ v1 + MA-SAC 브릿지]
+- Java(시뮬레이터→서버 브릿지): src/report/RmappoMaxpropBridgeReport.java
+- Python(DRL 서버, MA-SAC): toolkit/drl_server_rmappo_maxprop.py
+  - 프로토콜 핸들러: handle_rmappo_maxprop_v1(req)
+
+용어/기호
+---------
+- host: DTN 노드(예: "p0")
+- contact: 현재 연결된 이웃 중 대표 1개(브릿지에서 관측용으로 선택)
+- (순수 MaxProp) meeting probability P(i->j): “다음에 만날 노드가 j일 확률”
+- (순수 MaxProp) cost: dijkstra에서 사용하는 경로 비용(낮을수록 유리)
+- (MaxProp++ v1) 5개 제어 파라미터 = (lambda_cost, tau_age, beta_x, k_x, m_relay)
+
+
+1) 순수 MaxProp 라우팅(프로젝트 구현 기준)
+-----------------------------------------
+
+1.1 핵심 상태(state)로 유지하는 것
+- MeetingProbabilitySet probs:
+  - “내가 만나는 노드들”에 대한 P(다음 접촉=노드) 분포
+  - 업데이트 규칙: MeetingProbabilitySet.updateMeetingProbFor(index)
+    - 해당 노드 확률에 alpha를 더한 뒤, 전체를 (1+alpha)로 정규화
+    - probSetMaxSize 초과 시 가장 작은 확률 엔트리 제거
+- allProbs: Map<addr, MeetingProbabilitySet>
+  - “내가 알고 있는 다른 노드들의 meeting probability set” 테이블(전이적 갱신에 사용)
+- ackedMessageIds:
+  - 최종 목적지에 도달한 것으로 “알려진” 메시지 ID 집합(ACK 교환 후 삭제에 활용)
+- avgTransferredBytes:
+  - 전송 기회 1회당 전송 바이트 수의 이동평균 샘플(임계치(threshold) 계산에 사용)
+
+1.2 만남(연결) 이벤트에서 수행되는 작업(요약)
+- changedConnection()에서 연결이 올라오면(initiator 측):
+  1) 비용 캐시 무효화(invalidateCostCaches)
+  2) ACKed message ID 교환 및 ACK된 메시지 버퍼에서 삭제
+  3) meeting probability 업데이트:
+     - 내 probs에서 otherHost 주소 업데이트
+     - 상대도 자기 probs에서 내 주소 업데이트
+  4) 전이(transitive) 확률 정보 교환/갱신:
+     - updateTransitiveProbs(...) 호출 흐름으로 allProbs 테이블이 보강됨
+  5) (본 프로젝트 확장) 에너지 정보 교환(자세한 내용은 2절 MaxProp++ 참고)
+
+1.3 최단경로 비용(cost) 정의(핵심)
+- src/routing/maxprop/MaxPropDijkstra.java:
+  - 링크(from->to)의 “거리(distance)”를 다음처럼 정의:
+      distance(from,to) = (1 - P(from meets to))
+  - 경로 비용(cost)은 distance들의 합(= “확률 보완(complement)”의 누적합)
+  - 목적지별 cost는 Dijkstra로 계산하며, 낮은 cost가 더 유리한 경로(가까움)
+
+1.4 메시지 전송(Forwarding) 우선순위 개념
+- update()에서 대략 다음 순서로 전송 시도:
+  1) 최종 목적지로 직접 전달 가능한 메시지 우선(exchDeliverableMessages)
+  2) 그 외 메시지들(tryOtherMessages) 후보를 모아 정렬 후 전송
+
+- 핵심 정렬 기준(요약):
+  - “우선(priority) 메시지” 구간과 “비우선” 구간을 threshold(hop count)로 나눔
+  - hop<threshold 인 메시지는 hop가 낮은 순(그리고 tie-break)으로 우선
+  - 그 외 메시지는 목적지까지의 cost가 낮은(=유리한) 순으로 우선
+
+- threshold 계산(calcThreshold):
+  - 버퍼를 “우선 구간”으로 얼마나 잡을지를 avgTransferredBytes(x)와 버퍼 크기(b)로 계산
+  - 정렬된 메시지 목록에서 “우선 구간 바이트를 처음 초과하는 메시지”의 hop+1을 threshold로 사용
+
+
+2) MaxProp++(현재 코드에 추가된 RL 제어 훅)
+-------------------------------------------
+본 프로젝트의 MaxPropRouter는 “메시지 선택 로직 자체”는 MaxProp을 유지하면서,
+아래 5개 스칼라 파라미터를 외부(예: DRL)에서 주기적으로 주입받아 내부 cost/threshold/relay 조건에 반영한다.
+
+2.1 제어 파라미터(5D)와 의미 (src/routing/MaxPropRouter.java)
+- lambda_cost (rlLambdaCost):
+  - Dijkstra 비용 계산에 “에너지 리스크 패널티”를 더하는 강도
+  - 0 이하/비유한이면 패널티 비활성
+
+- tau_age (rlTauAgeSeconds):
+  - 이웃 에너지 정보가 오래될수록 영향력을 지수 감쇠시키는 시간상수
+  - w = exp(-age / tau_age)
+
+- beta_x (rlBetaX):
+  - avgTransferredBytes(x) 추정을 EWMA로 바꿀 때의 beta (0~1)
+  - 유한하고 0~1이면 EWMA 활성, 아니면 기존 샘플 기반 avgTransferredBytes 사용
+
+- k_x (rlKx):
+  - threshold 계산에서 x를 스케일: x_eff = x * k_x
+  - k_x<=0 이면 1.0으로 보정
+
+- m_relay (rlRelayMargin):
+  - “릴레이(중계)할지 말지”를 비용 개선량(Δcost) 기준으로 게이트
+  - 활성 조건: 유한 && >=0
+  - 조건(요약): (selfCost - peerCost) >= m_relay 일 때만 peer로 릴레이 후보에 포함
+    - selfCost = getCost(self, dest), peerCost = getCost(peer, dest)
+    - Δ가 클수록 peer가 더 유리(더 낮은 cost)하다는 의미
+
+2.2 에너지 리스크 패널티(개념/구현)
+- 에너지 정보(EnergyInfo: energy, rate, time)를 addr별로 유지하고,
+  연결 시 exchangeEnergyInfo()로 서로 최신값을 교환/병합한다.
+
+- getEnergyPenaltyForNode(nodeAddr):
+  - 에너지 소모율 rate(energy/sec)와 잔여 에너지 energy로 tEmpty=energy/rate 추정
+  - risk = exp(-tEmpty / energyRiskTimeScale)
+  - staleness weight w(위 2.1의 tau_age) 적용
+  - penalty = lambda_cost * w * risk
+
+- 이 penalty는 MaxPropDijkstra의 nodePenalty 콜백으로 들어가서,
+  getDistance(from,to)에서 (1 - P) 에 “+ penalty(to)” 형태로 추가된다.
+  즉, 에너지가 위험한 노드를 경유/선호하지 않도록 cost가 증가한다.
+
+
+3) MA-SAC + MaxProp++ v1 (rmappo_maxprop_v1) 상세
+-------------------------------------------------
+핵심 아이디어:
+- “MaxProp 라우팅(메시지 정렬/전송)”은 Java(MaxPropRouter)가 수행한다.
+- Python의 MA-SAC는 “MaxProp++ 파라미터(5D)”만 step마다 산출하여 Java에 반환한다.
+
+3.1 프로토콜/데이터 플로우(1 step 기준)
+[Java → Python] (src/report/RmappoMaxpropBridgeReport.java)
+- 매 sample interval마다 POST payload 생성:
+  - protocol: "rmappo_maxprop_v1"
+  - sim_id, time, step_id, prev_time, dt
+  - action_scope: "per_host" 또는 "global/shared"
+  - global_features: 5D (critic-only globals)
+  - action_spec: action 파라미터별 (min,max) 범위
+  - prev_transition: 이전 step 동안의 이벤트 카운터/에너지 사용량(리워드 계산 입력)
+  - state_batch: 각 host의 관측(obs 벡터) 배열
+
+[Python → Java] (toolkit/drl_server_rmappo_maxprop.py)
+- handle_rmappo_maxprop_v1(req)가 아래를 수행:
+  1) prev_transition 합계를 기반으로 “step 전역 reward(total_reward)” 계산
+  2) (학습 모드면) 이전 step에서 저장해 둔 (s,a)와 현재 step의 s'로 (s,a,r,s') 전이 적재/학습
+  3) 각 host에 대해 5D action을 만들고 action_spec 범위로 매핑하여 반환
+
+[Java 적용] (RmappoMaxpropBridgeReport.sample())
+- action_scope="global"이면 globalAction 1개를 모든 host에 적용
+- per_host이면 선택된 host들에 대해 host별 action 적용
+- mp.setRlParams(lambda_cost, tau_age, beta_x, k_x, m_relay) 호출로 라우터 내부 파라미터 갱신
+
+3.2 State(관측) 정의: state_batch의 obs 벡터(총 371D)
+각 host에 대해 "obs":[...] 로 전달되며, 구성은 다음과 같다.
+(아래 인덱스는 buildHostObs()와 buildMessageFeatures() 기준)
+
+SELF features (13D)  [idx 0..12]
+  0  eNorm            = local_energy / initial_energy  (0~1)
+  1  rNorm            = local_energy_rate / energyRateNorm (0~1)
+  2  tNorm            = time_to_empty / tEmptyNormSeconds (0~1)
+  3  bufOcc           = buffer_utilization (0~1)
+  4  nMsgsNorm         = n_messages / maxMsgsPerNode (0~1)
+  5  abortEFeat        = EMA(abort_rate) (스케일 후 0~1)
+  6  dropEFeat         = EMA(drop_rate)  (스케일 후 0~1)
+  7  xNorm             = avgTransferredBytesEstimate / buffer_size (0~1)
+  8  thresholdNorm     = calcThreshold() / hopNormMax (0~1)
+  9  tEpisodeNorm      = now / episodeSeconds (0~1)
+ 10  phaseA            = now < phaseAEnd ? 1 : 0
+ 11  phaseB            = phaseAEnd <= now < phaseBEnd ? 1 : 0
+ 12  phaseC            = now >= phaseBEnd ? 1 : 0
+
+CONTACT features (6D) [idx 13..18]
+ 13  eNbNorm          = neighbor_energy / neighbor_initial_energy (0~1)
+ 14  rNbNorm          = neighbor_energy_rate / energyRateNorm (0~1)
+ 15  tNbNorm          = neighbor_time_to_empty / tEmptyNormSeconds (0~1)
+ 16  ageInfoNorm      = age_of_energy_info / infoAgeNormSeconds (0~1)
+ 17  linkRateNorm     = contact_link_rate / linkRateNormBps (0~1)
+ 18  hasContact       = contact 존재 여부 (0 or 1)
+
+MSG token features (maxMsgTokens=32, 각 10D) [idx 19..338]
+  각 토큰은 host 버퍼에서 선택된 메시지 1개의 특징을 담는다(부족하면 0으로 패딩).
+  토큰 1개(10D)의 구성(buildMessageFeatures):
+    0 sizeNorm        = msg_size / buffer_size
+    1 ttlNorm         = remaining_ttl_minutes / ttlNormMinutes
+    2 ageNorm         = msg_age_seconds / (ttlNormMinutes*60)
+    3 hopNorm         = hop_count / hopNormMax
+    4 isPrio          = hop < thresholdCur ? 1 : 0
+    5 costSelfFeat    = 1/(1+costSelf)  (includeCostFeatures=false면 0)
+    6 costViaFeat     = 1/(1+costVia)   (includeCostFeatures=false면 0)
+    7 deltaFeat       = tanh((costSelf - costVia)/deltaCostScale) (includeCostFeatures=false면 0)
+    8 alreadySent     = contact에게 과거 전송했는지 (0/1)
+    9 txTimeNorm      = (msg_size/linkRate) / sample_interval  (0~1)
+
+MSG mask (32D) [idx 339..370]
+  - 각 토큰이 실제 메시지인지(1) 패딩인지(0)
+
+추가: 대표 contact 선택
+- host의 현재 connections 중 “주소가 가장 작은 이웃”을 contact로 선택(결정적 선택).
+
+추가: 메시지 토큰 선택
+- selectMessages()가 (prio/hop/cost 기준) top-N을 선택한다.
+- includeCostFeatures 설정에 따라 cost 기반 정렬/특징이 활성/비활성된다.
+
+3.3 Global features (critic-only globals, 5D)
+Java에서 collectGlobalFeatures()로 계산되어 req.global_features로 전달된다.
+- aliveFrac            (0~1)
+- energyFrac           (평균 에너지 비율, 0~1)
+- globalDropRateEma/5  (대략 [0,1] 스케일)
+- globalAbortRateEma/5 (대략 [0,1] 스케일)
+- globalRelayRateEma/12e6 (bytes/sec를 대략 [0,1]로)
+
+3.4 Action 정의(5D) 및 매핑
+Python이 host별로 반환하는 action은 다음 5개 실수(스칼라)다:
+- lambda_cost: 에너지 리스크 패널티 강도
+- tau_age    : 에너지 정보 staleness 감쇠 시간상수(초)
+- beta_x     : x(EWMA) beta
+- k_x        : threshold 계산용 x 스케일
+- m_relay    : relay margin(Δcost 게이트)
+
+매핑/클램프 방식(Python)
+- 에이전트가 내부적으로 [-1,1] 범위의 5D를 내면,
+  action_spec의 [min,max]로 affine 변환 후 clamp한다.
+
+안전 클램프(Java)
+- Java도 동일한 (min,max)로 한 번 더 clamp하고 mp.setRlParams(...)로 적용한다.
+
+3.5 Reward 정의(전역 step reward → host별 균등 분배)
+Python(handle_rmappo_maxprop_v1)에서 prev_transition을 합산해 total_reward를 만든다.
+prev_transition은 host별로 아래 카운터를 포함한다:
+- created_cnt, transferred_cnt, delivered_cnt, dropped, aborted, energy_used
+
+정의(코드 그대로):
+- dt = req.dt (초)
+- S(success) = delivered / created
+- O(overhead ratio) = (transferred - delivered) / transferred   (transferred==0이면 0으로 clamp)
+- D(drop rate) = dropped / created
+- E(energy) = (energy_used/dt) / MP_V1_ENERGY_RATE_NORM
+  - MP_V1_ENERGY_RATE_MODE:
+    - "avg_per_host"/"avg": host 수로 나눈 평균 사용률
+    - "total": 총합 사용률
+
+Reward form:
+- MP_V1_REWARD_FORM="prod"(기본):
+  total = scale * (S^alpha) * (O^beta) * ((1-E)^gamma) * ((1-D)^delta)
+- MP_V1_REWARD_FORM="log":
+  total = scale * ( alpha*log(S) + beta*log(O) + gamma*log(1-E) + delta*log(1-D) )
+- EPS(0에 대한 보호): max(eps, ·) 형태로 보호 후 계산
+
+Credit assignment(호스트별 r):
+- total_reward를 이번 step에 포함된 host 수로 나눠 동일하게 per_host_reward로 사용한다.
+
+주의(오버헤드 항)
+- 현재 구현은 O^beta(또는 beta*log(O)) 형태라서 beta>0이면 “오버헤드가 커질수록 보상이 증가”한다.
+  오버헤드 패널티 목적이면 보통 (1-O)^beta 또는 -beta*O 같은 형태가 더 자연스럽다.
+  (본 파일은 “현재 구현”을 그대로 기술한다.)
+
+3.6 Episode end(학습 트리거)
+- Java가 mode="episode_end"를 POST하면 Python은 시퀀스를 finalize하고 학습/체크포인트 저장을 수행한다.
+- 이때 응답은 status="episode_end_ack" 형태이며 action은 비어있다.
+
+3.7 기본 action 범위(action_spec) 기본값(Java 설정 기본)
+- lambdaCostMin/Max: [0.0, 2.0]
+- tauAgeMin/Max:     [0.0, 3600.0]
+- betaXMin/Max:      [0.0, 1.0]
+- kxMin/Max:         [0.1, 2.0]
+- relayMarginMin/Max:[-1e9, 5.0]  (음수면 사실상 게이트 비활성으로 사용 가능)
+
+
+4) 실행/디버깅 체크포인트(짧게)
+------------------------------
+- 브릿지 활성/로그:
+  - RmappoMaxpropBridgeReport는 매 step “OK t=... policy=... reward=... applied_actions=...” 로그를 남긴다.
+- Python 리워드 디버그:
+  - MP_V1_REWARD_DEBUG_PRINT=1 로 step별 (S,O,E,D,total) 출력 가능
+- MP v1 action 로그:
+  - MP_V1_ACTION_LOG_ENABLE=0 으로 비활성 가능
+
